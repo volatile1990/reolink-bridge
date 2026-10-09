@@ -1,8 +1,8 @@
 # Reolink Bridge für UniFi Protect
 
-Eine kleine Headless-Bridge liest einen Reolink-Baichuan-Stream und stellt ihn als authentifiziertes RTSP und ONVIF bereit. Der Pilot verwendet genau eine Kamera und eine eigene Netzwerkadresse. Video wird weitergereicht; Auflösung, Codec und Bitrate der Kamera werden nicht verändert. Die Bridge zeichnet nicht auf und startet weder Weboberfläche noch MQTT.
+Eine kleine Headless-Bridge liest einen Reolink-Baichuan-Stream und stellt ihn als authentifiziertes RTSP und ONVIF bereit. Jede Bridge-Instanz verwendet genau eine Kamera und eine eigene Netzwerkadresse. Video wird weitergereicht; Auflösung, Codec und Bitrate der Kamera werden nicht verändert. Die Bridge zeichnet nicht auf und startet weder Weboberfläche noch MQTT.
 
-Die Software basiert auf [Neolink.NET v1.1.0](UPSTREAM.md), benötigt .NET 10 und steht unter der [AGPL-3.0](LICENSE). Die Aufnahme in Protect und die Kompatibilität einzelner Kamerafirmwares müssen mit dem Pilot geprüft werden.
+Die Software basiert auf [Neolink.NET v1.1.0](UPSTREAM.md), benötigt .NET 10 und steht unter der [AGPL-3.0](LICENSE). Im NAS-Pilot wurden alle sechs Kameras separat in Protect aufgenommen: eine RLC-1212A und alle drei B1200 über vier Bridge-Instanzen, RLC-823A und E1 Zoom direkt über ONVIF. Ein paralleler 45-Sekunden-Liveabruf aller sechs Kameras lief ohne Abruffehler; am gemeinsamen 100-Mbit/s-Switchzweig bleiben jedoch größere Ankunftsabstände zu untersuchen. Daueraufzeichnung und Wiedergabe bleiben bis zum Einbau einer geeigneten Aufnahme-HDD in die Protect-Console offen; die interne SSD wurde dafür von Protect abgewiesen. Der Pilot ist inzwischen pausiert: Die vier Bridges sind gestoppt, und der wiederhergestellte Reolink-NVR meldet alle sechs Kameras online. Details und Messwerte stehen in [TESTING.md](TESTING.md).
 
 ## Konfiguration
 
@@ -56,7 +56,7 @@ Bei der Anmeldung den Bridge-Benutzer verwenden. Unter **Protect → Advanced Ad
 
 Für diesen Pilot müssen Protect und Bridge sich im Netz erreichen können; die Bridge benötigt außerdem TCP-Zugriff auf die echte Kamera an Port `9000`. RTSP läuft an `8554/TCP`, ONVIF an `8080/TCP` und lokale Erkennung an `3702/UDP`. Macvlan gibt dem Container eine eigene Adresse und MAC; der NAS-Host selbst erreicht seine Macvlan-Container standardmäßig nicht direkt. Der interne Healthcheck und Tests von Protect oder einem anderen LAN-Gerät funktionieren unabhängig davon.
 
-Der Pilot bietet zunächst Video-Profile und Erkennung. Snapshots, Bewegungsereignisse, PTZ und Audio-Transcodierung sind keine zugesicherten Pilot-Funktionen. Ein Test mit ausgeschaltetem Reolink-NVR zeigt, ob die Kamera eigenständig über Baichuan geliefert werden kann.
+Der Pilot bietet zunächst Video-Profile und Erkennung. Snapshots, Bewegungsereignisse, PTZ und Audio-Transcodierung sind keine zugesicherten Pilot-Funktionen. Der direkte Baichuan-Abruf aller drei B1200 und der RLC-1212A gelang im NAS-Pilot ohne den Reolink-NVR als Streamquelle. Die Übertragbarkeit auf andere Kamerafirmwares muss jeweils geprüft werden.
 
 ## Eingehenden Stream messen
 
@@ -98,4 +98,4 @@ docker build -t reolink-bridge:pilot .
 
 Der Container nutzt das .NET-10-SDK zum Bauen und das ASP.NET-10-Runtime-Image, da das Upstream-Projekt die ASP.NET-Frameworkreferenz enthält. Das Laufzeitimage arbeitet ohne Root-Rechte. Die GitHub-Actions-Prüfung baut und testet den Quellcode und baut das Containerimage; sie veröffentlicht und installiert nichts.
 
-[TESTING.md](TESTING.md) beschreibt die 35 ONVIF-Vertragstests, die Upstream-Selbsttests und den aktuellen NAS-Pilotstand einschließlich der noch offenen B1200-Kompatibilität.
+[TESTING.md](TESTING.md) beschreibt die 35 ONVIF-Vertragstests, die Upstream-Selbsttests, die erfolgreiche separate Integration und kurze Parallelmessung aller sechs Kameras sowie die Aufnahme-HDD als Voraussetzung für Daueraufzeichnung.
