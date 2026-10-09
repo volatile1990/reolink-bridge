@@ -16,9 +16,32 @@ Die zusätzlichen Vertragstests starten den tatsächlichen HTTP-Listener auf Loo
 
 ## Echter NAS-Pilot
 
-Der Pilot läuft auf einer **Synology DS720+ mit DSM 7.2.1, Docker 24 und .NET 10**, mit eigener Macvlan-Adresse je Bridge im Kameranetz und **UniFi Protect 7.3.70**. Der aktuelle getestete Softwarestand ist `fd3d9b6`.
+Der Pilot läuft auf einer **Synology DS720+ mit DSM 7.2.1, Docker 24 und .NET 10**, mit eigener Macvlan-Adresse je Bridge im Kameranetz und **UniFi Protect 7.3.70**. Die folgende frühere 45-Sekunden-Messung wurde mit Softwarestand `fd3d9b6` durchgeführt. Die lokalen Compose-Dateien, Geräteidentitäten und Zugangsdaten bleiben außerhalb des öffentlichen Repositorys.
 
-Alle sechs vorhandenen Kameras wurden separat in Protect aufgenommen: vier über eigene Bridge-Instanzen auf dem NAS und zwei über ihre direkte ONVIF-Schnittstelle. Die lokalen Compose-Dateien und Zugangsdaten bleiben außerhalb des öffentlichen Repositorys.
+### Aktiver Test: alle sechs Kameras über Bridges
+
+Für den aktuellen Test ist der Reolink-NVR **physisch ausgeschaltet**. Auf dem NAS laufen sechs getrennte Bridge-Instanzen: RLC-1212A, drei B1200, E1 Zoom und RLC-823A. Protect meldet alle sechs Bridge-Geräte als `CONNECTED` mit `Improved`/GStreamer. Die bisherigen direkten Protect-Einbindungen von E1 Zoom und RLC-823A wurden vor dem Umzug privat gesichert und entfernt; es werden damit keine parallelen direkten Protect-Streams zu diesen beiden Kameras getestet.
+
+Die neue **60-Sekunden-Messung** ist abgeschlossen. Für jede Bridge waren alle **61 von 61** parallelen `/metrics`-Abfragen erfolgreich und meldeten `ready`, ohne Fehler, Zähler-Reset oder Statuswechsel. Alle sechs Protect-WebSocket-Verbindungen antworteten mit HTTP `101`, lieferten Video ohne Abruffehler und erreichten die vollständige Abrufdauer von 60 Sekunden.
+
+| Kamera | Streamquelle | Eingangs-FPS / Mbit/s | Max. beobachtetes Frame-Alter | Lifetime-Maximalabstand Start → Ende | Erstes Protect-Video / max. Abschnittsabstand |
+|---|---|---|---|---|---|
+| RLC-1212A | Bridge | 19,896 / 8,364 | 846,874 ms | 995,405 → 995,405 ms | 0,558 s / 1,020 s |
+| B1200, Instanz 1 | Bridge | 19,829 / 10,436 | 59,694 ms | 182,118 → 182,118 ms | 0,371 s / 0,298 s |
+| B1200, Instanz 2 | Bridge | 19,813 / 10,455 | 52,422 ms | 182,081 → 182,081 ms | 0,328 s / 0,316 s |
+| B1200, Instanz 3 | Bridge | 17,366 / 9,232 | 976,118 ms | 2171,698 → 2171,698 ms | 1,104 s / 1,158 s |
+| E1 Zoom | Bridge | 19,998 / 5,238 | 47,579 ms | 166,571 → 166,571 ms | 0,322 s / 0,219 s |
+| RLC-823A | Bridge | 24,995 / 6,290 | 790,426 ms | 853,036 → 856,439 ms | 0,271 s / 1,017 s |
+
+Die Messung fragte `/metrics` parallel einmal pro Sekunde ab. FPS und Videobitrate stammen aus Zählerdifferenzen; die Bitrate umfasst nur codiertes Video ohne Audio und Transport-Overhead. Das beobachtete Frame-Alter sind Stichprobenwerte; kürzere oder zwischen Abfragen liegende Pausen können unbemerkt bleiben. Lifetime-Maximalabstände seit Bridge-Start sind getrennt zu Beginn und Ende erfasst und sind keine Maximalwerte ausschließlich aus dem 60-Sekunden-Fenster. Protect-Abschnittsabstände messen ankommende fMP4-Fragmente, nicht einzelne Kamera-Frameabstände.
+
+Am gemeinsamen MokerLink-Switchzweig kamen Frames schubweise an: Die ungefähr einsekündigen Zählerintervalle schwankten bei der RLC-1212A zwischen 3 und 36 FPS, bei B1200-Instanz 3 zwischen 1 und 32 FPS und bei der RLC-823A zwischen 6 und 45 FPS. Die übrigen drei Kameras lagen nahezu konstant bei 20 FPS. Das sind Ankunftsraten innerhalb der Intervalle, keine geänderten Kamera-FPS-Einstellungen; Werte über der eingestellten Rate passen zu nachgeholten Frames nach einer Pause.
+
+Der kurze Test bestätigt den vollständigen Abruf aller sechs Bridges, aber noch keine perfekte Flüssigkeit oder langfristige Stabilität. Nach dem Wechsel von direkter Einbindung zur Bridge wurde das Livebild der RLC-1212A vom Nutzer als deutlich flüssiger beurteilt. Dieses visuelle Feedback ergänzt die Messung, ersetzt aber keinen längeren Stabilitätstest. Eine passive TCP-Messung soll als nächsten Schritt klären, ob die Ankunftspausen bereits im Kamera-Transport sichtbar sind; dazu liegen hier noch keine Ergebnisse vor.
+
+### Früherer Pilot: vier Bridges und zwei direkte Kameras
+
+Im früheren Pilot wurden alle sechs vorhandenen Kameras separat in Protect aufgenommen: vier über eigene Bridge-Instanzen auf dem NAS und zwei über ihre direkte ONVIF-Schnittstelle.
 
 | Kamera | Ergebnis |
 |---|---|
@@ -32,7 +55,7 @@ Ein weiterer 45-Sekunden-Abruf durch Protect empfing rund 20,6 MB und 147 Videoa
 
 Der B1200-Livestream wurde anschließend ebenfalls 45 Sekunden durch Protect abgerufen: erstes Video nach 0,154 Sekunden, 493 erkannte fMP4-Videoabschnitte, größter Abstand 0,184 Sekunden. Die Eingangsmetriken über rund 50 Sekunden zeigten 19,96 Frames/s, 10,45 Mbit/s codiertes Video und einen maximalen eingangsseitigen Frameabstand von 124 ms. Das bestätigt einen flüssigen begrenzten Pilotabschnitt; es ersetzt keinen längeren Betrieb und keinen Test anderer Kamerafirmwares.
 
-### Finale Messung mit allen sechs Kameras
+### Abschlussmessung des früheren Piloten
 
 Alle sechs Protect-fMP4-Livestreams wurden ohne verbundenen Reolink-NVR parallel für **45 Sekunden** abgerufen. Alle WebSocket-Verbindungen antworteten mit HTTP `101`, lieferten Video ohne Abruffehler und erreichten die vollständige Messdauer. Die vier Bridges meldeten jeweils H.265 mit 4512 × 2512 Pixeln.
 
@@ -63,7 +86,7 @@ Die Kamera-Zugangsdaten können vom NVR-Adminpasswort abweichen: Reolink dokumen
 
 Eine Daueraufzeichnung wurde angefordert, aber Protect lehnte sie mit `Should not set recordingMode to 'Always' due to lack of external HDD` ab. Die vorhandene interne SSD reicht auf dieser Console dafür nicht aus. Die separate Einbindung der Kameras und Livevideo funktionieren; Daueraufzeichnung und Wiedergabe sind noch nicht nachgewiesen. Die verbleibende Speicherhürde ist eine geeignete zusätzliche Aufnahme-HDD im HDD-Schacht der Protect-Console, bevor der Reolink-NVR dauerhaft abgeschaltet wird.
 
-Der Pilot ist nach der abgeschlossenen Messung **pausiert**. Alle vier Bridge-Container wurden bewusst gestoppt und endeten mit Exitcode `143`. Die ursprünglichen UniFi-Port-Overrides des NVR-Anschlusses wurden wiederhergestellt, einschließlich `port_security_enabled: false`. Der NVR war nach rund 45 Sekunden wieder erreichbar; `GetChannelstatus` bestätigte anschließend **alle sechs Kameras mit `online: 1`**. Die Wiederherstellung des NVR-Betriebs ist damit bestätigt. Container, private Konfigurationen und die in Protect aufgenommenen Geräte bleiben für die Fortsetzung nach Einbau der Aufnahme-HDD vorbereitet.
+Nach der abgeschlossenen Messung des früheren Piloten wurden alle vier Bridge-Container bewusst gestoppt und endeten mit Exitcode `143`. Die ursprünglichen UniFi-Port-Overrides des NVR-Anschlusses wurden wiederhergestellt, einschließlich `port_security_enabled: false`. Der NVR war nach rund 45 Sekunden wieder erreichbar; `GetChannelstatus` bestätigte anschließend **alle sechs Kameras mit `online: 1`**. Diese damalige Wiederherstellung des NVR-Betriebs war bestätigt. Für den oben beschriebenen aktuellen Test wurde der NVR anschließend physisch ausgeschaltet und der Aufbau auf sechs aktive Bridges erweitert.
 
 ## Herkunft
 

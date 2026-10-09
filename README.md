@@ -2,7 +2,9 @@
 
 Eine kleine Headless-Bridge liest einen Reolink-Baichuan-Stream und stellt ihn als authentifiziertes RTSP und ONVIF bereit. Jede Bridge-Instanz verwendet genau eine Kamera und eine eigene Netzwerkadresse. Video wird weitergereicht; Auflösung, Codec und Bitrate der Kamera werden nicht verändert. Die Bridge zeichnet nicht auf und startet weder Weboberfläche noch MQTT.
 
-Die Software basiert auf [Neolink.NET v1.1.0](UPSTREAM.md), benötigt .NET 10 und steht unter der [AGPL-3.0](LICENSE). Im NAS-Pilot wurden alle sechs Kameras separat in Protect aufgenommen: eine RLC-1212A und alle drei B1200 über vier Bridge-Instanzen, RLC-823A und E1 Zoom direkt über ONVIF. Ein paralleler 45-Sekunden-Liveabruf aller sechs Kameras lief ohne Abruffehler; am gemeinsamen 100-Mbit/s-Switchzweig bleiben jedoch größere Ankunftsabstände zu untersuchen. Daueraufzeichnung und Wiedergabe bleiben bis zum Einbau einer geeigneten Aufnahme-HDD in die Protect-Console offen; die interne SSD wurde dafür von Protect abgewiesen. Der Pilot ist inzwischen pausiert: Die vier Bridges sind gestoppt, und der wiederhergestellte Reolink-NVR meldet alle sechs Kameras online. Details und Messwerte stehen in [TESTING.md](TESTING.md).
+Die Software basiert auf [Neolink.NET v1.1.0](UPSTREAM.md), benötigt .NET 10 und steht unter der [AGPL-3.0](LICENSE). In einem früheren NAS-Pilot wurden alle sechs Kameras separat in Protect aufgenommen: eine RLC-1212A und alle drei B1200 über vier Bridge-Instanzen, RLC-823A und E1 Zoom direkt über ONVIF. Ein paralleler 45-Sekunden-Liveabruf lief ohne Abruffehler; am gemeinsamen 100-Mbit/s-Switchzweig blieben jedoch größere Ankunftsabstände zu untersuchen.
+
+Im aktuellen Test laufen **alle sechs Kameras über jeweils eine eigene Bridge**, einschließlich RLC-823A und E1 Zoom. Der Reolink-NVR ist physisch ausgeschaltet; Protect meldet die sechs Bridge-Geräte als verbunden mit dem Kompatibilitätsmodus `Improved`. Ein paralleler 60-Sekunden-Abruf aller sechs Livestreams lief ohne Abruffehler. Am gemeinsamen MokerLink-Switchzweig kommen Frames weiterhin schubweise an; eine passive TCP-Messung ist zur weiteren Eingrenzung vorgesehen. Daueraufzeichnung und Wiedergabe bleiben bis zum Einbau einer geeigneten Aufnahme-HDD in die Protect-Console offen; die interne SSD wurde dafür von Protect abgewiesen. Details und Messwerte stehen in [TESTING.md](TESTING.md).
 
 ## Konfiguration
 
@@ -98,4 +100,4 @@ docker build -t reolink-bridge:pilot .
 
 Der Container nutzt das .NET-10-SDK zum Bauen und das ASP.NET-10-Runtime-Image, da das Upstream-Projekt die ASP.NET-Frameworkreferenz enthält. Das Laufzeitimage arbeitet ohne Root-Rechte. Die GitHub-Actions-Prüfung baut und testet den Quellcode und baut das Containerimage; sie veröffentlicht und installiert nichts.
 
-[TESTING.md](TESTING.md) beschreibt die 35 ONVIF-Vertragstests, die Upstream-Selbsttests, die erfolgreiche separate Integration und kurze Parallelmessung aller sechs Kameras sowie die Aufnahme-HDD als Voraussetzung für Daueraufzeichnung.
+[TESTING.md](TESTING.md) beschreibt die 35 ONVIF-Vertragstests, die Upstream-Selbsttests, den früheren Paralleltest mit vier Bridges und zwei direkten Kameras sowie den aktuellen Test mit sechs Bridges. Die Aufnahme-HDD bleibt Voraussetzung für Daueraufzeichnung.
