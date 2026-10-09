@@ -147,6 +147,11 @@ public sealed class BcCamera : IBcCamera
         await _conn.SendAsync(modern, ct).ConfigureAwait(false);
 
         var modernReply = await sub.ReceiveAsync(RxTimeout, ct).ConfigureAwait(false);
+        // A phase-two 401 is an explicit credential refusal, including firmware
+        // that sends an XML error rather than an empty modern message. Treating
+        // that reply as a generic protocol fault would retry the same password.
+        if (modernReply.Meta.ResponseCode == 401)
+            throw new AuthFailedException("Camera rejected the credentials");
         if (modernReply.Xml?.DeviceInfo != null)
         {
             DeviceInfo = modernReply.Xml.DeviceInfo;

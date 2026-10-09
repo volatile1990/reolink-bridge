@@ -49,12 +49,16 @@ public sealed partial class ProtectOnvifServer
         _rtspPort = rtspPort;
     }
 
-    public bool Healthy => _streams.All(s => s.Hub.VideoReady && s.Hub.LiveVideo && Matches(s)
+    public bool Healthy => _streams.All(s => !s.Hub.AuthenticationFailed
+        && s.Hub.VideoReady && s.Hub.LiveVideo && Matches(s)
         && s.Hub.GetVideoDiagnostics().LastVideoAgeMs is >= 0 and <= 5000);
+
+    private string SourceStatus(bool healthy) => _streams.Any(s => s.Hub.AuthenticationFailed)
+        ? "authentication-failed" : healthy ? "ready" : "waiting-for-camera";
 
     private string MetricsJson() => JsonSerializer.Serialize(new
     {
-        status = Healthy ? "ready" : "waiting-for-camera",
+        status = SourceStatus(Healthy),
         uptimeSeconds = System.Diagnostics.Stopwatch.GetElapsedTime(_startedTimestamp).TotalSeconds,
         streams = _streams.Select(stream =>
         {
@@ -72,6 +76,7 @@ public sealed partial class ProtectOnvifServer
                 sourceUptimeSeconds = diagnostics.UptimeSeconds,
                 videoReady = stream.Hub.VideoReady,
                 liveVideo = stream.Hub.LiveVideo,
+                authenticationFailed = stream.Hub.AuthenticationFailed,
                 viewers = stream.Hub.ViewerCount
             };
         }).ToArray()
@@ -176,7 +181,7 @@ public sealed partial class ProtectOnvifServer
                 bool health = request[1] == "/health";
                 bool ready = Healthy;
                 int status = health ? ready ? 200 : 503 : 404;
-                string body = health ? ready ? "{\"status\":\"ready\"}" : "{\"status\":\"waiting-for-camera\"}" : "";
+                string body = health ? JsonSerializer.Serialize(new { status = SourceStatus(ready) }) : "";
                 await RespondAsync(stream, status, body, true, ct, "application/json");
                 return;
             }

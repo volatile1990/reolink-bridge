@@ -49,7 +49,7 @@ internal static class ContractTests
             new ProtectOnvifStream("sub", "/test/subStream", sub)
         };
         var server = new ProtectOnvifServer(config, users, streams, 18554);
-        using var cancellation = new CancellationTokenSource(TimeSpan.FromSeconds(45));
+        using var cancellation = new CancellationTokenSource(TimeSpan.FromSeconds(90));
         Task serving = server.RunAsync(cancellation.Token);
         using var http = new HttpClient { BaseAddress = new Uri($"http://127.0.0.1:{port}"), Timeout = TimeSpan.FromSeconds(3) };
         int failures = 0, passed = 0;
@@ -141,7 +141,7 @@ internal static class ContractTests
                 Assert(root.GetProperty("uptimeSeconds").GetDouble() >= 0, "negative endpoint uptime");
                 var diagnostics = root.GetProperty("streams").EnumerateArray().ToArray();
                 Assert(diagnostics.Length == 2, "metrics lost a profile");
-                var fields = new HashSet<string>(["profile", "codec", "width", "height", "incomingFrames", "incomingVideoBytes", "lastVideoAgeMs", "maxArrivalGapMs", "sourceUptimeSeconds", "videoReady", "liveVideo", "viewers"]);
+                var fields = new HashSet<string>(["profile", "codec", "width", "height", "incomingFrames", "incomingVideoBytes", "lastVideoAgeMs", "maxArrivalGapMs", "sourceUptimeSeconds", "videoReady", "liveVideo", "authenticationFailed", "viewers"]);
                 foreach (var item in diagnostics)
                 {
                     Assert(fields.SetEquals(item.EnumerateObject().Select(x => x.Name)), "unexpected or missing stream metric fields");
@@ -343,6 +343,11 @@ internal static class ContractTests
                 finally { File.Delete(path); }
             });
             await Test("unsupported mutation produces a fault", async () => Fault(await Call("SetSystemFactoryDefault", extra: "<m:FactoryDefault>Hard</m:FactoryDefault>")));
+            await Test("nonempty Baichuan phase-two 401 is an authentication failure", AuthParkingTests.Explicit401IsAuthenticationFailure);
+            await Test("existing empty Baichuan refusal remains an authentication failure", AuthParkingTests.ExistingEmptyReplyRemainsAuthenticationFailure);
+            await Test("Baichuan phase-two XML 500 remains a protocol failure", AuthParkingTests.OtherXmlFailureRemainsProtocolFailure);
+            await Test("RelayOnly transport failure still reconnects", AuthParkingTests.TransportFailureStillReconnects);
+            await Test("RelayOnly authentication failures park for more than 30 seconds while listeners remain alive", AuthParkingTests.AuthenticationFailuresParkWithoutRetry);
         }
         finally
         {

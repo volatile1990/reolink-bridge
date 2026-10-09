@@ -23,6 +23,9 @@ public interface IMediaSink
     /// viewer joining while the source is down isn't primed with stale frames that
     /// play for a second and freeze.</summary>
     void SourceStopped();
+    /// <summary>Headless bridge login was refused. Source stays parked until restart;
+    /// implementations without source status still discard any live session cache.</summary>
+    void SourceAuthenticationFailed() => SourceStopped();
 }
 
 /// <summary>
@@ -50,6 +53,8 @@ public interface IStreamHub
     /// <summary>A publisher is sending video now (a keyframe seen since it started), even while its
     /// group of pictures is too big to buffer; a frame from it means waiting for the next keyframe.</summary>
     bool LiveVideo => HasBufferedGop;
+    /// <summary>A bridge source is parked after a credential refusal. Cleared by a fresh instance.</summary>
+    bool AuthenticationFailed => false;
     VideoCodec? Codec { get; }
     byte[]? Sps { get; }
     byte[]? Pps { get; }

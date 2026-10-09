@@ -77,6 +77,8 @@ Die Zähler und der maximale Abstand gelten seit dem Prozessstart und schließen
 
 Für die tatsächliche Bilderrate und Bitrate zwei Messungen mit bekanntem Abstand `Δt` in Sekunden vergleichen: `FPS = ΔincomingFrames / Δt`, `Bitrate in bit/s = 8 × ΔincomingVideoBytes / Δt`. Für Mbit/s zusätzlich durch `1.000.000` teilen. Damit lässt sich ein stockender Kameraeingang von Problemen bei der Wiedergabe in Protect unterscheiden; die Werte messen den Eingang der Bridge.
 
+Im Headless-Pilot beendet eine ausdrücklich abgewiesene Kamera-Anmeldung (HTTP 401 in der zweiten Loginphase oder `AuthFailedException`) weitere Anmeldeversuche bis zum manuellen Neustart nach Korrektur der Zugangsdaten. Die RTSP- und ONVIF-Server bleiben erreichbar, `/health` liefert HTTP 503 und `/metrics` meldet `status: "authentication-failed"` sowie `authenticationFailed: true` am betroffenen Stream. Der Container bleibt laufen und gerät dadurch nicht in eine automatische Neustartschleife. Verbindungsfehler und Timeouts lösen weiterhin die üblichen Wiederverbindungsversuche aus.
+
 ## Stoppen und erweitern
 
 ```sh
@@ -96,4 +98,4 @@ docker build -t reolink-bridge:pilot .
 
 Der Container nutzt das .NET-10-SDK zum Bauen und das ASP.NET-10-Runtime-Image, da das Upstream-Projekt die ASP.NET-Frameworkreferenz enthält. Das Laufzeitimage arbeitet ohne Root-Rechte. Die GitHub-Actions-Prüfung baut und testet den Quellcode und baut das Containerimage; sie veröffentlicht und installiert nichts.
 
-[TESTING.md](TESTING.md) beschreibt die 30 ONVIF-Vertragstests, die Upstream-Selbsttests und den aktuellen NAS-Pilotstand einschließlich der noch offenen B1200-Kompatibilität.
+[TESTING.md](TESTING.md) beschreibt die 35 ONVIF-Vertragstests, die Upstream-Selbsttests und den aktuellen NAS-Pilotstand einschließlich der noch offenen B1200-Kompatibilität.

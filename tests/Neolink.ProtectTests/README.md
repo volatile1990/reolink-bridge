@@ -27,6 +27,16 @@ No waiting is needed to simulate a stalled source. The `/metrics` endpoint must
 require valid HTTP Basic credentials and expose only the documented diagnostic
 fields, with no source addresses, camera names or authentication details.
 
+The authentication-parking checks use a synthetic Baichuan TCP camera on
+loopback and the actual `BcCamera` and `CameraService`. They distinguish an
+explicit phase-two 401, an older empty modern refusal and a non-authentication
+500 reply. Both authentication refusals must make just one login attempt during
+a parallel 32-second observation window, longer than the former retry delay.
+RTSP and ONVIF remain responsive, health reports failure, authenticated metrics
+identify the failure, and cancellation still completes promptly. A transport
+disconnect must continue to reconnect. These checks add about 33 seconds to the
+contract test run and do not contact physical cameras.
+
 These checks establish protocol behavior only. They do not establish that a
 specific camera's Baichuan video is decodable, that UniFi Protect will render
 H.265 in a particular browser, or that an actual deployment sustains recording.

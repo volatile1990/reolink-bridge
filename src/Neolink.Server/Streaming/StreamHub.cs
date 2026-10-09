@@ -44,6 +44,7 @@ public sealed class StreamHub : IStreamHub, IMediaSink
     private long _videoBytes;
     private long _lastVideoTimestamp;
     private long _maxVideoGapTicks;
+    private int _authenticationFailed;
 
     // GOP cache: the ordered packets since (and including) the most recent video
     // keyframe. A brand-new viewer is primed with this so it has a decodable
@@ -111,6 +112,13 @@ public sealed class StreamHub : IStreamHub, IMediaSink
 
     public long VideoFrameCount => Interlocked.Read(ref _videoFrameCount);
     public long VideoBytes => Interlocked.Read(ref _videoBytes);
+    public bool AuthenticationFailed => Volatile.Read(ref _authenticationFailed) != 0;
+
+    public void SourceAuthenticationFailed()
+    {
+        Interlocked.Exchange(ref _authenticationFailed, 1);
+        SourceStopped();
+    }
 
     public VideoDiagnostics GetVideoDiagnostics()
     {

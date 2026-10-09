@@ -777,6 +777,19 @@ public sealed class CameraService : ILiveCameraSource
             }
             catch (AuthFailedException ex)
             {
+                if (RelayOnly)
+                {
+                    // A configured password will not change while this headless
+                    // instance is running. Keep listeners alive for diagnostics,
+                    // but never repeat a rejected login or exit into Docker's
+                    // restart policy. Fix the credentials, then restart the bridge.
+                    _hub.SourceAuthenticationFailed();
+                    Log.Error($"{Tag}: camera authentication failed; login attempts are paused " +
+                              "until the bridge is restarted with corrected credentials");
+                    try { await Task.Delay(Timeout.InfiniteTimeSpan, ct).ConfigureAwait(false); }
+                    catch (OperationCanceledException) when (ct.IsCancellationRequested) { }
+                    return;
+                }
                 // Wrong credentials are permanent, but cameras also reject logins
                 // transiently (rebooting, user table full), so retry at a slow pace
                 // rather than giving up for good.
