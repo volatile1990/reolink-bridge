@@ -213,6 +213,34 @@ internal static class GopPlayoutWireTests
         Check(hub.GetVideoDiagnostics().IncomingFrames == 2104, "local subscriber recovery modified source frame accounting");
     }
 
+    public static async Task RawClockJumpPictures()
+    {
+        var clock = new ManualTimeProvider(); var waits = new ControlledWait(clock);
+        var hub = new StreamHub("synthetic", clock); hub.PublishInfo(new MediaInfo(1920, 1080, 20)); hub.PublishVideo(Key());
+        await using var wire = await Wire.Start(hub, true, 2500, clock, waits.Wait);
+        await wire.Setup("/synthetic"); await wire.Command("PLAY", "/synthetic"); await Viewers(hub, 1);
+        clock.Advance(TimeSpan.FromMilliseconds(50));
+        hub.PublishVideo(new VideoFrame(VideoCodec.H265, false, 50000, null, Annex(P)));
+        clock.Advance(TimeSpan.FromMilliseconds(2145));
+        byte[] afterJump = [0x02, 0x01, 0x80, 0x83];
+        hub.PublishVideo(new VideoFrame(VideoCodec.H265, false, 12_177_668, null, Annex(afterJump)));
+        clock.Advance(TimeSpan.FromMilliseconds(50)); hub.PublishVideo(Key(12_227_668));
+        var reserve = await waits.Next();
+        Check(reserve.Delay == TimeSpan.FromMilliseconds(2500), "configured fallback reserve was not applied");
+        reserve.Release(); var first = await wire.Picture();
+        (await waits.Next()).Release(); var second = await wire.Picture();
+        (await waits.Next()).Release(); var third = await wire.Picture();
+        Check(unchecked(second.Timestamp - first.Timestamp) == 67350
+            && unchecked(third.Timestamp - second.Timestamp) == 67350,
+            "raw-clock fallback does not distribute all three pictures over the measured 2.245s GOP");
+        Check(second.Nals.Count == 1 && second.Nals[0].SequenceEqual(P)
+            && third.Nals.Count == 1 && third.Nals[0].SequenceEqual(afterJump),
+            "raw camera jump discarded or rewrote a valid encoded picture");
+        var source = hub.GetVideoDiagnostics(); var raw = hub.GetVideoBufferDiagnostics();
+        Check(source.IncomingFrames == 4 && raw.TotalAccessUnits == 4 && raw.MaxCameraTimestampDeltaUs == 12_127_668,
+            "output smoothing changed original source diagnostics");
+    }
+
     private static async Task Viewers(StreamHub hub, int count)
     {
         using var limit = new CancellationTokenSource(TimeSpan.FromSeconds(3));
@@ -258,7 +286,14 @@ internal static class GopPlayoutWireTests
             public TimeSpan Delay { get; } = delay;
             public TaskCompletionSource Gate { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
             public TaskCompletionSource Cancelled { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
-            public void Release() { clock.Advance(Delay); Gate.TrySetResult(); }
+            public void Release()
+            {
+                // A fake timer must wake at or after the due instant. Truncating
+                // a fractional 90-kHz offset to this clock's 1-us granularity
+                // can otherwise leave a sub-tick remainder that never elapses.
+                clock.AdvanceTimestampTicks((long)Math.Ceiling(Delay.Ticks / 10d));
+                Gate.TrySetResult();
+            }
         }
     }
 

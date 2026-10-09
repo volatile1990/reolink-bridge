@@ -777,6 +777,7 @@ internal sealed class RtspSession
                 _conn.Server.PlayoutTimeProvider, _conn.Server.PlayoutWaiter)
             : null;
         long sourceEpoch = hub.SourceEpoch;
+        bool? uniformCadence = null;
         // Owned by THIS pump, reused per frame: each send is awaited before the
         // next frame packetizes, and a PAUSE/PLAY successor pump gets its own
         // buffer rather than resetting one a cancelled write may still be reading.
@@ -821,6 +822,10 @@ internal sealed class RtspSession
                         {
                             var complete = playout.Push(v);
                             if (complete == null) continue;
+                            if (uniformCadence.HasValue && uniformCadence.Value != complete.UniformCadence)
+                                Log.Info($"{hub.Name}: RTSP GOP cadence changed to {(complete.UniformCadence ? "uniform" : "source")}, " +
+                                    $"pictures={complete.Pictures.Count}, duration={complete.Duration.TotalMilliseconds:F1}ms");
+                            uniformCadence = complete.UniformCadence;
                             complete = playout.BeginGop(complete);
                             foreach (var picture in complete.Pictures)
                             {

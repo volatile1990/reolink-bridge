@@ -185,11 +185,13 @@ internal static class ContractTests
             await Test("GOP playout wraps continuously and cancels its reserve promptly", GopVideoPlayoutTests.WrapAndCancel);
             await Test("GOP playout bounds memory frames time and recovers only at complete keyframes", GopVideoPlayoutTests.BoundsAndRecovery);
             await Test("GOP playout splits pictures while preserving parameter slices and SEI", GopVideoPlayoutTests.MultiAuAndMetadata);
+            await Test("GOP playout retains valid pictures when source clocks or AU bundles need uniform timing", GopVideoPlayoutTests.SourceClockFallback);
             await Test("GOP config defaults aliases and source arrival metadata are correct", GopPlayoutWireTests.ConfigAndMetadata);
             await Test("actual RTSP aliases normalize AU timestamps markers and FU bytes", GopPlayoutWireTests.WireAliasesAndPictures);
             await Test("default RTSP is unchanged and GOP mounts explicitly refuse audio", GopPlayoutWireTests.DefaultAndAudioScope);
             await Test("actual RTSP PAUSE TEARDOWN and source resets cancel delayed old GOPs", GopPlayoutWireTests.CancelAndEpochRecovery);
             await Test("actual RTSP queue gaps discard partial GOPs and recover at a fresh keyframe", GopPlayoutWireTests.QueueGapRecovery);
+            await Test("actual RTSP retains all encoded pictures across a twelve-second raw clock jump", GopPlayoutWireTests.RawClockJumpPictures);
             await Test("stopping and resuming a source preserves lifetime diagnostic counters", () =>
             {
                 var clock = new ManualTimeProvider();
@@ -495,4 +497,5 @@ internal sealed class ManualTimeProvider : TimeProvider
     public DateTimeOffset WallClock { get; set; } = DateTimeOffset.UnixEpoch;
     public override DateTimeOffset GetUtcNow() => WallClock;
     public void Advance(TimeSpan duration) => Interlocked.Add(ref _timestamp, (long)(duration.TotalSeconds * TimestampFrequency));
+    public void AdvanceTimestampTicks(long ticks) => Interlocked.Add(ref _timestamp, ticks);
 }

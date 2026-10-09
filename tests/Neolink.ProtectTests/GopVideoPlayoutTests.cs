@@ -24,12 +24,13 @@ internal static class GopVideoPlayoutTests
         nals.SelectMany(nal => new byte[] { 0, 0, 0, 1 }.Concat(nal)).ToArray();
 
     private static HubVideo Packet(long index, uint timestamp, long arrivalUs, bool keyframe = false,
-        byte[]? bytes = null, long epoch = 0, long frequency = 1_000_000) =>
+        byte[]? bytes = null, long epoch = 0, long frequency = 1_000_000, uint? cameraMicroseconds = null) =>
         new(index, bytes ?? Annex(keyframe ? Idr : Predicted), keyframe, timestamp)
         {
             SourceEpoch = epoch,
             ArrivalTimestamp = arrivalUs,
-            ArrivalTimestampFrequency = frequency
+            ArrivalTimestampFrequency = frequency,
+            CameraMicroseconds = cameraMicroseconds
         };
 
     private static CompletedVideoGop Close(GopVideoPlayout playout, HubVideo nextKeyframe) =>
@@ -244,13 +245,13 @@ internal static class GopVideoPlayoutTests
             invalid.Push(Packet(0, 1000, 0, true));
             Check(invalid.Push(Packet(1, 5500, badArrival, true)) == null, "invalid GOP wall span was emitted");
         }
-        var timestampJump = new GopVideoPlayout(VideoCodec.H265, 0);
-        timestampJump.Push(Packet(0, 1000, 0, true));
-        Check(timestampJump.Push(Packet(1, 1_115_000, 1_000_000)) == null && timestampJump.BufferedFrames == 0,
-            "12-second camera timestamp jump invented a long picture interval");
-        timestampJump.Push(Packet(2, 1_119_500, 1_050_000, true));
-        Check(Close(timestampJump, Packet(3, 1_124_000, 1_100_000, true)).Pictures.Count == 1,
-            "timestamp-discontinuity recovery did not wait for a new complete GOP");
+        var wallJump = new GopVideoPlayout(VideoCodec.H265, 0);
+        wallJump.Push(Packet(0, 1000, 0, true));
+        Check(wallJump.Push(Packet(1, 5500, 5_000_001)) == null && wallJump.BufferedFrames == 0,
+            "a GOP exceeding the real five-second wall bound remained retained");
+        wallJump.Push(Packet(2, 10_000, 5_050_000, true));
+        Check(Close(wallJump, Packet(3, 14_500, 5_100_000, true)).Pictures.Count == 1,
+            "wall-discontinuity recovery did not wait for a new complete GOP");
 
         var epoch = new GopVideoPlayout(VideoCodec.H265, 0);
         epoch.Push(Packet(0, 1000, 0, true, epoch: 1));
@@ -259,6 +260,90 @@ internal static class GopVideoPlayoutTests
         epoch.Push(Packet(2, 10_000, 100_000, true, epoch: 2));
         Check(Close(epoch, Packet(3, 14_500, 150_000, true, epoch: 2)).Pictures.All(picture => picture.SourceEpoch == 2),
             "recovered GOP contains pictures from a stopped publisher");
+        return Task.CompletedTask;
+    }
+
+    public static Task SourceClockFallback()
+    {
+        // Real source ordering is sound while camera-derived timestamps may be
+        // stale, repaired, backwards or discontinuous. None invents or drops pictures.
+        var cases = new (uint[] Rtp, uint?[] Camera)[]
+        {
+            ([1000, 5500, 14_500, 19_000], [0, 12_127_000, 12_177_000, 12_227_000]),
+            ([1000, 1_115_000, 1_119_500, 1_124_000], [null, null, null, null]),
+            ([1000, 1000, 1000, 1000], [null, null, null, null]),
+            ([1000, 5500, 4000, 8500], [null, null, null, null]),
+            ([1000, 5500, 14_500, 1000], [null, null, null, null]),
+            ([1000, 1001, 199_999, 200_000], [null, null, null, null])
+        };
+        foreach (var item in cases)
+        {
+            var playout = new GopVideoPlayout(VideoCodec.H265, 0);
+            var originals = new List<byte[]>();
+            for (int i = 0; i < 3; i++)
+            {
+                byte[] original = Annex(i == 0 ? Idr : Predicted);
+                originals.Add(original);
+                Check(playout.Push(Packet(i, item.Rtp[i], i * 100_000L, i == 0,
+                    original, cameraMicroseconds: item.Camera[i])) == null,
+                    "source-clock fallback emitted before a complete GOP");
+                Check(playout.BufferedFrames == i + 1, "unreliable source timestamp discarded a received picture");
+            }
+            var complete = Close(playout, Packet(3, item.Rtp[3], 300_000, true,
+                cameraMicroseconds: item.Camera[3]));
+            Check(complete.Pictures.Count == 3, "source-clock fallback changed the received picture count");
+            Near(complete.Duration.TotalMilliseconds, 300, 0.02, "fallback duration came from the bad camera clock");
+            uint first = complete.Pictures[0].RtpTimestamp;
+            for (int i = 0; i < complete.Pictures.Count; i++)
+            {
+                Near(complete.Pictures[i].Offset.TotalMilliseconds, i * 100, 0.02,
+                    "bad source clock was not replaced by actual-GOP-duration/actual-picture-count");
+                Check(unchecked(complete.Pictures[i].RtpTimestamp - first) == i * 9000,
+                    "uniform fallback output timestamp disagrees with its paced position");
+                Check(complete.Pictures[i].AnnexB.SequenceEqual(originals[i]),
+                    "source-clock fallback changed original encoded picture bytes");
+            }
+        }
+
+        // A middle-of-GOP four-picture bundle must be distributed across the
+        // whole observed GOP, not crammed into its next 50-ms buffer interval.
+        var bundled = new GopVideoPlayout(VideoCodec.H265, 0);
+        bundled.Push(Packet(0, 1000, 0, true));
+        byte[] fourPictures = Annex(Predicted, Predicted, Predicted, Predicted);
+        Check(bundled.Push(Packet(1, 5500, 100_000, false, fourPictures)) == null
+            && bundled.BufferedFrames == 5, "bundled fallback did not retain all five real pictures");
+        var five = Close(bundled, Packet(2, 10_000, 300_000, true));
+        Check(five.Pictures.Count == 5, "uniform bundled GOP added or omitted pictures");
+        for (int i = 0; i < five.Pictures.Count; i++)
+            Near(five.Pictures[i].Offset.TotalMilliseconds, i * 60, 0.02,
+                "bundled GOP used per-buffer PTS interpolation or an invented fixed FPS");
+        Check(five.Pictures.Skip(1).SelectMany(picture => H26x.SplitNals(picture.AnnexB))
+            .SelectMany(nal => nal.ToArray()).SequenceEqual(H26x.SplitNals(fourPictures).SelectMany(nal => nal.ToArray())),
+            "uniform bundled fallback changed encoded picture bytes");
+
+        // A valid modulo clock wrap keeps the existing variable source cadence.
+        const uint wrapped = uint.MaxValue - 10;
+        var validWrap = new GopVideoPlayout(VideoCodec.H265, 0);
+        validWrap.Push(Packet(0, wrapped, 0, true, cameraMicroseconds: wrapped));
+        validWrap.Push(Packet(1, unchecked(wrapped + 4500), 60_000,
+            cameraMicroseconds: unchecked(wrapped + 50_000)));
+        var wrappedGop = Close(validWrap, Packet(2, unchecked(wrapped + 13_500), 180_000, true,
+            cameraMicroseconds: unchecked(wrapped + 150_000)));
+        Near(wrappedGop.Pictures[1].Offset.TotalMilliseconds, 60, 0.02,
+            "a legitimate clock wrap incorrectly activated uniform cadence");
+
+        // Bundling in the closing keyframe belongs to the following GOP only.
+        var nextBundle = new GopVideoPlayout(VideoCodec.H265, 0);
+        nextBundle.Push(Packet(0, 1000, 0, true));
+        nextBundle.Push(Packet(1, 5500, 75_000));
+        nextBundle.Push(Packet(2, 14_500, 225_000));
+        var preceding = Close(nextBundle, Packet(3, 19_000, 300_000, true, Annex(Idr, Predicted)));
+        Check(preceding.Pictures.Count == 3 && nextBundle.BufferedFrames == 2,
+            "closing keyframe's bundle was assigned to the preceding GOP");
+        Near(preceding.Pictures[1].Offset.TotalMilliseconds, 75, 0.02,
+            "next GOP's bundled keyframe flattened a valid preceding GOP");
+        Near(preceding.Pictures[2].Offset.TotalMilliseconds, 225, 0.02,
+            "preceding GOP lost its legitimate variable cadence");
         return Task.CompletedTask;
     }
 

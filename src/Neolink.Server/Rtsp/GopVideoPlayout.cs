@@ -6,11 +6,13 @@ namespace Neolink.Rtsp;
 
 internal sealed record GopPlayoutPicture(byte[] AnnexB, bool Keyframe, bool HasSps,
     uint RtpTimestamp, TimeSpan Offset, long SourceEpoch);
-internal sealed record CompletedVideoGop(IReadOnlyList<GopPlayoutPicture> Pictures, TimeSpan Duration, long SourceEpoch);
+internal sealed record CompletedVideoGop(IReadOnlyList<GopPlayoutPicture> Pictures, TimeSpan Duration,
+    long SourceEpoch, bool UniformCadence = false);
 
 /// <summary>One RTSP pump owns this object. It releases only a complete bounded GOP,
-/// scales its camera PTS onto the measured keyframe-arrival wall duration, and paces
+/// scales plausible camera PTS onto the measured keyframe-arrival wall duration, and paces
 /// the new outbound timeline. Source timestamps and encoded NAL contents stay intact.
+/// Bundled pictures or unreliable source clocks use actual GOP duration/picture count.
 /// One complete output GOP plus the next keyframe are at most two 6-MiB groups;
 /// the existing bounded subscriber channel remains the source/backpressure boundary.</summary>
 internal sealed class GopVideoPlayout
@@ -26,7 +28,7 @@ internal sealed class GopVideoPlayout
     private int _prefixBytes;
     private long? _prefixEpoch;
     private int _bytes, _pictures;
-    private bool _haveOutputTimestamp, _scheduleStarted;
+    private bool _haveOutputTimestamp, _scheduleStarted, _uniformCadence;
     private uint _nextOutputTimestamp;
     private long _scheduleEpoch;
     private TimeSpan _scheduledDuration, _currentGopOffset;
@@ -50,7 +52,7 @@ internal sealed class GopVideoPlayout
     /// <summary>Discard pending input and scheduling state; keep the outbound RTP clock continuous.</summary>
     public void Reset()
     {
-        _buffers.Clear(); _bytes = _pictures = 0;
+        _buffers.Clear(); _bytes = _pictures = 0; _uniformCadence = false;
         _prefixMetadata.Clear(); _prefixBytes = 0; _prefixEpoch = null;
         _scheduleStarted = false; _scheduledDuration = _currentGopOffset = TimeSpan.Zero;
     }
@@ -103,18 +105,22 @@ internal sealed class GopVideoPlayout
         bool sane = video.SourceEpoch == first.SourceEpoch
             && video.ArrivalTimestampFrequency == first.ArrivalTimestampFrequency
             && video.ArrivalTimestamp >= last.ArrivalTimestamp
-            && ArrivalSeconds(first, video) is >= 0 and <= 5
-            && step is > 0 and <= MaxRtpSpan && span is > 0 and <= MaxRtpSpan && cameraSane;
+            && ArrivalSeconds(first, video) is >= 0 and <= 5;
         if (!sane)
         {
             Reset();
             if (video.Keyframe && incoming.Pictures > 0) Append(incoming);
             return null;
         }
+        // Camera clocks can jump or be repaired independently of sound source
+        // ordering. Preserve those received pictures and use the complete GOP's
+        // measured wall span instead of discarding a valid group.
+        if (step is 0 or > MaxRtpSpan || span is 0 or > MaxRtpSpan || !cameraSane)
+            _uniformCadence = true;
         if (video.Keyframe)
         {
             var completed = Complete(video, span);
-            _buffers.Clear(); _bytes = _pictures = 0;
+            _buffers.Clear(); _bytes = _pictures = 0; _uniformCadence = false;
             if (completed == null) Reset();
             if (incoming.Pictures > 0) Append(incoming);
             return completed;
@@ -128,6 +134,7 @@ internal sealed class GopVideoPlayout
     private void Append(SourceBuffer buffer)
     {
         _buffers.Add(buffer); _bytes += buffer.Video.AnnexB.Length; _pictures += buffer.Pictures;
+        _uniformCadence |= buffer.Pictures > 1;
     }
 
     private static double ArrivalSeconds(HubVideo first, HubVideo last) =>
@@ -140,28 +147,38 @@ internal sealed class GopVideoPlayout
         if (seconds <= 0 || _pictures == 0) return null;
         long durationTicks = (long)Math.Round(seconds * 90000);
         if (durationTicks < _pictures || durationTicks > MaxRtpSpan) return null;
+        bool uniform = _uniformCadence;
+        var positions = new long[_pictures];
+        if (!uniform)
+        {
+            long previous = -1;
+            int index = 0;
+            foreach (var buffer in _buffers)
+            {
+                // A non-uniform GOP contains only one picture per source buffer.
+                uint offset = unchecked(buffer.Video.RtpTs - first.RtpTs);
+                long position = (long)Math.Round(offset * (double)durationTicks / sourceSpan);
+                if (position <= previous || position >= durationTicks)
+                { uniform = true; break; }
+                positions[index++] = position; previous = position;
+            }
+        }
+        if (uniform)
+            for (int i = 0; i < positions.Length; i++)
+                positions[i] = (long)Math.Round(i * (double)durationTicks / _pictures);
         uint start = _haveOutputTimestamp ? _nextOutputTimestamp : first.RtpTs;
         var pending = new List<ReadOnlyMemory<byte>>();
         var pictures = new List<GopPlayoutPicture>(_pictures);
         int outputBytes = 0;
-        long previousPosition = -1;
         for (int bufferIndex = 0; bufferIndex < _buffers.Count; bufferIndex++)
         {
             var buffer = _buffers[bufferIndex];
-            uint offset = unchecked(buffer.Video.RtpTs - first.RtpTs);
-            uint nextOffset = bufferIndex + 1 < _buffers.Count
-                ? unchecked(_buffers[bufferIndex + 1].Video.RtpTs - first.RtpTs) : sourceSpan;
             int pictureIndex = 0;
             foreach (var unit in buffer.Units)
             {
                 pending.AddRange(unit.Nals);
                 if (!unit.HasVcl) continue;
-                // A bundled buffer has one source timestamp. Spread its pictures
-                // over the known interval up to the next buffer, never a guessed fixed FPS.
-                double sourcePosition = offset + (nextOffset - offset) * (pictureIndex / (double)buffer.Pictures);
-                long position = (long)Math.Round(sourcePosition * durationTicks / sourceSpan);
-                if (position <= previousPosition || position >= durationTicks) return null;
-                previousPosition = position;
+                long position = positions[pictures.Count];
                 int bytes = pending.Sum(nal => checked(4 + nal.Length));
                 if (outputBytes + bytes > MaxBytes) return null;
                 outputBytes += bytes;
@@ -186,7 +203,7 @@ internal sealed class GopVideoPlayout
         }
         _haveOutputTimestamp = true;
         _nextOutputTimestamp = unchecked(start + (uint)durationTicks);
-        return new CompletedVideoGop(pictures, TimeSpan.FromSeconds(durationTicks / 90000d), first.SourceEpoch);
+        return new CompletedVideoGop(pictures, TimeSpan.FromSeconds(durationTicks / 90000d), first.SourceEpoch, uniform);
     }
 
     public CompletedVideoGop BeginGop(CompletedVideoGop gop)
