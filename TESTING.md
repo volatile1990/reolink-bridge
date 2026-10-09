@@ -10,9 +10,11 @@ dotnet run --project src/Neolink.Server/Neolink.Server.csproj --configuration Re
 dotnet run --project tests/Neolink.ProtectTests/Neolink.ProtectTests.csproj --configuration Release
 ```
 
-Die letzten lokalen Läufe bestanden mit **159 Upstream-Selbsttests und 35 ONVIF-Vertragstests**. Der Release-Build hatte keine Fehler oder Warnungen.
+Die lokalen Prüfungen umfassen **159 Upstream-Selbsttests und 49 ONVIF-/RTSP-Vertragstests**. Der Release-Build wird einschließlich der GOP-Ausgabe ohne Fehler oder Warnungen geprüft.
 
 Die zusätzlichen Vertragstests starten den tatsächlichen HTTP-Listener auf Loopback und verwenden synthetische Zugangsdaten und Medienzustände. Sie prüfen Geräteidentität und stabile UUID/MAC, Media1/Media2, ehrliche H.265-/H.264-Profile, RTSP-URLs, WSSE-/Basic-Anmeldung, Zeitabweichung und Replay-Schutz, Bereitschaft des Streams, XML-/XXE-Abweisung sowie die strenge Pilot-Konfiguration. Sie verbinden sich mit keiner echten Kamera. Details stehen im [Testprojekt](tests/Neolink.ProtectTests/README.md).
+
+Die GOP-Tests prüfen zusätzlich den tatsächlichen RTSP-TCP-Pfad: beide Mount-Aliase, einzelne RTP-Marker und Zeitstempel pro Bild, unveränderte codierte NAL-Inhalte auch nach FU-Fragmentierung, die unveränderte Standardausgabe sowie Audio-Abweisung im ausdrücklich aktivierten Video-Modus. Deterministische Uhren prüfen Drift, Wrap, begrenzte GOP-Puffer, Metadaten und Wiederaufnahme nach einer Lücke. PAUSE, TEARDOWN, Source-Wechsel und die echte DropOldest-Subscriberqueue sind ebenfalls abgedeckt.
 
 ## Echter NAS-Pilot
 
@@ -50,6 +52,16 @@ Eine weitere 60-Sekunden-Messung erfasste ausschließlich TCP-Header der drei Qu
 | RLC-823A | 6,434 | 66,167 ms |
 
 Damit ist in diesem Beobachtungsfenster kein Paketverlust oder Empfangsstau als Ursache bestätigt. TCP-Paketabstände und vollständige Video-Frames messen unterschiedliche Stufen. Die passive Messung lief nach der oben dokumentierten Frame-Messung; sie korreliert daher nicht exakt mit deren einzelnen Aussetzern. Offload, Capture-Grenzen und andere Betriebszeiten begrenzen die Aussage. Für verbleibende längere Frame-Pausen sind zeitgleich erfasste Transport- und Baichuan-/Parser-Metriken die nächste Eingrenzung; ein MokerLink-Hardwarefehler ist bislang nicht bewiesen.
+
+### Eingrenzung der stockenden B1200, Instanz 3
+
+Eine Diagnoseversion mit Softwarestand `6e7b1de` wurde ausschließlich auf B1200-Instanz 3 eingesetzt. Nach rund 979 Sekunden waren 16.886 Videobuffer und 17.123 geschätzte Access Units erfasst: 110 Buffer enthielten mehrere Bilder, der größte bis zu 16. Es gab keine GOP-Cache-Eviction. Die größten codierten Buffer überschritten 1 MB. Die anfängliche 92-Sekunden-Stichprobe hatte noch keine gebündelten Bilder erkannt; erst der längere Lauf bestätigte diesen Fall.
+
+Eine zusätzliche 30-Sekunden-RTSP-Probe verwarf drei Sekunden Aufwärmphase. Sie empfing 474 vollständige RTP-Markergruppen ohne Sequenzunterbrechung oder unvollständige Gruppen. Über 26,968 Sekunden Empfangszeit liefen nur 23,901 Sekunden RTP-Zeit; der größte Ankunftsabstand betrug 645 ms vor einem Schlüsselbild mit rund 715 kB. Dessen RTP-Abstand zum vorigen Bild war nur rund 50 ms. Diese Probe misst Transport-Metadaten und dekodiert keine Bilder.
+
+Die separat nachfolgende Protect-fMP4-Probe lief ebenfalls 30 Sekunden mit drei Sekunden Aufwärmphase und `useWallClock: false`. 241 gemessene Fragmente enthielten 477 Videoproben. Ihre Decode-Start-Zeitspanne betrug 26,777 Sekunden bei 26,688 Sekunden Empfangszeit; es gab keine Lücke oder Überlappung der Fragmentzeitbasis. Der maximale Fragment-Ankunftsabstand lag dennoch bei 749 ms. Diese spätere Beobachtung belegt eine annähernd zur Echtzeit passende Protect-Medienzeit, keine bestimmte interne Clockkorrektur und keine exakte Korrelation zum früheren RTP-Fenster.
+
+Der optionale GOP-Ausgabemodus adressiert deshalb sowohl gebündelte Bilder als auch Ankunftspausen. Er hält vollständige Bildgruppen zurück, trennt deren Access Units, normalisiert den ausgehenden RTP-Clock auf die gemessene Gruppen-Dauer und sendet zeitlich geplant. Der Modus ist Video-only und standardmäßig ausgeschaltet. Pro GOP gelten 6 MiB, 900 Bilder und fünf Sekunden als Grenzen; während der Ausgabe werden auch Daten des nächsten Schlüsselbilds gehalten. Das sind keine garantierten 6 MiB Gesamtprozessspeicher. Eine zusätzliche Startreserve von 1500 ms wird im kontrollierten Test verwendet. Die tatsächliche Wirkung auf Protect muss mit der neuen Canary getrennt gemessen werden.
 
 ### Früherer Pilot: vier Bridges und zwei direkte Kameras
 

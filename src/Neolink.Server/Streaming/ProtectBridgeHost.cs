@@ -26,8 +26,7 @@ public static class ProtectBridgeHost
         var source = new CameraService(camera, StreamKind.Main, hub, TimeSpan.Zero) { RelayOnly = true };
         var path = "/" + camera.Name + "/mainStream";
         var rtsp = new RtspServer(users) { TcpOnly = true };
-        rtsp.AddMount(new RtspMount { Path = path, Hub = hub, PermittedUsers = permitted });
-        rtsp.AddMount(new RtspMount { Path = "/" + camera.Name, Hub = hub, PermittedUsers = permitted });
+        AddRtspMounts(rtsp, camera.Name, hub, permitted, onvif.GopPlayout, onvif.PlayoutDelayMs);
         var endpoint = new ProtectOnvifServer(onvif, users, [new ProtectOnvifStream("main", path, hub)], config.BindPort);
         var tasks = new[]
         {
@@ -58,6 +57,16 @@ public static class ProtectBridgeHost
             AppDomain.CurrentDomain.ProcessExit -= exit;
         }
         return result;
+    }
+
+    /// <summary>Both path aliases share one source and the same optional video playout policy.</summary>
+    internal static void AddRtspMounts(RtspServer rtsp, string cameraName, IStreamHub hub,
+        HashSet<string> permitted, bool gopPlayout, int playoutDelayMs)
+    {
+        rtsp.AddMount(new RtspMount { Path = "/" + cameraName + "/mainStream", Hub = hub,
+            PermittedUsers = permitted, GopPlayout = gopPlayout, PlayoutDelayMs = playoutDelayMs });
+        rtsp.AddMount(new RtspMount { Path = "/" + cameraName, Hub = hub,
+            PermittedUsers = permitted, GopPlayout = gopPlayout, PlayoutDelayMs = playoutDelayMs });
     }
 
     private static async Task RunCameraAsync(CameraService source, CancellationToken ct)

@@ -181,6 +181,15 @@ internal static class ContractTests
             await Test("GOP byte and packet evictions count once without interrupting delivery", VideoBufferDiagnosticsTests.CacheEvictions);
             await Test("camera timestamp diagnostics distinguish wrap zero reversal and reconnect", VideoBufferDiagnosticsTests.TimestampDeltas);
             await Test("protected HTTP metrics expose buffer diagnostics without encoded data or secrets", VideoBufferDiagnosticsTests.HttpMetrics);
+            await Test("GOP playout corrects camera wall drift and retains variable cadence", GopVideoPlayoutTests.DriftAndPacing);
+            await Test("GOP playout wraps continuously and cancels its reserve promptly", GopVideoPlayoutTests.WrapAndCancel);
+            await Test("GOP playout bounds memory frames time and recovers only at complete keyframes", GopVideoPlayoutTests.BoundsAndRecovery);
+            await Test("GOP playout splits pictures while preserving parameter slices and SEI", GopVideoPlayoutTests.MultiAuAndMetadata);
+            await Test("GOP config defaults aliases and source arrival metadata are correct", GopPlayoutWireTests.ConfigAndMetadata);
+            await Test("actual RTSP aliases normalize AU timestamps markers and FU bytes", GopPlayoutWireTests.WireAliasesAndPictures);
+            await Test("default RTSP is unchanged and GOP mounts explicitly refuse audio", GopPlayoutWireTests.DefaultAndAudioScope);
+            await Test("actual RTSP PAUSE TEARDOWN and source resets cancel delayed old GOPs", GopPlayoutWireTests.CancelAndEpochRecovery);
+            await Test("actual RTSP queue gaps discard partial GOPs and recover at a fresh keyframe", GopPlayoutWireTests.QueueGapRecovery);
             await Test("stopping and resuming a source preserves lifetime diagnostic counters", () =>
             {
                 var clock = new ManualTimeProvider();

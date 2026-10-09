@@ -66,6 +66,8 @@ public interface IStreamHub
     bool LiveVideo => HasBufferedGop;
     /// <summary>A bridge source is parked after a credential refusal. Cleared by a fresh instance.</summary>
     bool AuthenticationFailed => false;
+    /// <summary>Monotonic source-session generation, changed when the publisher stops.</summary>
+    long SourceEpoch => 0;
     VideoCodec? Codec { get; }
     byte[]? Sps { get; }
     byte[]? Pps { get; }

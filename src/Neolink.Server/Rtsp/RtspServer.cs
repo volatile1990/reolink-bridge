@@ -24,6 +24,10 @@ public sealed class RtspMount
     /// camera's audio_transcode config; each client overrides it per URL with
     /// ?audio=opus / ?audio=original.</summary>
     public bool Opus { get; init; }
+    /// <summary>Complete-GOP video-only output normalization; disabled for existing mounts.</summary>
+    public bool GopPlayout { get; init; }
+    /// <summary>Additional startup reserve after the first complete GOP has arrived.</summary>
+    public int PlayoutDelayMs { get; init; }
 }
 
 /// <summary>Pure .NET RTSP server (RFC 2326 subset: OPTIONS/DESCRIBE/SETUP/PLAY/PAUSE/GET_PARAMETER/TEARDOWN).</summary>
@@ -31,6 +35,9 @@ public sealed class RtspServer
 {
     /// <summary>Bridge mode accepts interleaved RTP over TCP only; never opens dynamic UDP media ports.</summary>
     public bool TcpOnly { get; init; }
+    // Injected only by deterministic local contract tests; each pump owns its own timeline.
+    internal TimeProvider PlayoutTimeProvider { get; init; } = TimeProvider.System;
+    internal Func<TimeSpan, CancellationToken, Task>? PlayoutWaiter { get; init; }
     private readonly Dictionary<string, RtspMount> _mounts = new(StringComparer.OrdinalIgnoreCase);
     private readonly IReadOnlyDictionary<string, string> _users;
 

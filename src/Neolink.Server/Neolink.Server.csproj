@@ -24,6 +24,7 @@
   <!-- The web UI (Blazor) is hosted in-process when enabled in the config -->
   <ItemGroup>
     <ProjectReference Include="..\Neolink.WebClient\Neolink.WebClient.csproj" />
+    <InternalsVisibleTo Include="Neolink.ProtectTests" />
   </ItemGroup>
 
   <!-- Ship the user's config (and the template) next to the built executable -->

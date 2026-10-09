@@ -26,6 +26,10 @@ Bearbeite `.env` und `secrets/bridge-config.json`:
 - `cameras[0].address`, `username`, `password`: Zugang zur echten Kamera auf Baichuan-Port `9000`.
 - `users[0]`: separater Bridge-Benutzer für RTSP und ONVIF. Dieses Passwort wird bei der Aufnahme in Protect verwendet.
 - `onvif.profiles`: tatsächlichen Codec, Auflösung, Bilderrate und Bitrate in kbit/s eintragen. Die Beispieleinstellungen sind keine Transcodierung.
+- `onvif.gop_playout`: optionale Glättung und Normalisierung der Video-Zeitbasis; Standard `false`.
+- `onvif.playout_delay_ms`: zusätzliche Startreserve im GOP-Modus, in Millisekunden; Standard `0`, zulässig `0` bis `5000`.
+
+Mit `gop_playout: true` wartet die Bridge bis zum nächsten Schlüsselbild, verteilt gebündelte Bilder auf einzelne RTP-Bildgruppen und bildet die Kamera-Zeitbasis auf die gemessene Dauer der vollständigen Bildgruppe ab. Danach sendet sie diese Bilder nach der normalisierten RTP-Zeitbasis. Codierte NAL-Inhalte, Auflösung und Codec bleiben erhalten; die ausgehenden RTP-Zeitstempel werden bewusst angepasst. Es werden keine zusätzlichen Bilder erzeugt. Der Modus bietet ausschließlich Video und erhöht die Live-Verzögerung um etwa eine Bildgruppe plus Startreserve. Eine Reserve von `1500` Millisekunden dient dem kontrollierten B1200-Versuch. Der normale Modus bleibt ohne diese ausdrückliche Konfiguration unverändert.
 
 Die Config-Datei muss für die Container-UID/GID aus `.env` lesbar sein. Bei den Beispielwerten auf dem NAS:
 
@@ -70,12 +74,20 @@ curl --fail --user protect http://10.30.0.113:8080/metrics
 
 | Messwert | Bedeutung |
 | --- | --- |
-| `incomingFrames` | Anzahl der eingegangenen Videoframes seit dem Start |
+| `incomingFrames` | Anzahl der eingegangenen Videobuffer seit dem Start; ein Buffer kann mehrere Bilder enthalten |
 | `incomingVideoBytes` | Empfangene codierte Videobytes; Audio und Transport-Overhead sind ausgeschlossen |
 | `lastVideoAgeMs` | Millisekunden seit dem zuletzt eingegangenen Videoframe |
 | `maxArrivalGapMs` | Größter bisher abgeschlossener Abstand zwischen zwei eingegangenen Videoframes |
+| `totalAccessUnits`, `multiAccessUnitBuffers`, `maxAccessUnitsPerBuffer` | Schätzung der Bilder anhand von VCL-Slice-Grenzen; Metadaten allein zählen nicht als Bild |
+| `maxVideoBufferBytes` | Größter eingegangener codierter Videobuffer |
+| `keyframeCount`, `keyframeAgeMs` | Anzahl und Alter der als Schlüsselbild markierten Buffer |
+| `gopBytes`, `gopPackets`, `gopBuffered`, `gopCacheEvictions` | Aktueller Cache ab dem letzten Schlüsselbild und Anzahl verworfener Caches nach Überschreiten der Größenlimits |
+| `lastCameraTimestampDeltaUs`, `maxCameraTimestampDeltaUs` | Letzte und größte vorwärts gerichtete Änderung der Kamera-Uhr, mit korrektem 32-Bit-Wrap |
+| `cameraTimestampZeroDeltas`, `cameraTimestampBackwardCandidates` | Wiederholte Zeitstempel sowie mögliche Rücksprünge oder sehr große Vorwärtssprünge |
 
 Die Zähler und der maximale Abstand gelten seit dem Prozessstart und schließen Wiederverbindungen ein. Ein Neustart setzt sie zurück; `maxArrivalGapMs` ist kein gleitendes Zeitfenster. Während einer laufenden Pause steigt zunächst `lastVideoAgeMs`; der maximale Abstand kann erst mit dem nächsten Frame aktualisiert werden. Die Abstände werden mit einer monotonen Uhr gemessen und hängen nicht von Änderungen der Systemzeit ab.
+
+Auch die neuen Zähler und Maximalwerte gelten seit dem Prozessstart; die GOP-Größe und der GOP-Status beschreiben dagegen den aktuellen Cache. Kamera-Zeitstempel werden nicht über eine Wiederverbindung hinweg verglichen. Access-Unit-Zahlen sind eine Prüfung der codierten Struktur, keine erfolgreiche Bilddekodierung. Diese Diagnosen verändern weder die Buffer noch deren RTP-Zeitstempel.
 
 Für die tatsächliche Bilderrate und Bitrate zwei Messungen mit bekanntem Abstand `Δt` in Sekunden vergleichen: `FPS = ΔincomingFrames / Δt`, `Bitrate in bit/s = 8 × ΔincomingVideoBytes / Δt`. Für Mbit/s zusätzlich durch `1.000.000` teilen. Damit lässt sich ein stockender Kameraeingang von Problemen bei der Wiedergabe in Protect unterscheiden; die Werte messen den Eingang der Bridge.
 
@@ -100,4 +112,4 @@ docker build -t reolink-bridge:pilot .
 
 Der Container nutzt das .NET-10-SDK zum Bauen und das ASP.NET-10-Runtime-Image, da das Upstream-Projekt die ASP.NET-Frameworkreferenz enthält. Das Laufzeitimage arbeitet ohne Root-Rechte. Die GitHub-Actions-Prüfung baut und testet den Quellcode und baut das Containerimage; sie veröffentlicht und installiert nichts.
 
-[TESTING.md](TESTING.md) beschreibt die 35 ONVIF-Vertragstests, die Upstream-Selbsttests, den früheren Paralleltest mit vier Bridges und zwei direkten Kameras sowie den aktuellen Test mit sechs Bridges. Die Aufnahme-HDD bleibt Voraussetzung für Daueraufzeichnung.
+[TESTING.md](TESTING.md) beschreibt die ONVIF- und RTSP-Vertragstests, die Upstream-Selbsttests, den früheren Paralleltest mit vier Bridges und zwei direkten Kameras sowie den aktuellen Test mit sechs Bridges. Die Aufnahme-HDD bleibt Voraussetzung für Daueraufzeichnung.

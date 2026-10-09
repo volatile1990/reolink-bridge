@@ -13,7 +13,16 @@ public abstract record HubPacket(long Index);
 /// always covers those); it saves every consumer a second full NAL scan of the
 /// same buffer.</summary>
 public sealed record HubVideo(long Index, byte[] AnnexB, bool Keyframe, uint RtpTs, bool HasSps = false)
-    : HubPacket(Index);
+    : HubPacket(Index)
+{
+    /// <summary>Publisher generation for optional delayed consumers; not an RTP timestamp.</summary>
+    public long SourceEpoch { get; init; }
+    /// <summary>Original publisher arrival on a monotonic clock, including after GOP replay.</summary>
+    public long? ArrivalTimestamp { get; init; }
+    public long ArrivalTimestampFrequency { get; init; }
+    /// <summary>Unmodified camera header counter, for detecting discontinuities hidden by the legacy RTP fallback.</summary>
+    public uint? CameraMicroseconds { get; init; }
+}
 /// <summary>One raw AAC access unit (no ADTS header). RTP clock = sample rate.</summary>
 public sealed record HubAudioAac(long Index, byte[] Au, uint RtpTs) : HubPacket(Index);
 /// <summary>16-bit little-endian mono PCM decoded from ADPCM. RTP clock = sample rate.</summary>
@@ -38,6 +47,7 @@ public sealed class StreamHub : IStreamHub, IMediaSink
     private readonly ConcurrentDictionary<Guid, (Channel<HubPacket> Ch, bool Viewer)> _subscribers = new();
     private int _viewerCount;
     private long _index;
+    private long _sourceEpoch;
     private readonly TimeProvider _diagnosticClock;
     private readonly long _startedTimestamp;
     private long _videoFrameCount;
@@ -119,6 +129,7 @@ public sealed class StreamHub : IStreamHub, IMediaSink
     public long VideoFrameCount => Interlocked.Read(ref _videoFrameCount);
     public long VideoBytes => Interlocked.Read(ref _videoBytes);
     public bool AuthenticationFailed => Volatile.Read(ref _authenticationFailed) != 0;
+    public long SourceEpoch => Interlocked.Read(ref _sourceEpoch);
 
     public void SourceAuthenticationFailed()
     {
@@ -276,6 +287,7 @@ public sealed class StreamHub : IStreamHub, IMediaSink
 
     public void PublishVideo(VideoFrame frame)
     {
+        long arrivalTimestamp = _diagnosticClock.GetTimestamp();
         RecordVideoArrival(frame.Data.Length);
         RecordVideoBuffer(frame);
         // Advance the RTP timestamp using the camera's microsecond counter when sane,
@@ -353,7 +365,9 @@ public sealed class StreamHub : IStreamHub, IMediaSink
         if (ready)
             _videoReady.TrySetResult();
 
-        Emit(new HubVideo(Interlocked.Increment(ref _index), frame.Data, frame.Keyframe, _videoRtpTs, frameHasSps),
+        Emit(new HubVideo(Interlocked.Increment(ref _index), frame.Data, frame.Keyframe, _videoRtpTs, frameHasSps)
+             { SourceEpoch = SourceEpoch, ArrivalTimestamp = arrivalTimestamp,
+               ArrivalTimestampFrequency = _diagnosticClock.TimestampFrequency, CameraMicroseconds = frame.Microseconds },
              frame.Keyframe, frame.Data.Length);
     }
 
@@ -483,6 +497,7 @@ public sealed class StreamHub : IStreamHub, IMediaSink
         // reopens the cache in Emit.
         lock (_castGate)
         {
+            Interlocked.Increment(ref _sourceEpoch);
             _gop.Clear();
             _gopBytes = 0;
             _gopOpen = false;

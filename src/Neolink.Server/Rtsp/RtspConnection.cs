@@ -272,7 +272,7 @@ public sealed class RtspConnection
             await RespondAsync(req, 404, "Not Found", ct: ct).ConfigureAwait(false);
             return;
         }
-        bool opus = audioChoice ?? mount.Opus;
+        bool opus = !mount.GopPlayout && (audioChoice ?? mount.Opus);
 
         // Opus is only honest when the located ffmpeg can actually encode it
         // (probed once, lazily). Refusing here beats promising Opus in the SDP
@@ -302,7 +302,7 @@ public sealed class RtspConnection
         // Plain players (VLC, ffmpeg, go2rtc without backchannel) never send the
         // header, so their SDP is unchanged.
         bool backchannel = false;
-        if (WantsBackchannel(req) && mount.Talk != null)
+        if (!mount.GopPlayout && WantsBackchannel(req) && mount.Talk != null)
         {
             try
             {
@@ -315,7 +315,7 @@ public sealed class RtspConnection
             }
         }
 
-        string sdp = Sdp.Build(mount.Hub, mount.Hub.Name, backchannel, opus: opus);
+        string sdp = Sdp.Build(mount.Hub, mount.Hub.Name, backchannel, opus: opus, videoOnly: mount.GopPlayout);
         string contentBase = req.Uri.TrimEnd('/') + "/";
         await RespondAsync(req, 200, "OK",
             $"Content-Base: {contentBase}\r\nContent-Type: application/sdp",
@@ -339,6 +339,11 @@ public sealed class RtspConnection
         }
         if (!await CheckAuthAsync(req, mount, ct).ConfigureAwait(false)) return;
         if (trackId is not (0 or 1 or Sdp.BackchannelTrackId)) trackId = 0;
+        if (mount.GopPlayout && trackId != 0)
+        {
+            await RespondAsync(req, 404, "Not Found", ct: ct).ConfigureAwait(false);
+            return;
+        }
 
         var transportHeader = req.Header("Transport");
         if (transportHeader == null)
@@ -357,8 +362,8 @@ public sealed class RtspConnection
             // The codec choice travels on the query: this URI's own ?audio= wins,
             // else what the DESCRIBE on this connection settled on, else the mount
             // default. Unknown values were already policed at DESCRIBE.
-            bool opus = (TryMapAudio(audio, out var choice) ? choice : null)
-                ?? _describedOpus ?? mount.Opus;
+            bool opus = !mount.GopPlayout && ((TryMapAudio(audio, out var choice) ? choice : null)
+                ?? _describedOpus ?? mount.Opus);
             if (opus && !Media.Ffmpeg.SupportsOpus)
                 opus = false; // DESCRIBE-less client; never promise silence
             session = new RtspSession(this, mount, opus);
@@ -765,6 +770,13 @@ internal sealed class RtspSession
         var reader = watch.Reader;
         long lastIndex = -1;
         bool waitKeyframe = true; // always start on a keyframe
+        // The explicit opt-in mount advertises/accepts video only. Audio's sample
+        // clock has no shared camera PTS epoch and cannot use this normalization.
+        var playout = _mount.GopPlayout && Video != null && Audio == null
+            ? new GopVideoPlayout(hub.Codec ?? VideoCodec.H264, _mount.PlayoutDelayMs,
+                _conn.Server.PlayoutTimeProvider, _conn.Server.PlayoutWaiter)
+            : null;
+        long sourceEpoch = hub.SourceEpoch;
         // Owned by THIS pump, reused per frame: each send is awaited before the
         // next frame packetizes, and a PAUSE/PLAY successor pump gets its own
         // buffer rather than resetting one a cancelled write may still be reading.
@@ -775,39 +787,58 @@ internal sealed class RtspSession
         if (_opus) hub.AcquireOpus();
         Log.Info($"{hub.Name}: client started streaming (session {Id}" +
                  $"{(_opus ? ", Opus audio" : "")})");
+        if (playout != null)
+            Log.Info($"{hub.Name}: RTSP GOP playout enabled, reserve={_mount.PlayoutDelayMs}ms (video-only)");
         try
         {
             await foreach (var packet in reader.ReadAllAsync(ct).ConfigureAwait(false))
             {
                 bool gap = lastIndex >= 0 && packet.Index != lastIndex + 1;
                 lastIndex = packet.Index;
-                if (gap) waitKeyframe = true;
+                if (gap)
+                {
+                    waitKeyframe = true;
+                    playout?.Reset();
+                }
+                if (playout != null && sourceEpoch != hub.SourceEpoch)
+                {
+                    sourceEpoch = hub.SourceEpoch;
+                    waitKeyframe = true;
+                    playout.Reset();
+                }
 
                 switch (packet)
                 {
                     case HubVideo v when Video != null:
                     {
+                        if (playout != null && v.SourceEpoch != sourceEpoch) continue;
                         if (waitKeyframe)
                         {
                             if (!v.Keyframe) continue;
                             waitKeyframe = false;
                         }
-                        var codec = hub.Codec ?? VideoCodec.H264;
-                        var au = v.Keyframe ? EnsureParameterSets(hub, codec, v.AnnexB, v.HasSps) : v.AnnexB;
-                        Video.Packetizer.PacketizeVideoInto(batch, codec, au, v.RtpTs, Video.RtpChannel);
-                        if (Video.Tcp)
+                        if (playout != null)
                         {
-                            // One write per frame instead of one per packet. UDP keeps
-                            // per-packet sends: datagram boundaries ARE the packet
-                            // boundaries — but they leave from the same batch buffer.
-                            await _conn.SendInterleavedRawAsync(batch.Framed, ct).ConfigureAwait(false);
+                            var complete = playout.Push(v);
+                            if (complete == null) continue;
+                            complete = playout.BeginGop(complete);
+                            foreach (var picture in complete.Pictures)
+                            {
+                                await playout.WaitAsync(picture.Offset, ct).ConfigureAwait(false);
+                                // A source may stop during the deliberate wait.
+                                if (complete.SourceEpoch != hub.SourceEpoch)
+                                {
+                                    waitKeyframe = true;
+                                    playout.Reset();
+                                    break;
+                                }
+                                await SendVideoAsync(hub, picture.AnnexB, picture.Keyframe, picture.HasSps,
+                                    picture.RtpTimestamp, batch, ct).ConfigureAwait(false);
+                                playout.MarkSent(picture);
+                            }
+                            continue;
                         }
-                        else if (Video.UdpSocket != null && Video.ClientEndpoint != null)
-                        {
-                            for (int i = 0; i < batch.Count; i++)
-                                await Video.UdpSocket.SendToAsync(batch.PacketAt(i), SocketFlags.None,
-                                    Video.ClientEndpoint, ct).ConfigureAwait(false);
-                        }
+                        await SendVideoAsync(hub, v.AnnexB, v.Keyframe, v.HasSps, v.RtpTs, batch, ct).ConfigureAwait(false);
                         break;
                     }
                     // The URL decided this session's audio: on an Opus session the
@@ -838,6 +869,22 @@ internal sealed class RtspSession
             watch.Dispose();
             Log.Info($"{hub.Name}: client stopped streaming (session {Id})");
         }
+    }
+
+    private async Task SendVideoAsync(IStreamHub hub, byte[] annexB, bool keyframe, bool hasSps,
+        uint timestamp, RtpBatch batch, CancellationToken ct)
+    {
+        var video = Video ?? throw new InvalidOperationException("Video transport missing");
+        var codec = hub.Codec ?? VideoCodec.H264;
+        var au = keyframe ? EnsureParameterSets(hub, codec, annexB, hasSps) : annexB;
+        // Packetization follows the cancellable wait, into this pump's private batch.
+        video.Packetizer.PacketizeVideoInto(batch, codec, au, timestamp, video.RtpChannel);
+        if (video.Tcp)
+            await _conn.SendInterleavedRawAsync(batch.Framed, ct).ConfigureAwait(false);
+        else if (video.UdpSocket != null && video.ClientEndpoint != null)
+            for (int i = 0; i < batch.Count; i++)
+                await video.UdpSocket.SendToAsync(batch.PacketAt(i), SocketFlags.None,
+                    video.ClientEndpoint, ct).ConfigureAwait(false);
     }
 
     /// <summary>Prepends cached SPS/PPS(/VPS) to keyframes that lack them (players

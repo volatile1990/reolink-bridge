@@ -18,7 +18,8 @@ public static class Sdp
     /// <summary>trackID used for the ONVIF audio backchannel (0 = video, 1 = audio out).</summary>
     public const int BackchannelTrackId = 2;
 
-    public static string Build(IStreamHub hub, string sessionName, bool backchannel = false, bool opus = false)
+    public static string Build(IStreamHub hub, string sessionName, bool backchannel = false, bool opus = false,
+        bool videoOnly = false)
     {
         var sb = new StringBuilder();
         long sid = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
@@ -54,7 +55,7 @@ public static class Sdp
         }
         sb.Append("a=control:trackID=0\r\n");
 
-        var audio = hub.Audio;
+        var audio = videoOnly ? null : hub.Audio;
         if (audio != null)
         {
             sb.Append($"m=audio 0 RTP/AVP {AudioPayloadType}\r\n");
@@ -81,7 +82,7 @@ public static class Sdp
             sb.Append("a=control:trackID=1\r\n");
         }
 
-        if (backchannel)
+        if (backchannel && !videoOnly)
         {
             // ONVIF Profile-T audio backchannel: an 8 kHz µ-law track the CLIENT
             // sends on (a=sendonly is read from the client's perspective, per the

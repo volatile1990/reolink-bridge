@@ -26,6 +26,10 @@ public sealed class BridgeOnvifConfig
     public string Name { get; set; } = "Reolink Bridge";
     public string Model { get; set; } = "Baichuan camera";
     public bool Discovery { get; set; } = true;
+    /// <summary>Opt-in complete-GOP lookahead and video-only outbound RTP normalization.</summary>
+    public bool GopPlayout { get; set; }
+    /// <summary>Additional startup reserve when GopPlayout is enabled.</summary>
+    public int PlayoutDelayMs { get; set; }
     public List<BridgeOnvifProfile> Profiles { get; set; } = new();
 
     public string EndpointReference => "urn:uuid:" + Guid.Parse(Uuid).ToString("D");
@@ -47,6 +51,8 @@ public sealed class BridgeOnvifConfig
                 case "name": result.Name = property.Value.GetString() ?? ""; break;
                 case "model": result.Model = property.Value.GetString() ?? ""; break;
                 case "discovery": result.Discovery = property.Value.GetBoolean(); break;
+                case "playoutdelayms": result.PlayoutDelayMs = property.Value.GetInt32(); break;
+                case "gopplayout": result.GopPlayout = property.Value.GetBoolean(); break;
                 case "profiles":
                     foreach (var item in property.Value.EnumerateArray())
                     {
@@ -75,6 +81,7 @@ public sealed class BridgeOnvifConfig
     public void Validate()
     {
         if (Port is < 1 or > 65535) throw new FormatException("onvif.port must be between 1 and 65535");
+        if (PlayoutDelayMs is < 0 or > 5000) throw new FormatException("onvif.playout_delay_ms must be between 0 and 5000");
         if (!IPAddress.TryParse(Bind, out var bind) || bind.AddressFamily != System.Net.Sockets.AddressFamily.InterNetwork)
             throw new FormatException("onvif.bind must be an IPv4 address");
         if (!IPAddress.TryParse(AdvertisedHost, out var host) || host.AddressFamily != System.Net.Sockets.AddressFamily.InterNetwork

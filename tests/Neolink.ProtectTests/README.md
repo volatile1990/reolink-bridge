@@ -9,7 +9,7 @@ dotnet run --project tests/Neolink.ProtectTests/Neolink.ProtectTests.csproj --co
 This console runner uses no third-party testing framework. It starts the actual
 ONVIF HTTP listener on an ephemeral loopback port and sends SOAP requests using
 synthetic credentials. Its media hubs report controlled states without opening
-any camera, RTSP session, UDP discovery listener or recording file. The XML
+any physical camera, UDP discovery listener or recording file. The XML
 entity and configuration tests create and remove synthetic temporary files.
 
 The assertions check the externally visible adoption contract: unauthenticated
@@ -36,6 +36,14 @@ RTSP and ONVIF remain responsive, health reports failure, authenticated metrics
 identify the failure, and cancellation still completes promptly. A transport
 disconnect must continue to reconnect. These checks add about 33 seconds to the
 contract test run and do not contact physical cameras.
+
+The video-buffer checks distinguish bundled pictures from continuation slices
+and metadata-only buffers. The optional GOP playout checks use controlled source
+arrival clocks and the actual loopback RTSP/TCP server. They verify AU markers,
+outbound timestamps, parameter/SEI preservation and byte-identical encoded NALs
+after RTP fragmentation, both aliases, video-only policy, bounded buffering,
+clock wrap, real queue gaps and cancellation/recovery. The default RTSP path
+must still forward the original buffer and timestamp. No real media is used.
 
 These checks establish protocol behavior only. They do not establish that a
 specific camera's Baichuan video is decodable, that UniFi Protect will render
