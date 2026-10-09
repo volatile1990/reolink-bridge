@@ -61,6 +61,15 @@ public interface IBcCamera : IAsyncDisposable
     /// <summary>Requests a JPEG snapshot from the camera (msg 109), or null if unsupported.</summary>
     Task<byte[]?> SnapAsync(CancellationToken ct);
 
+    /// <summary>A snapshot bounded while reassembling on the real BC transport.
+    /// The default supports synthetic/custom sessions which implement SnapAsync only.</summary>
+    async Task<byte[]?> SnapBoundedAsync(int maxBytes, CancellationToken ct)
+    {
+        if (maxBytes <= 0) throw new ArgumentOutOfRangeException(nameof(maxBytes));
+        var jpeg = await SnapAsync(ct).ConfigureAwait(false);
+        return jpeg is { } bytes && bytes.Length <= maxBytes ? bytes : null;
+    }
+
     /// <summary>
     /// Two-way talk: configures the camera's speaker for the given audio profile
     /// (msg 201, retried once after a reset if another talker holds the channel),

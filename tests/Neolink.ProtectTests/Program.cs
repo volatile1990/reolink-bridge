@@ -272,6 +272,19 @@ internal static class ContractTests
                 string basic = "Basic " + Convert.ToBase64String(Encoding.UTF8.GetBytes(User + ":" + Password));
                 Success(await Send($"<m:GetProfiles xmlns:m=\"{Media2}\"/>", Media2, authorization: basic), "GetProfilesResponse", Media2);
             });
+            await Test("snapshot Media1 and Media2 expose stable authenticated credential-free JPEG URIs", SnapshotContractTests.SoapUriContracts);
+            await Test("snapshot capability is absent without a provider", SnapshotContractTests.CapabilityWithoutProvider);
+            await Test("snapshot HTTP authentication and profile checks precede provider work", SnapshotContractTests.AuthBeforeWork);
+            await Test("snapshot HTTP preserves binary JPEG and enforces body bounds", SnapshotContractTests.BinaryResponseAndBounds);
+            await Test("snapshot HTTP rejects stale or replaced source sessions", SnapshotContractTests.SourceFreshnessAndEpoch);
+            await Test("snapshot provider failures and timeouts become bounded generic 503 replies", SnapshotContractTests.ProviderFailureAndBudget);
+            await Test("native snapshot cache expires monotonically and rejects stale or replaced sessions", NativeProtectSnapshotTests.CacheAndFreshness);
+            await Test("native snapshot single-flight isolates one HTTP caller's cancellation", NativeProtectSnapshotTests.SharedCaptureCancellation);
+            await Test("native snapshot validates JPEG structure and invalidates capture across epochs", NativeProtectSnapshotTests.InvalidAndChangedSession);
+            await Test("native snapshot capture has a total deadline and stops on host shutdown", NativeProtectSnapshotTests.TotalBudgetAndLifetime);
+            await Test("actual Baichuan snapshot reassembles JPEG and caps announced and received bytes", NativeProtectSnapshotTests.WireReassemblyAndLimits);
+            await Test("actual Baichuan cancellation rejects late old snapshot fragments", NativeProtectSnapshotTests.WireCancelledAndLateReply);
+            await Test("actual FullAES snapshot uses the existing login and preserves JPEG chunks", NativeProtectSnapshotTests.WireFullAesSnapshot);
             await Test("Protect identity has an enabled interface and valid stable MAC", async () =>
             {
                 var xml = Success(await Call("GetNetworkInterfaces"), "GetNetworkInterfacesResponse", Device);

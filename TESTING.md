@@ -10,11 +10,13 @@ dotnet run --project src/Neolink.Server/Neolink.Server.csproj --configuration Re
 dotnet run --project tests/Neolink.ProtectTests/Neolink.ProtectTests.csproj --configuration Release
 ```
 
-Die lokalen Prüfungen umfassen **159 Upstream-Selbsttests und 51 ONVIF-/RTSP-Vertragstests**. Der Release-Build wird einschließlich der GOP-Ausgabe ohne Fehler oder Warnungen geprüft.
+Die lokalen Prüfungen umfassen **159 Upstream-Selbsttests und 64 ONVIF-/RTSP-/Snapshot-Vertragstests**. Der Release-Build wird einschließlich der GOP-Ausgabe ohne Fehler oder Warnungen geprüft.
 
 Die zusätzlichen Vertragstests starten den tatsächlichen HTTP-Listener auf Loopback und verwenden synthetische Zugangsdaten und Medienzustände. Sie prüfen Geräteidentität und stabile UUID/MAC, Media1/Media2, ehrliche H.265-/H.264-Profile, RTSP-URLs, WSSE-/Basic-Anmeldung, Zeitabweichung und Replay-Schutz, Bereitschaft des Streams, XML-/XXE-Abweisung sowie die strenge Pilot-Konfiguration. Sie verbinden sich mit keiner echten Kamera. Details stehen im [Testprojekt](tests/Neolink.ProtectTests/README.md).
 
 Die GOP-Tests prüfen zusätzlich den tatsächlichen RTSP-TCP-Pfad: beide Mount-Aliase, einzelne RTP-Marker und Zeitstempel pro Bild, unveränderte codierte NAL-Inhalte auch nach FU-Fragmentierung, die unveränderte Standardausgabe sowie Audio-Abweisung im ausdrücklich aktivierten Video-Modus. Deterministische Uhren prüfen Drift, Wrap, begrenzte GOP-Puffer, Metadaten und Wiederaufnahme nach einer Lücke. PAUSE, TEARDOWN, Source-Wechsel und die echte DropOldest-Subscriberqueue sind ebenfalls abgedeckt. Die ergänzten Regressionen erhalten reale Bilder trotz eines zwölfsekündigen Raw-Clock-Sprungs, wiederholter oder rückläufiger RTP-Werte und gebündelter Access Units; sie prüfen zugleich plausible variable Kadenz und die Zuordnung des nächsten Schlüsselbilds.
+
+Die Snapshot-Tests prüfen Media1/Media2-URIs, Basic-Anmeldung vor dem nativen Abruf, binäre JPEG-Ausgabe, Frische und Source-Wechsel, begrenzte Antwortgröße und Fristen. Der native Cache wird mit monotoner Uhr geprüft; parallele Aufrufer teilen eine Anforderung, deren Arbeit durch einen einzelnen abgebrochenen HTTP-Aufruf nicht beendet wird. Synthetische Baichuan-Peers prüfen den Befehl 109 einschließlich FullAES, Reassembly-Limits und verspäteter Antworten nach Abbruch. Diese Tests belegen noch keine Unterstützung durch eine konkrete Kamerafirmware.
 
 ## Echter NAS-Pilot
 
@@ -63,9 +65,26 @@ Die separat nachfolgende Protect-fMP4-Probe lief ebenfalls 30 Sekunden mit drei 
 
 Der optionale GOP-Ausgabemodus adressiert deshalb sowohl gebündelte Bilder als auch Ankunftspausen. Er hält vollständige Bildgruppen zurück, trennt deren Access Units, normalisiert den ausgehenden RTP-Clock auf die gemessene Gruppen-Dauer und sendet zeitlich geplant. Der Modus ist Video-only und standardmäßig ausgeschaltet. Pro GOP gelten 6 MiB, 900 Bilder und fünf Sekunden tatsächliche Ankunftsdauer als Grenzen; während der Ausgabe werden auch Daten des nächsten Schlüsselbilds gehalten. Das sind keine garantierten 6 MiB Gesamtprozessspeicher.
 
-Der erste Versuch mit Softwarestand `6a29ff1` und 1500 ms Startreserve glättete die gewöhnlichen Abstände, verwarf bei einem auffälligen Kamera-Zeitsprung aber noch eine vollständige Bildgruppe. In einem parallelen 45-Sekunden-Abruf waren der mediane RTP-Ankunftsabstand 58 ms und der 95. Perzentilwert 88 ms; eine Wiederaufnahmepause betrug dennoch 3,18 Sekunden. Die Protect-fMP4-Probe sah entsprechend einen maximalen Fragmentabstand von 3,26 Sekunden. Dieser Versuch bestätigt deshalb noch keine verlässliche Glättung.
+Der erste Versuch mit Softwarestand `6a29ff1` und 1500 ms Startreserve glättete die gewöhnlichen Abstände, verwarf bei einem auffälligen Kamera-Zeitsprung aber noch eine vollständige Bildgruppe. In einem parallelen 45-Sekunden-Abruf waren der mediane RTP-Ankunftsabstand 58 ms und der 95. Perzentilwert 88 ms; eine Wiederaufnahmepause betrug dennoch 3,18 Sekunden. Die Protect-fMP4-Probe sah entsprechend einen maximalen Fragmentabstand von 3,26 Sekunden. Der Nutzer meldete zudem einen dauerhaften Livebild-Hänger nach den ersten Sekunden. Dieser Versuch bestätigt deshalb keine verlässliche Glättung oder Wiedergabe.
 
-Die anschließende Anpassung soll gültige Bildgruppen auch bei auffälliger Kamera-Uhr erhalten: Sie verwendet deren tatsächliche Ankunftsdauer und Anzahl vorhandener Bilder für eine gleichmäßige Ausgabe. Gebündelte Bilder lösen ebenfalls diese Verteilung aus. Plausible relative Zeitstempel einzelner Bilder bleiben erhalten. Die Grenzen für echte Ankunftspausen, Epoch-Wechsel, Buffergrößen und Bildanzahl gelten weiterhin. Der erneute kontrollierte Test verwendet 2500 ms Startreserve; seine Wirkung wird separat gemessen.
+Die anschließende Anpassung erhält gültige Bildgruppen auch bei auffälliger Kamera-Uhr: Sie verwendet deren tatsächliche Ankunftsdauer und Anzahl vorhandener Bilder für eine gleichmäßige Ausgabe. Gebündelte Bilder lösen ebenfalls diese Verteilung aus. Plausible relative Zeitstempel einzelner Bilder bleiben erhalten. Die Grenzen für echte Ankunftspausen, Epoch-Wechsel, Buffergrößen und Bildanzahl gelten weiterhin.
+
+Softwarestand `c9626ec` wurde anschließend nur auf dieser Instanz mit 2500 ms Startreserve eingesetzt. Ein paralleler 45-Sekunden-Abruf lieferte nach Aufwärmphase 683 vollständige RTP-Bildgruppen mit 17,08 Gruppen/s, ohne Sequenzlücke oder unvollständige FU-Gruppe. Die RTP-Zeitspanne von 39,930 Sekunden entsprach der Empfangszeit. Der mediane Abstand betrug 57 ms, der 95. Perzentilwert 68 ms und das Maximum 124 ms. Protect lieferte 358 gemessene Fragmente mit 712 Videoproben; der maximale Fragmentabstand lag bei 171 ms, ohne Lücke oder Überlappung der Decode-Zeitbasis.
+
+Die Quellmetriken nach 94 Sekunden Prozesslauf zählten neun gebündelte Buffer mit bis zu zwei Bildern, einen größten Ankunftsabstand von 1,48 Sekunden und einen größten Kamera-Zeitsprung von 8,67 Sekunden. Es gab keine Cache-Eviction. Diese Werte umfassen den gesamten Prozesslauf, nicht ausschließlich das 45-Sekunden-Probenfenster. Die gleichmäßige RTP- und fMP4-Lieferung bestätigt die Verbesserung in diesem begrenzten Versuch; reale Dekodierung und der erneute sichtbare Live-Test sind getrennte Prüfungen.
+
+Der erneute Live-Test dieser B1200 wurde vom Nutzer anschließend als sehr gut beurteilt. Auf seinen Wunsch wurde derselbe geprüfte Softwarestand mit 2500 ms Reserve auch für RLC-1212A und RLC-823A aktiviert. UUIDs und Protect-Einbindungen blieben erhalten. Die anderen drei Bridges liefen weiter im Standardmodus.
+
+Ein anschließender paralleler 45-Sekunden-Test der beiden zusätzlichen Instanzen ergab:
+
+| Kamera | Gemessene RTP-Bildgruppen / FPS | Max. RTP-Bildabstand | Protect-Fragmente / Videoproben | Max. Protect-Fragmentabstand |
+|---|---|---|---|---|
+| RLC-1212A | 795 / 19,89 | 100 ms | 360 / 835 | 250 ms |
+| RLC-823A | 1008 / 25,19 | 83 ms | 352 / 1056 | 192 ms |
+
+Es gab keine RTP-Sequenzlücke oder unvollständige FU-Gruppe und keine Lücke oder Überlappung der Protect-Decode-Zeitbasis. Die Aufwärmphase betrug bei RTP fünf und bei Protect drei Sekunden. Fragmentabstände und Bildabstände messen unterschiedliche Stufen; eine genaue langfristige Verzögerungs- oder Flüssigkeitsgarantie lässt sich aus diesem begrenzten Versuch nicht ableiten.
+
+Ein Softwaredecoder verarbeitete bei allen drei Kameras die vollständige 30-Sekunden-Mediendauer nach Null, ohne Stillstand. Nach Korrektur der feineren Zeitbasis des privaten Test-Muxers lieferte ein 15-Sekunden-Abruf 263, 302 und 380 decodierte Bilder für B1200-Instanz 3, RLC-1212A und RLC-823A, jeweils ohne Decoderwarnung. Diese Prüfungen speicherten keine Medien. Ein später gemeldeter Hänger der B1200 war in einem frischen Abruf nicht reproduzierbar: RTP und Protect lieferten weiter aktuelle Daten, und ein weiterer 10-Sekunden-Decode erzeugte 178 Bilder ohne Warnung. Der Nutzer bestätigte anschließend, dass mehrere Browser-Reloads die Wiedergabe wiederherstellten. Ein Browserproblem ist damit eine plausible Einordnung dieses letzten Vorfalls, keine abschließend bewiesene Ursache aller ursprünglichen Stream-Probleme.
 
 ### Früherer Pilot: vier Bridges und zwei direkte Kameras
 

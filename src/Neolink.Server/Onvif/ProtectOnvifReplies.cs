@@ -62,7 +62,7 @@ public sealed partial class ProtectOnvifServer
     private string[] ScopeValues() => ["onvif://www.onvif.org/type/video_encoder", "onvif://www.onvif.org/Profile/Streaming",
         "onvif://www.onvif.org/name/" + Uri.EscapeDataString(_config.Name), "onvif://www.onvif.org/hardware/" + Uri.EscapeDataString(_config.Model)];
 
-    private string MediaCapabilities(string prefix) => $"<{prefix}:GetServiceCapabilitiesResponse><{prefix}:Capabilities SnapshotUri=\"false\" Rotation=\"false\">" +
+    private string MediaCapabilities(string prefix) => $"<{prefix}:GetServiceCapabilitiesResponse><{prefix}:Capabilities SnapshotUri=\"{(_snapshots == null ? "false" : "true")}\" Rotation=\"false\">" +
         $"<{prefix}:ProfileCapabilities MaximumNumberOfProfiles=\"{_streams.Count}\"/>" +
         $"<{prefix}:StreamingCapabilities RTPMulticast=\"false\" RTP_TCP=\"true\" RTP_RTSP_TCP=\"true\"/>" +
         $"</{prefix}:Capabilities></{prefix}:GetServiceCapabilitiesResponse>";

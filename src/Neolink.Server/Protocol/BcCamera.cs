@@ -673,7 +673,15 @@ public sealed class BcCamera : IBcCamera
         return new BatteryPush(Math.Clamp(pct, 0, 100), charge.Contains("charg"));
     }
 
-    public async Task<byte[]?> SnapAsync(CancellationToken ct)
+    public Task<byte[]?> SnapAsync(CancellationToken ct) => SnapCoreAsync(null, ct);
+
+    public Task<byte[]?> SnapBoundedAsync(int maxBytes, CancellationToken ct)
+    {
+        if (maxBytes <= 0) throw new ArgumentOutOfRangeException(nameof(maxBytes));
+        return SnapCoreAsync(maxBytes, ct);
+    }
+
+    private async Task<byte[]?> SnapCoreAsync(int? maxBytes, CancellationToken ct)
     {
         using var sub = _conn.Subscribe(BcConstants.MsgIdSnap);
 
@@ -709,13 +717,25 @@ public sealed class BcCamera : IBcCamera
         while (true)
         {
             var reply = await sub.ReceiveAsync(perMessageTimeout, ct).ConfigureAwait(false);
+            // A late response to a cancelled bounded snapshot must not become
+            // the next request's JPEG. Legacy SnapAsync semantics stay intact.
+            if (maxBytes.HasValue && (reply.Meta.MsgNum != req.Meta.MsgNum || reply.Meta.ChannelId != _channelId))
+                continue;
             if (reply.Meta.ResponseCode != 200)
                 throw new CameraCommandException(BcConstants.MsgIdSnap, reply.Meta.ResponseCode);
             if (reply.Xml?.RawElement("Snap") is { } snap
                 && int.TryParse(snap.Element("pictureSize")?.Value.Trim(), out var size) && size > 0)
+            {
+                if (maxBytes.HasValue && size > maxBytes.Value)
+                    throw new BcProtocolException("Snapshot exceeds the permitted byte limit");
                 expected = size;
+            }
             if (reply.Binary is { Length: > 0 } bin)
+            {
+                if (maxBytes.HasValue && jpeg.Length + bin.Length > maxBytes.Value)
+                    throw new BcProtocolException("Snapshot exceeds the permitted byte limit");
                 jpeg.Write(bin, 0, bin.Length);
+            }
             if (expected >= 0 && jpeg.Length >= expected)
                 return jpeg.ToArray();
             if (expected < 0 && jpeg.Length > 0)

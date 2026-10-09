@@ -24,17 +24,18 @@ public sealed partial class ProtectOnvifServer
     public const string NsMedia = "http://www.onvif.org/ver10/media/wsdl";
     public const string NsMedia2 = "http://www.onvif.org/ver20/media/wsdl";
     public const string NsSchema = "http://www.onvif.org/ver10/schema";
-    private const int MaxHeader = 16 * 1024, MaxBody = 256 * 1024;
+    private const int MaxHeader = 16 * 1024, MaxBody = 256 * 1024, MaxSnapshotBytes = 4 * 1024 * 1024;
     private readonly BridgeOnvifConfig _config;
     private readonly IReadOnlyDictionary<string, string> _users;
     private readonly IReadOnlyList<ProtectOnvifStream> _streams;
     private readonly int _rtspPort;
+    private readonly IProtectSnapshotProvider? _snapshots;
     private readonly long _startedTimestamp = System.Diagnostics.Stopwatch.GetTimestamp();
     private readonly Dictionary<string, DateTime> _nonces = new(StringComparer.Ordinal);
     private readonly Dictionary<string, int> _connections = new(StringComparer.Ordinal);
 
     public ProtectOnvifServer(BridgeOnvifConfig config, IReadOnlyDictionary<string, string> users,
-        IReadOnlyList<ProtectOnvifStream> streams, int rtspPort)
+        IReadOnlyList<ProtectOnvifStream> streams, int rtspPort, IProtectSnapshotProvider? snapshots = null)
     {
         config.Validate();
         if (rtspPort is < 1 or > 65535 || config.Port == rtspPort)
@@ -47,6 +48,7 @@ public sealed partial class ProtectOnvifServer
         _users = users;
         _streams = streams;
         _rtspPort = rtspPort;
+        _snapshots = snapshots;
     }
 
     public bool Healthy => _streams.All(s => !s.Hub.AuthenticationFailed
@@ -186,6 +188,11 @@ public sealed partial class ProtectOnvifServer
             { await RespondAsync(stream, 400, "", true, ct); return; }
             if (request[0] == "GET")
             {
+                if (request[1].StartsWith("/snapshot/", StringComparison.Ordinal))
+                {
+                    await SnapshotAsync(stream, request[1], headers.GetValueOrDefault("Authorization"), ct).ConfigureAwait(false);
+                    return;
+                }
                 if (request[1] == "/metrics")
                 {
                     bool authorized = AuthenticatedBasic(headers.GetValueOrDefault("Authorization"));
@@ -244,6 +251,56 @@ public sealed partial class ProtectOnvifServer
         if (data.Length > 0) await stream.WriteAsync(data, ct).ConfigureAwait(false);
     }
 
+    private static string SnapshotPath(ProtectOnvifStream stream) => "/snapshot/" + Uri.EscapeDataString(stream.Token) + ".jpg";
+
+    private bool SnapshotReady(ProtectOnvifStream stream) => !stream.Hub.AuthenticationFailed
+        && stream.Hub.VideoReady && stream.Hub.LiveVideo && Matches(stream)
+        && stream.Hub.GetVideoDiagnostics().LastVideoAgeMs is >= 0 and <= 5000;
+
+    private async Task SnapshotAsync(NetworkStream connection, string path, string? authorization, CancellationToken ct)
+    {
+        // JPEG GETs cannot carry WSSE. Require the same local Basic credentials as RTSP,
+        // before resolving a profile, looking in a provider cache or contacting the live session.
+        if (!AuthenticatedBasic(authorization))
+        {
+            await RespondAsync(connection, 401, "{\"error\":\"authentication-required\"}", true, ct, "application/json").ConfigureAwait(false);
+            return;
+        }
+        var selected = _streams.FirstOrDefault(stream => SnapshotPath(stream) == path);
+        if (selected == null)
+        {
+            await RespondAsync(connection, 404, "{\"error\":\"unknown-profile\"}", true, ct, "application/json").ConfigureAwait(false);
+            return;
+        }
+        if (_snapshots == null || !SnapshotReady(selected))
+        {
+            await RespondAsync(connection, 503, "{\"error\":\"snapshot-unavailable\"}", true, ct, "application/json").ConfigureAwait(false);
+            return;
+        }
+        long epoch = selected.Hub.SourceEpoch;
+        byte[]? jpeg = null;
+        using var deadline = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        deadline.CancelAfter(TimeSpan.FromSeconds(3));
+        try
+        {
+            jpeg = await _snapshots.GetJpegAsync(deadline.Token).WaitAsync(deadline.Token).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested) { throw; }
+        catch { } // A provider failure is a generic 503; never reflect its exception or camera credentials.
+        if (jpeg is not { Length: >= 4 and <= MaxSnapshotBytes } || jpeg[0] != 0xFF || jpeg[1] != 0xD8
+            || jpeg[^2] != 0xFF || jpeg[^1] != 0xD9 || selected.Hub.SourceEpoch != epoch || !SnapshotReady(selected))
+        {
+            await RespondAsync(connection, 503, "{\"error\":\"snapshot-unavailable\"}", true, ct, "application/json").ConfigureAwait(false);
+            return;
+        }
+        var head = $"HTTP/1.1 200 OK\r\nContent-Length: {jpeg.Length}\r\nContent-Type: image/jpeg\r\n" +
+            "Cache-Control: no-store\r\nConnection: close\r\n\r\n";
+        using var outputDeadline = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        outputDeadline.CancelAfter(TimeSpan.FromSeconds(3));
+        await connection.WriteAsync(Encoding.ASCII.GetBytes(head), outputDeadline.Token).ConfigureAwait(false);
+        await connection.WriteAsync(jpeg, outputDeadline.Token).ConfigureAwait(false);
+    }
+
     public async Task<(int Status, string Body)> HandleAsync(string soap, string? authorization, CancellationToken ct)
     {
         ct.ThrowIfCancellationRequested();
@@ -283,6 +340,17 @@ public sealed partial class ProtectOnvifServer
         bool media2 = service == NsMedia2;
         string prefix = media2 ? "tr2" : "trt";
         if (action == "GetServiceCapabilities") return Ok(MediaCapabilities(prefix));
+        if (action == "GetSnapshotUri")
+        {
+            var profile = _streams.FirstOrDefault(stream => stream.Token == Child(op, "ProfileToken"));
+            if (profile == null) return Fault(400, "ter:NoProfile", "Unknown profile token");
+            if (_snapshots == null) return Fault(400, "ter:ActionNotSupported", "Snapshots are not available");
+            string snapshotUri = $"http://{_config.AdvertisedHost}:{_config.Port}{SnapshotPath(profile)}";
+            return Ok(media2 ? $"<tr2:GetSnapshotUriResponse><tr2:Uri>{Esc(snapshotUri)}</tr2:Uri></tr2:GetSnapshotUriResponse>"
+                : $"<trt:GetSnapshotUriResponse><trt:MediaUri><tt:Uri>{Esc(snapshotUri)}</tt:Uri>" +
+                    "<tt:InvalidAfterConnect>false</tt:InvalidAfterConnect><tt:InvalidAfterReboot>false</tt:InvalidAfterReboot>" +
+                    "<tt:Timeout>PT0S</tt:Timeout></trt:MediaUri></trt:GetSnapshotUriResponse>");
+        }
         // Metadata comes from the stream already carried by RTSP, never another camera connection.
         if (_streams.Any(s => !Matches(s)))
             return Fault(503, "ter:Action", "Camera encoding differs from the configured profile; correct the bridge configuration");

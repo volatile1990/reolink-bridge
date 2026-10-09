@@ -62,7 +62,13 @@ Bei der Anmeldung den Bridge-Benutzer verwenden. Unter **Protect → Advanced Ad
 
 Für diesen Pilot müssen Protect und Bridge sich im Netz erreichen können; die Bridge benötigt außerdem TCP-Zugriff auf die echte Kamera an Port `9000`. RTSP läuft an `8554/TCP`, ONVIF an `8080/TCP` und lokale Erkennung an `3702/UDP`. Macvlan gibt dem Container eine eigene Adresse und MAC; der NAS-Host selbst erreicht seine Macvlan-Container standardmäßig nicht direkt. Der interne Healthcheck und Tests von Protect oder einem anderen LAN-Gerät funktionieren unabhängig davon.
 
-Der Pilot bietet zunächst Video-Profile und Erkennung. Snapshots, Bewegungsereignisse, PTZ und Audio-Transcodierung sind keine zugesicherten Pilot-Funktionen. Der direkte Baichuan-Abruf aller drei B1200 und der RLC-1212A gelang im NAS-Pilot ohne den Reolink-NVR als Streamquelle. Die Übertragbarkeit auf andere Kamerafirmwares muss jeweils geprüft werden.
+Der Pilot bietet Video-Profile, Erkennung und einen authentifizierten Snapshot-Endpunkt. Bewegungsereignisse, PTZ und Audio-Transcodierung sind keine zugesicherten Pilot-Funktionen. Der direkte Baichuan-Abruf aller drei B1200 und der RLC-1212A gelang im NAS-Pilot ohne den Reolink-NVR als Streamquelle. Die Übertragbarkeit auf andere Kamerafirmwares muss jeweils geprüft werden.
+
+## Vorschaubilder
+
+ONVIF Media1 und Media2 liefern mit `GetSnapshotUri` eine stabile Adresse wie `http://10.30.0.113:8080/snapshot/main.jpg`. Der JPEG-Abruf verlangt HTTP Basic mit dem Bridge-Benutzer. Die URI enthält keine Zugangsdaten. Bereits aufgenommene Protect-Geräte müssen diese neue Snapshot-Adresse in ihren Kamerametadaten übernehmen; ein Browser-Reload allein ergänzt die bisher fehlende Adresse nicht.
+
+Die Bridge fordert über die bereits angemeldete Baichuan-Verbindung einen nativen Schnappschuss an. Sie öffnet dafür keinen weiteren Kamerastream und benötigt keinen JPEG-Decoder. Gleichzeitige Anfragen teilen einen Abruf; dessen Ergebnis wird höchstens fünf Sekunden zwischengespeichert. Ein alter oder nicht bereiter Videoeingang sowie ein Wechsel der Kamerasitzung verwerfen den Cache. Die native Anforderung hat insgesamt drei Sekunden Zeit und eine Reassembly-Grenze von 4 MiB. Nicht unterstützte oder ungültige Antworten ergeben HTTP 503 mit einer kurzen Wiederholungspause. Ob die jeweilige Kamerafirmware den nativen Befehl unterstützt, muss am Gerät geprüft werden.
 
 ## Eingehenden Stream messen
 

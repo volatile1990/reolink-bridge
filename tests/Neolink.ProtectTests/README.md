@@ -45,7 +45,16 @@ after RTP fragmentation, both aliases, video-only policy, bounded buffering,
 clock wrap, real queue gaps and cancellation/recovery. The default RTSP path
 must still forward the original buffer and timestamp. No real media is used.
 
+Snapshot contracts exercise Media1/Media2 URI replies and the binary HTTP endpoint,
+including Basic authentication before capture, profile lookup, unavailable or stale
+sources, source-epoch changes, byte limits and deadlines. Native provider checks
+cover the monotonic five-second cache, shared capture cancellation, session changes,
+invalid JPEGs and host shutdown. Synthetic Baichuan peers verify the bounded native
+109 command, chunk assembly, FullAES replies and rejection of late cancelled data.
+They do not open an additional stream or contact a real camera.
+
 These checks establish protocol behavior only. They do not establish that a
 specific camera's Baichuan video is decodable, that UniFi Protect will render
 H.265 in a particular browser, or that an actual deployment sustains recording.
-The Synology pilot must verify those separately.
+The Synology pilot must verify those separately, including whether each camera's
+firmware supports native snapshots and Protect accepts the advertised JPEG URI.

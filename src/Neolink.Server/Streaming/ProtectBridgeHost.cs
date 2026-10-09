@@ -27,7 +27,11 @@ public static class ProtectBridgeHost
         var path = "/" + camera.Name + "/mainStream";
         var rtsp = new RtspServer(users) { TcpOnly = true };
         AddRtspMounts(rtsp, camera.Name, hub, permitted, onvif.GopPlayout, onvif.PlayoutDelayMs);
-        var endpoint = new ProtectOnvifServer(onvif, users, [new ProtectOnvifStream("main", path, hub)], config.BindPort);
+        var snapshots = new NativeProtectSnapshotProvider(() => source.LiveCamera,
+            () => !hub.AuthenticationFailed && hub.LiveVideo && hub.VideoReady
+                && hub.GetVideoDiagnostics().LastVideoAgeMs is >= 0 and <= 5000,
+            () => hub.SourceEpoch, lifetime: shutdown.Token);
+        var endpoint = new ProtectOnvifServer(onvif, users, [new ProtectOnvifStream("main", path, hub)], config.BindPort, snapshots);
         var tasks = new[]
         {
             RunCameraAsync(source, shutdown.Token),
