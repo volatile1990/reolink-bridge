@@ -30,12 +30,14 @@ public sealed partial class ProtectOnvifServer
     private readonly IReadOnlyList<ProtectOnvifStream> _streams;
     private readonly int _rtspPort;
     private readonly IProtectSnapshotProvider? _snapshots;
+    private readonly SnapshotDigestAuthentication _snapshotDigest;
     private readonly long _startedTimestamp = System.Diagnostics.Stopwatch.GetTimestamp();
     private readonly Dictionary<string, DateTime> _nonces = new(StringComparer.Ordinal);
     private readonly Dictionary<string, int> _connections = new(StringComparer.Ordinal);
 
     public ProtectOnvifServer(BridgeOnvifConfig config, IReadOnlyDictionary<string, string> users,
-        IReadOnlyList<ProtectOnvifStream> streams, int rtspPort, IProtectSnapshotProvider? snapshots = null)
+        IReadOnlyList<ProtectOnvifStream> streams, int rtspPort, IProtectSnapshotProvider? snapshots = null,
+        TimeProvider? snapshotAuthClock = null)
     {
         config.Validate();
         if (rtspPort is < 1 or > 65535 || config.Port == rtspPort)
@@ -49,6 +51,7 @@ public sealed partial class ProtectOnvifServer
         _streams = streams;
         _rtspPort = rtspPort;
         _snapshots = snapshots;
+        _snapshotDigest = new SnapshotDigestAuthentication(users, snapshotAuthClock ?? TimeProvider.System);
     }
 
     public bool Healthy => _streams.All(s => !s.Hub.AuthenticationFailed
@@ -239,13 +242,13 @@ public sealed partial class ProtectOnvifServer
     }
 
     private static async Task RespondAsync(NetworkStream stream, int status, string body, bool close,
-        CancellationToken ct, string contentType = "application/soap+xml; charset=utf-8")
+        CancellationToken ct, string contentType = "application/soap+xml; charset=utf-8", string? challenge = null)
     {
         var data = Encoding.UTF8.GetBytes(body);
         var head = $"HTTP/1.1 {status} {status switch { 200 => "OK", 400 => "Bad Request", 401 => "Unauthorized", 404 => "Not Found", 503 => "Service Unavailable", _ => "Error" }}\r\n" +
             $"Content-Length: {data.Length}\r\nContent-Type: {contentType}\r\n" +
             "Cache-Control: no-store\r\n" +
-            (status == 401 ? "WWW-Authenticate: Basic realm=\"reolink-bridge\"\r\n" : "") +
+            (status == 401 ? "WWW-Authenticate: " + (challenge ?? "Basic realm=\"reolink-bridge\"") + "\r\n" : "") +
             (close ? "Connection: close\r\n" : "") + "\r\n";
         await stream.WriteAsync(Encoding.ASCII.GetBytes(head), ct).ConfigureAwait(false);
         if (data.Length > 0) await stream.WriteAsync(data, ct).ConfigureAwait(false);
@@ -259,11 +262,12 @@ public sealed partial class ProtectOnvifServer
 
     private async Task SnapshotAsync(NetworkStream connection, string path, string? authorization, CancellationToken ct)
     {
-        // JPEG GETs cannot carry WSSE. Require the same local Basic credentials as RTSP,
+        // JPEG GETs cannot carry WSSE. Require local Digest or preemptive Basic credentials,
         // before resolving a profile, looking in a provider cache or contacting the live session.
-        if (!AuthenticatedBasic(authorization))
+        if (!AuthenticatedBasic(authorization) && !_snapshotDigest.Authenticate(authorization, "GET", path))
         {
-            await RespondAsync(connection, 401, "{\"error\":\"authentication-required\"}", true, ct, "application/json").ConfigureAwait(false);
+            await RespondAsync(connection, 401, "{\"error\":\"authentication-required\"}", true, ct,
+                "application/json", _snapshotDigest.Challenge()).ConfigureAwait(false);
             return;
         }
         var selected = _streams.FirstOrDefault(stream => SnapshotPath(stream) == path);

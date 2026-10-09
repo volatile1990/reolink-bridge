@@ -158,6 +158,38 @@ internal static class NativeProtectSnapshotTests
             await Reply(stream, request, bytes: jpeg, ct: stop);
         }, async (camera, stop) =>
             Check((await camera.SnapAsync(stop))!.SequenceEqual(jpeg), "legacy snapshot behavior changed"));
+        foreach (bool finalBytes in new[] { true, false })
+        {
+            const ushort snapshotNumber = 43, videoNumber = 42;
+            var context = new BcContext(new EncryptionState());
+            async Task<BcMessage> Parse(BcMessage message)
+            {
+                using var wire = new MemoryStream(BcCodec.Serialize(message, context.Encryption));
+                return await BcCodec.ReadMessageAsync(wire, context, CancellationToken.None);
+            }
+            BcMessage Binary(uint messageId, ushort number, ushort status, byte[]? bytes) => new()
+            {
+                Meta = new BcMeta { MsgId = messageId, MsgNum = number,
+                    Class = BcConstants.ClassModernZero, ResponseCode = status },
+                Extension = bytes == null ? null : new ExtensionXml { BinaryData = 1, ChannelId = 0 },
+                Binary = bytes
+            };
+            await Parse(Binary(BcConstants.MsgIdVideo, videoNumber, 200, [1, 2, 3]));
+            await Parse(Binary(BcConstants.MsgIdSnap, snapshotNumber, 200, jpeg[..60]));
+            Check(context.InBinMode.Contains(snapshotNumber), "multipart 200 released snapshot mode too early");
+            byte[]? tail = finalBytes ? jpeg[60..] : null;
+            var final = await Parse(Binary(BcConstants.MsgIdSnap, snapshotNumber, 201, tail));
+            Check(tail == null ? final.Binary == null : final.Binary!.SequenceEqual(tail),
+                "snapshot mode was cleared before the final 201 bytes were parsed");
+            Check(!context.InBinMode.Contains(snapshotNumber) && context.InBinMode.Contains(videoNumber),
+                "snapshot completion retained its mode or cleared the active video mode");
+            var acknowledgement = await Parse(BcMessage.FromXml(new BcMeta { MsgId = BcConstants.MsgIdSnap,
+                MsgNum = snapshotNumber, Class = BcConstants.ClassModernZero, ResponseCode = 200 },
+                BcXmlBody.FromRaw(new XElement("Snap", new XElement("pictureSize", jpeg.Length)))));
+            Check(acknowledgement.Xml?.RawElement("Snap")?.Element("pictureSize")?.Value == jpeg.Length.ToString()
+                && acknowledgement.Binary == null, "reused snapshot number misclassified its XML acknowledgement");
+            Check(context.InBinMode.Contains(videoNumber), "reused snapshot acknowledgement changed another video mode");
+        }
         foreach (bool advertised in new[] { true, false })
             await Wire(async (stream, context, stop) =>
             {

@@ -184,6 +184,11 @@ public static class BcCodec
             }
         }
 
+        // Snapshot transfers are finite. Keep binary mode through the final
+        // payload, then release its number so a later 16-bit wrap can parse a
+        // new XML acknowledgement instead of treating it as stale binary data.
+        if (msgId == BcConstants.MsgIdSnap && responseCode == 201)
+            ctx.InBinMode.Remove(msgNum);
         return msg;
     }
 

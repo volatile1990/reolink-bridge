@@ -278,6 +278,10 @@ internal static class ContractTests
             await Test("snapshot HTTP preserves binary JPEG and enforces body bounds", SnapshotContractTests.BinaryResponseAndBounds);
             await Test("snapshot HTTP rejects stale or replaced source sessions", SnapshotContractTests.SourceFreshnessAndEpoch);
             await Test("snapshot provider failures and timeouts become bounded generic 503 replies", SnapshotContractTests.ProviderFailureAndBudget);
+            await Test("snapshot Digest negotiates HTTP JPEG with exact targets and preemptive Basic compatibility", SnapshotDigestContractTests.ChallengeAndAuthentication);
+            await Test("snapshot Digest binds requests and rejects concurrent or stale nonce-count replays", SnapshotDigestContractTests.ReplayAndBindings);
+            await Test("snapshot Digest fails closed on malformed headers and remains outside SOAP and metrics", SnapshotDigestContractTests.ParserAndScope);
+            await Test("snapshot Digest bounds nonce replay state and expires it using monotonic time", SnapshotDigestContractTests.MonotonicExpiryAndBounds);
             await Test("native snapshot cache expires monotonically and rejects stale or replaced sessions", NativeProtectSnapshotTests.CacheAndFreshness);
             await Test("native snapshot single-flight isolates one HTTP caller's cancellation", NativeProtectSnapshotTests.SharedCaptureCancellation);
             await Test("native snapshot validates JPEG structure and invalidates capture across epochs", NativeProtectSnapshotTests.InvalidAndChangedSession);

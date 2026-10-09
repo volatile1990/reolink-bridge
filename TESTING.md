@@ -10,17 +10,34 @@ dotnet run --project src/Neolink.Server/Neolink.Server.csproj --configuration Re
 dotnet run --project tests/Neolink.ProtectTests/Neolink.ProtectTests.csproj --configuration Release
 ```
 
-Die lokalen Prüfungen umfassen **159 Upstream-Selbsttests und 64 ONVIF-/RTSP-/Snapshot-Vertragstests**. Der Release-Build wird einschließlich der GOP-Ausgabe ohne Fehler oder Warnungen geprüft.
+Die lokalen Prüfungen umfassen **159 Upstream-Selbsttests und 68 ONVIF-/RTSP-/Snapshot-Vertragstests**. Der Release-Build wird einschließlich der GOP-Ausgabe ohne Fehler oder Warnungen geprüft.
 
 Die zusätzlichen Vertragstests starten den tatsächlichen HTTP-Listener auf Loopback und verwenden synthetische Zugangsdaten und Medienzustände. Sie prüfen Geräteidentität und stabile UUID/MAC, Media1/Media2, ehrliche H.265-/H.264-Profile, RTSP-URLs, WSSE-/Basic-Anmeldung, Zeitabweichung und Replay-Schutz, Bereitschaft des Streams, XML-/XXE-Abweisung sowie die strenge Pilot-Konfiguration. Sie verbinden sich mit keiner echten Kamera. Details stehen im [Testprojekt](tests/Neolink.ProtectTests/README.md).
 
 Die GOP-Tests prüfen zusätzlich den tatsächlichen RTSP-TCP-Pfad: beide Mount-Aliase, einzelne RTP-Marker und Zeitstempel pro Bild, unveränderte codierte NAL-Inhalte auch nach FU-Fragmentierung, die unveränderte Standardausgabe sowie Audio-Abweisung im ausdrücklich aktivierten Video-Modus. Deterministische Uhren prüfen Drift, Wrap, begrenzte GOP-Puffer, Metadaten und Wiederaufnahme nach einer Lücke. PAUSE, TEARDOWN, Source-Wechsel und die echte DropOldest-Subscriberqueue sind ebenfalls abgedeckt. Die ergänzten Regressionen erhalten reale Bilder trotz eines zwölfsekündigen Raw-Clock-Sprungs, wiederholter oder rückläufiger RTP-Werte und gebündelter Access Units; sie prüfen zugleich plausible variable Kadenz und die Zuordnung des nächsten Schlüsselbilds.
 
-Die Snapshot-Tests prüfen Media1/Media2-URIs, Basic-Anmeldung vor dem nativen Abruf, binäre JPEG-Ausgabe, Frische und Source-Wechsel, begrenzte Antwortgröße und Fristen. Der native Cache wird mit monotoner Uhr geprüft; parallele Aufrufer teilen eine Anforderung, deren Arbeit durch einen einzelnen abgebrochenen HTTP-Aufruf nicht beendet wird. Synthetische Baichuan-Peers prüfen den Befehl 109 einschließlich FullAES, Reassembly-Limits und verspäteter Antworten nach Abbruch. Diese Tests belegen noch keine Unterstützung durch eine konkrete Kamerafirmware.
+Die Snapshot-Tests prüfen Media1/Media2-URIs, Anmeldung vor dem nativen Abruf, binäre JPEG-Ausgabe, Frische und Source-Wechsel, begrenzte Antwortgröße und Fristen. HTTP Digest wird mit echter Challenge-Verhandlung, Bindung an GET und Anfragepfad, Replay-Zählern, begrenztem Nonce-Cache und monotoner Ablaufzeit geprüft; vorab gesendetes Basic bleibt verfügbar. Der native Cache wird mit monotoner Uhr geprüft; parallele Aufrufer teilen eine Anforderung, deren Arbeit durch einen einzelnen abgebrochenen HTTP-Aufruf nicht beendet wird. Synthetische Baichuan-Peers prüfen den Befehl 109 einschließlich FullAES, Reassembly-Limits und verspäteter Antworten nach Abbruch. Nach dem vollständigen 201-Abschluss wird der binäre Snapshot-Modus freigegeben; ein später wiederverwendeter Nachrichtenzähler muss erneut eine XML-Bestätigung lesen können. Andere Videotransfers behalten ihren Modus. Diese Tests belegen noch keine Unterstützung durch eine konkrete Kamerafirmware.
 
 ## Echter NAS-Pilot
 
 Der Pilot läuft auf einer **Synology DS720+ mit DSM 7.2.1, Docker 24 und .NET 10**, mit eigener Macvlan-Adresse je Bridge im Kameranetz und **UniFi Protect 7.3.70**. Die folgende frühere 45-Sekunden-Messung wurde mit Softwarestand `fd3d9b6` durchgeführt. Die lokalen Compose-Dateien, Geräteidentitäten und Zugangsdaten bleiben außerhalb des öffentlichen Repositorys.
+
+### Native Vorschaubilder
+
+Alle sechs NAS-Instanzen liefern mit Stand `648b7d7` native JPEGs über die bestehende Baichuan-Sitzung, ohne zweiten Videostream und ohne Bilddecoder auf dem NAS. Der begrenzte Snapshot-Befehl muss `streamType: sub` verwenden. Die vorherige Anforderung `subStream` führte an einer B1200 zu einem 1.947.116-Byte-Hauptstream-JPEG mit ungefähr 7,7 Sekunden Übertragungszeit und überschritt die dreisekündige Frist. Mit `sub` lieferte dieselbe Kamera ein rund 72-KB-JPEG innerhalb der Frist.
+
+| Modell / Instanz | JPEG-Größe | Erster Abruf | Cache-Abruf |
+|---|---:|---:|---:|
+| RLC-1212A | 48.306 Byte | 357 ms | 6 ms |
+| B1200, Instanz 1 | 57.113 Byte | 121 ms | 7 ms |
+| B1200, Instanz 2 | 69.222 Byte | 158 ms | 5 ms |
+| B1200, Instanz 3 | 71.581 Byte | 681 ms | 4 ms |
+| E1 Zoom | 21.466 Byte | 682 ms | 8 ms |
+| RLC-823A | 593.394 Byte | 1.200 ms | 18 ms |
+
+Die parallele Prüfung bestätigte pro Instanz ONVIF `GetSnapshotUri` mit HTTP 200, authentifizierte JPEG-Ausgabe mit SOI/EOI-Markern und `image/jpeg`, anonyme Abweisung mit HTTP 401 sowie weiterhin `/health` mit HTTP 200. Alle sechs Protect-Geräte blieben `CONNECTED`, ohne `isPoorNetwork`; Protect übernahm die Snapshot-Adressen beim Wiederverbinden automatisch. Die Videoglättung mit 2.500 ms Reserve blieb für die drei betroffenen Instanzen aktiv.
+
+Diese Messung belegt zunächst den Bridge-Abruf. Die installierte Protect-Version verwendet für das Bild HTTP Digest statt des bisher angebotenen HTTP Basic; der vollständige Protect-Vorschauabruf wird nach Ergänzung dieser Anmeldung separat geprüft. Protect speichert fehlgeschlagene Snapshot-Abrufe bis zu 60 Sekunden zwischen; sein Parameter `force=true` umgeht diesen Fehlercache nicht.
 
 ### Aktiver Test: alle sechs Kameras über Bridges
 

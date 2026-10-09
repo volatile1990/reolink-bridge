@@ -97,8 +97,8 @@ internal static class SnapshotContractTests
         {
             using var response = await fixture.GetAsync("/snapshot/main.jpg", authorization);
             Check(response.StatusCode == HttpStatusCode.Unauthorized
-                && response.Headers.WwwAuthenticate.Any(challenge => challenge.Scheme == "Basic"),
-                "snapshot GET must challenge anonymous or incorrect Basic credentials");
+                && response.Headers.WwwAuthenticate.Any(challenge => challenge.Scheme == "Digest"),
+                "snapshot GET must challenge anonymous or incorrect credentials with Digest");
             Check(!((await response.Content.ReadAsStringAsync()).Contains(Password)), "snapshot auth response reflected credentials");
         }
         using (var response = await fixture.GetAsync("/snapshot/unknown.jpg"))
