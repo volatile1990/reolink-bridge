@@ -691,7 +691,7 @@ public sealed class BcCamera : IBcCamera
             new XElement("logicChannel", _channelId),
             new XElement("time", 0),
             new XElement("fullFrame", 0),
-            new XElement("streamType", "subStream")));
+            new XElement("streamType", maxBytes.HasValue ? "sub" : "subStream")));
         var req = new BcMessage
         {
             Meta = new BcMeta
@@ -721,7 +721,8 @@ public sealed class BcCamera : IBcCamera
             // the next request's JPEG. Legacy SnapAsync semantics stay intact.
             if (maxBytes.HasValue && (reply.Meta.MsgNum != req.Meta.MsgNum || reply.Meta.ChannelId != _channelId))
                 continue;
-            if (reply.Meta.ResponseCode != 200)
+            bool completed = maxBytes.HasValue && reply.Meta.ResponseCode == 201;
+            if (reply.Meta.ResponseCode != 200 && !completed)
                 throw new CameraCommandException(BcConstants.MsgIdSnap, reply.Meta.ResponseCode);
             if (reply.Xml?.RawElement("Snap") is { } snap
                 && int.TryParse(snap.Element("pictureSize")?.Value.Trim(), out var size) && size > 0)
@@ -736,6 +737,11 @@ public sealed class BcCamera : IBcCamera
                     throw new BcProtocolException("Snapshot exceeds the permitted byte limit");
                 jpeg.Write(bin, 0, bin.Length);
             }
+            // Some cameras attach their last bytes to a 201 completion reply.
+            // Only the bounded, correlated transfer accepts that status, and
+            // only once the announced image has actually been received.
+            if (completed && (expected <= 0 || jpeg.Length < expected))
+                throw new BcProtocolException("Snapshot completed before its announced image was received");
             if (expected >= 0 && jpeg.Length >= expected)
                 return jpeg.ToArray();
             if (expected < 0 && jpeg.Length > 0)

@@ -127,18 +127,37 @@ internal static class NativeProtectSnapshotTests
     public static async Task WireReassemblyAndLimits()
     {
         byte[] jpeg = Jpeg();
+        foreach (ushort finalStatus in new ushort[] { 200, 201 })
+            await Wire(async (stream, context, stop) =>
+            {
+                var request = await BcCodec.ReadMessageAsync(stream, context, stop);
+                AssertSnap(request);
+                await Reply(stream, request, size: jpeg.Length, ct: stop);
+                await Reply(stream, request, bytes: jpeg[..60], ct: stop);
+                await Reply(stream, request, bytes: jpeg[60..], ct: stop, responseCode: finalStatus);
+            }, async (camera, stop) =>
+            {
+                Check((await camera.SnapBoundedAsync(4 * 1024 * 1024, stop))!.SequenceEqual(jpeg),
+                    "native BC chunks did not reassemble into the original JPEG");
+            });
+        foreach (bool announced in new[] { true, false })
+            await Wire(async (stream, context, stop) =>
+            {
+                var request = await BcCodec.ReadMessageAsync(stream, context, stop); AssertSnap(request);
+                if (announced) await Reply(stream, request, size: jpeg.Length, ct: stop);
+                await Reply(stream, request, bytes: jpeg[..60], ct: stop, responseCode: 201);
+            }, async (camera, stop) =>
+            {
+                bool rejected = false;
+                try { await camera.SnapBoundedAsync(1024, stop); } catch (BcProtocolException) { rejected = true; }
+                Check(rejected, "201 accepted an incomplete or unannounced snapshot");
+            });
         await Wire(async (stream, context, stop) =>
         {
-            var request = await BcCodec.ReadMessageAsync(stream, context, stop);
-            AssertSnap(request);
-            await Reply(stream, request, size: jpeg.Length, ct: stop);
-            await Reply(stream, request, bytes: jpeg[..60], ct: stop);
-            await Reply(stream, request, bytes: jpeg[60..], ct: stop);
+            var request = await BcCodec.ReadMessageAsync(stream, context, stop); AssertSnap(request, "subStream");
+            await Reply(stream, request, bytes: jpeg, ct: stop);
         }, async (camera, stop) =>
-        {
-            Check((await camera.SnapBoundedAsync(4 * 1024 * 1024, stop))!.SequenceEqual(jpeg),
-                "native BC chunks did not reassemble into the original JPEG");
-        });
+            Check((await camera.SnapAsync(stop))!.SequenceEqual(jpeg), "legacy snapshot behavior changed"));
         foreach (bool advertised in new[] { true, false })
             await Wire(async (stream, context, stop) =>
             {
@@ -198,7 +217,7 @@ internal static class NativeProtectSnapshotTests
             var request = await BcCodec.ReadMessageAsync(stream, context, stop); AssertSnap(request);
             await Reply(stream, request, size: jpeg.Length, ct: stop, encryption: context.Encryption);
             await Reply(stream, request, bytes: jpeg[..37], ct: stop, encryption: context.Encryption);
-            await Reply(stream, request, bytes: jpeg[37..], ct: stop, encryption: context.Encryption);
+            await Reply(stream, request, bytes: jpeg[37..], ct: stop, encryption: context.Encryption, responseCode: 201);
         }, async (camera, stop) =>
         {
             await camera.LoginAsync("synthetic-snapshot-user", password, stop);
@@ -207,23 +226,24 @@ internal static class NativeProtectSnapshotTests
         });
     }
 
-    private static void AssertSnap(BcMessage request)
+    private static void AssertSnap(BcMessage request, string streamType = "sub")
     {
         Check(request.Meta.MsgId == BcConstants.MsgIdSnap && request.Meta.MsgId == 109,
             "native snapshot performed a login or started a stream");
-        Check(request.Xml?.RawElement("Snap")?.Element("streamType")?.Value == "subStream",
+        Check(request.Xml?.RawElement("Snap")?.Element("streamType")?.Value == streamType,
             "native snapshot does not request the camera's small tier");
     }
 
     private static async Task Reply(NetworkStream stream, BcMessage request, int? size = null,
-        byte[]? bytes = null, CancellationToken ct = default, EncryptionState? encryption = null)
+        byte[]? bytes = null, CancellationToken ct = default, EncryptionState? encryption = null,
+        ushort responseCode = 200)
     {
         encryption ??= new EncryptionState();
         bool encrypted = bytes != null && encryption.Snapshot().Item1 == EncryptionKind.FullAes;
         var response = new BcMessage
         {
             Meta = new BcMeta { MsgId = 109, MsgNum = request.Meta.MsgNum, ChannelId = request.Meta.ChannelId,
-                Class = BcConstants.ClassModern, ResponseCode = 200 },
+                Class = BcConstants.ClassModern, ResponseCode = responseCode },
             Xml = size.HasValue ? BcXmlBody.FromRaw(new XElement("Snap", new XElement("pictureSize", size.Value))) : null,
             Extension = bytes != null ? new ExtensionXml { BinaryData = 1, ChannelId = request.Meta.ChannelId,
                 EncryptLen = encrypted ? (uint)bytes.Length : null } : null,
