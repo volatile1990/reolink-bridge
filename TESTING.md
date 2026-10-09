@@ -41,6 +41,8 @@ Der abschließende Stand `c513d0d` ergänzt HTTP Digest, das der installierte Pr
 
 Protect speichert fehlgeschlagene Snapshot-Abrufe bis zu 60 Sekunden zwischen; sein Parameter `force=true` umgeht diesen Fehlercache nicht. Der vorherige leere HTTP-500-Abruf wurde erst nach Digest-Unterstützung erfolgreich. Vor der letzten Aktualisierung wurden die sechs Streameingänge zusätzlich 20 Sekunden beobachtet: jede Instanz beantwortete alle 20 Abfragen als `ready`, ohne Abruffehler. Diese Kurzprüfungen belegen den funktionierenden Vorschauabruf, keine mehrtägige Dauerprüfung.
 
+Nach vollständigem Browser-Neuladen bestätigte der Nutzer anschließend sichtbare Vorschaubilder sowohl in der Seitenleiste als auch im Gerätefenster.
+
 ### Aktiver Test: alle sechs Kameras über Bridges
 
 Für den aktuellen Test ist der Reolink-NVR **physisch ausgeschaltet**. Auf dem NAS laufen sechs getrennte Bridge-Instanzen: RLC-1212A, drei B1200, E1 Zoom und RLC-823A. Protect meldet alle sechs Bridge-Geräte als `CONNECTED` mit `Improved`/GStreamer. Die bisherigen direkten Protect-Einbindungen von E1 Zoom und RLC-823A wurden vor dem Umzug privat gesichert und entfernt; es werden damit keine parallelen direkten Protect-Streams zu diesen beiden Kameras getestet.
