@@ -37,7 +37,19 @@ Die Messung fragte `/metrics` parallel einmal pro Sekunde ab. FPS und Videobitra
 
 Am gemeinsamen MokerLink-Switchzweig kamen Frames schubweise an: Die ungefähr einsekündigen Zählerintervalle schwankten bei der RLC-1212A zwischen 3 und 36 FPS, bei B1200-Instanz 3 zwischen 1 und 32 FPS und bei der RLC-823A zwischen 6 und 45 FPS. Die übrigen drei Kameras lagen nahezu konstant bei 20 FPS. Das sind Ankunftsraten innerhalb der Intervalle, keine geänderten Kamera-FPS-Einstellungen; Werte über der eingestellten Rate passen zu nachgeholten Frames nach einer Pause.
 
-Der kurze Test bestätigt den vollständigen Abruf aller sechs Bridges, aber noch keine perfekte Flüssigkeit oder langfristige Stabilität. Nach dem Wechsel von direkter Einbindung zur Bridge wurde das Livebild der RLC-1212A vom Nutzer als deutlich flüssiger beurteilt. Dieses visuelle Feedback ergänzt die Messung, ersetzt aber keinen längeren Stabilitätstest. Eine passive TCP-Messung soll als nächsten Schritt klären, ob die Ankunftspausen bereits im Kamera-Transport sichtbar sind; dazu liegen hier noch keine Ergebnisse vor.
+Der kurze Test bestätigt den vollständigen Abruf aller sechs Bridges, aber noch keine perfekte Flüssigkeit oder langfristige Stabilität. Nach dem Wechsel von direkter Einbindung zur Bridge wurde das Livebild der RLC-1212A vom Nutzer als deutlich flüssiger beurteilt. Dieses visuelle Feedback ergänzt die Messung, ersetzt aber keinen längeren Stabilitätstest.
+
+### Anschließende passive TCP-Messung
+
+Eine weitere 60-Sekunden-Messung erfasste ausschließlich TCP-Header der drei Quellen am MokerLink-Zweig am NAS-VLAN-Interface. Sie öffnete keine zusätzliche Kameraquelle und speicherte weder Videodaten noch Paketdateien. Es wurden 191.820 Pakete erfasst, ohne vom Kernel gemeldete Capture-Verluste. In allen drei beobachteten Verbindungen gab es keine Sequenzüberschneidungen, wiederholten reinen ACK-Kandidaten oder Zero-Window-Pakete.
+
+| Quelle | TCP-Nutzdaten / Mbit/s | Größter Abstand zwischen Nutzdatenpaketen |
+|---|---|---|
+| RLC-1212A | 8,470 | 44,368 ms |
+| B1200, Instanz 3 | 9,376 | 4,013 ms |
+| RLC-823A | 6,434 | 66,167 ms |
+
+Damit ist in diesem Beobachtungsfenster kein Paketverlust oder Empfangsstau als Ursache bestätigt. TCP-Paketabstände und vollständige Video-Frames messen unterschiedliche Stufen. Die passive Messung lief nach der oben dokumentierten Frame-Messung; sie korreliert daher nicht exakt mit deren einzelnen Aussetzern. Offload, Capture-Grenzen und andere Betriebszeiten begrenzen die Aussage. Für verbleibende längere Frame-Pausen sind zeitgleich erfasste Transport- und Baichuan-/Parser-Metriken die nächste Eingrenzung; ein MokerLink-Hardwarefehler ist bislang nicht bewiesen.
 
 ### Früherer Pilot: vier Bridges und zwei direkte Kameras
 
