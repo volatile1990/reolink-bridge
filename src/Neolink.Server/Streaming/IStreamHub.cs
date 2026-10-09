@@ -11,6 +11,17 @@ namespace Neolink.Streaming;
 public readonly record struct VideoDiagnostics(long IncomingFrames, long IncomingVideoBytes,
     double? LastVideoAgeMs, double MaxArrivalGapMs, double UptimeSeconds);
 
+/// <summary>Metadata-only inspection of the unchanged encoded buffers. Access-unit counts
+/// estimate VCL-containing pictures using slice boundaries, not successful decoder output.
+/// Counters/maxima are lifetime values; GOP size/state describe the current cache.
+/// Timestamp backward candidates use wrap-aware serial arithmetic and can also mean a
+/// forward discontinuity exceeding half the 32-bit camera clock range.</summary>
+public readonly record struct VideoBufferDiagnostics(long TotalAccessUnits, long MultiAccessUnitBuffers,
+    long MaxAccessUnitsPerBuffer, long MaxVideoBufferBytes, long KeyframeCount, double? KeyframeAgeMs,
+    int GopBytes, int GopPackets, bool GopBuffered, long GopCacheEvictions,
+    uint? LastCameraTimestampDeltaUs, long MaxCameraTimestampDeltaUs,
+    long CameraTimestampZeroDeltas, long CameraTimestampBackwardCandidates);
+
 /// <summary>The publish side of a stream hub, fed by one camera stream.</summary>
 public interface IMediaSink
 {
@@ -64,6 +75,7 @@ public interface IStreamHub
     AudioTrackInfo? Audio { get; }
     /// <summary>A read-only snapshot; implementations without timing cannot claim freshness.</summary>
     VideoDiagnostics GetVideoDiagnostics() => new(0, 0, null, 0, 0);
+    VideoBufferDiagnostics GetVideoBufferDiagnostics() => default;
 
     /// <summary>An Opus-consuming session arrived/left. The hub transcodes the
     /// camera's audio to Opus (<see cref="HubAudioOpus"/> packets, alongside the

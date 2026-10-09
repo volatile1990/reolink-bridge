@@ -63,6 +63,7 @@ public sealed partial class ProtectOnvifServer
         streams = _streams.Select(stream =>
         {
             var diagnostics = stream.Hub.GetVideoDiagnostics();
+            var buffers = stream.Hub.GetVideoBufferDiagnostics();
             return new
             {
                 profile = stream.Token,
@@ -74,6 +75,20 @@ public sealed partial class ProtectOnvifServer
                 lastVideoAgeMs = diagnostics.LastVideoAgeMs,
                 maxArrivalGapMs = diagnostics.MaxArrivalGapMs,
                 sourceUptimeSeconds = diagnostics.UptimeSeconds,
+                totalAccessUnits = buffers.TotalAccessUnits,
+                multiAccessUnitBuffers = buffers.MultiAccessUnitBuffers,
+                maxAccessUnitsPerBuffer = buffers.MaxAccessUnitsPerBuffer,
+                maxVideoBufferBytes = buffers.MaxVideoBufferBytes,
+                keyframeCount = buffers.KeyframeCount,
+                keyframeAgeMs = buffers.KeyframeAgeMs,
+                gopBytes = buffers.GopBytes,
+                gopPackets = buffers.GopPackets,
+                gopBuffered = buffers.GopBuffered,
+                gopCacheEvictions = buffers.GopCacheEvictions,
+                lastCameraTimestampDeltaUs = buffers.LastCameraTimestampDeltaUs,
+                maxCameraTimestampDeltaUs = buffers.MaxCameraTimestampDeltaUs,
+                cameraTimestampZeroDeltas = buffers.CameraTimestampZeroDeltas,
+                cameraTimestampBackwardCandidates = buffers.CameraTimestampBackwardCandidates,
                 videoReady = stream.Hub.VideoReady,
                 liveVideo = stream.Hub.LiveVideo,
                 authenticationFailed = stream.Hub.AuthenticationFailed,

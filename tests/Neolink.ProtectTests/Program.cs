@@ -141,7 +141,9 @@ internal static class ContractTests
                 Assert(root.GetProperty("uptimeSeconds").GetDouble() >= 0, "negative endpoint uptime");
                 var diagnostics = root.GetProperty("streams").EnumerateArray().ToArray();
                 Assert(diagnostics.Length == 2, "metrics lost a profile");
-                var fields = new HashSet<string>(["profile", "codec", "width", "height", "incomingFrames", "incomingVideoBytes", "lastVideoAgeMs", "maxArrivalGapMs", "sourceUptimeSeconds", "videoReady", "liveVideo", "authenticationFailed", "viewers"]);
+                var fields = new HashSet<string>(["profile", "codec", "width", "height", "incomingFrames", "incomingVideoBytes", "lastVideoAgeMs", "maxArrivalGapMs", "sourceUptimeSeconds", "videoReady", "liveVideo", "authenticationFailed", "viewers",
+                    "totalAccessUnits", "multiAccessUnitBuffers", "maxAccessUnitsPerBuffer", "maxVideoBufferBytes", "keyframeCount", "keyframeAgeMs", "gopBytes", "gopPackets", "gopBuffered", "gopCacheEvictions",
+                    "lastCameraTimestampDeltaUs", "maxCameraTimestampDeltaUs", "cameraTimestampZeroDeltas", "cameraTimestampBackwardCandidates"]);
                 foreach (var item in diagnostics)
                 {
                     Assert(fields.SetEquals(item.EnumerateObject().Select(x => x.Name)), "unexpected or missing stream metric fields");
@@ -174,6 +176,11 @@ internal static class ContractTests
                 Assert(hub.GetVideoDiagnostics() == later, "wall-clock change affects video arrival diagnostics");
                 return Task.CompletedTask;
             });
+            await Test("H265 buffer diagnostics distinguish pictures from slices and metadata", VideoBufferDiagnosticsTests.PictureBoundaries);
+            await Test("keyframe age and current GOP cache are independent of lifetime counters", VideoBufferDiagnosticsTests.KeyframeAndCache);
+            await Test("GOP byte and packet evictions count once without interrupting delivery", VideoBufferDiagnosticsTests.CacheEvictions);
+            await Test("camera timestamp diagnostics distinguish wrap zero reversal and reconnect", VideoBufferDiagnosticsTests.TimestampDeltas);
+            await Test("protected HTTP metrics expose buffer diagnostics without encoded data or secrets", VideoBufferDiagnosticsTests.HttpMetrics);
             await Test("stopping and resuming a source preserves lifetime diagnostic counters", () =>
             {
                 var clock = new ManualTimeProvider();

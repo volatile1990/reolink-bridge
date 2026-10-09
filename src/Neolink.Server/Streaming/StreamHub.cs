@@ -45,6 +45,12 @@ public sealed class StreamHub : IStreamHub, IMediaSink
     private long _lastVideoTimestamp;
     private long _maxVideoGapTicks;
     private int _authenticationFailed;
+    private long _totalAccessUnits, _multiAccessUnitBuffers, _maxAccessUnitsPerBuffer, _maxVideoBufferBytes;
+    private long _keyframeCount, _lastKeyframeTimestamp, _gopCacheEvictions;
+    private long _lastCameraDeltaUs = -1, _maxCameraDeltaUs, _cameraZeroDeltas, _cameraBackwardCandidates;
+    private readonly object _diagnosticTimestampGate = new();
+    private bool _haveDiagnosticCameraTimestamp;
+    private uint _lastDiagnosticCameraTimestamp;
 
     // GOP cache: the ordered packets since (and including) the most recent video
     // keyframe. A brand-new viewer is primed with this so it has a decodable
@@ -150,6 +156,77 @@ public sealed class StreamHub : IStreamHub, IMediaSink
         Interlocked.Increment(ref _videoFrameCount);
     }
 
+    public VideoBufferDiagnostics GetVideoBufferDiagnostics()
+    {
+        int bytes, packets;
+        bool buffered;
+        lock (_castGate)
+        {
+            bytes = _gopBytes;
+            packets = _gop.Count;
+            buffered = _gopOpen && packets > 0;
+        }
+        long keyframes = Interlocked.Read(ref _keyframeCount);
+        long lastDelta = Interlocked.Read(ref _lastCameraDeltaUs);
+        double? keyframeAge = keyframes == 0 ? null : Math.Max(0,
+            _diagnosticClock.GetTimestamp() - Interlocked.Read(ref _lastKeyframeTimestamp))
+            * 1000.0 / _diagnosticClock.TimestampFrequency;
+        return new(Interlocked.Read(ref _totalAccessUnits), Interlocked.Read(ref _multiAccessUnitBuffers),
+            Interlocked.Read(ref _maxAccessUnitsPerBuffer), Interlocked.Read(ref _maxVideoBufferBytes),
+            keyframes, keyframeAge, bytes, packets, buffered, Interlocked.Read(ref _gopCacheEvictions),
+            lastDelta < 0 ? null : (uint)lastDelta, Interlocked.Read(ref _maxCameraDeltaUs),
+            Interlocked.Read(ref _cameraZeroDeltas), Interlocked.Read(ref _cameraBackwardCandidates));
+    }
+
+    private static void RaiseMaximum(ref long target, long value)
+    {
+        long old;
+        do { old = Interlocked.Read(ref target); if (value <= old) return; }
+        while (Interlocked.CompareExchange(ref target, value, old) != old);
+    }
+
+    private void RecordVideoBuffer(VideoFrame frame)
+    {
+        // Inspect only: the original bytes, frame boundary, flags and RTP clock stay unchanged.
+        var split = FMp4.SplitAccessUnitsRaw(frame.Codec, frame.Data);
+        int pictures = 0;
+        foreach (var unit in split.Units)
+        {
+            for (int i = unit.FirstNal; i < unit.FirstNal + unit.NalCount; i++)
+            {
+                var nal = split.Nals[i].Span;
+                bool picture = frame.Codec == VideoCodec.H264
+                    ? nal.Length >= 2 && H26x.H264NalType(nal) is >= 1 and <= 5
+                    : nal.Length >= 3 && H26x.H265NalType(nal) <= 31;
+                if (!picture) continue;
+                pictures++;
+                break;
+            }
+        }
+        Interlocked.Add(ref _totalAccessUnits, pictures);
+        if (pictures > 1) Interlocked.Increment(ref _multiAccessUnitBuffers);
+        RaiseMaximum(ref _maxAccessUnitsPerBuffer, pictures);
+        RaiseMaximum(ref _maxVideoBufferBytes, frame.Data.Length);
+        if (frame.Keyframe)
+        {
+            Interlocked.Exchange(ref _lastKeyframeTimestamp, _diagnosticClock.GetTimestamp());
+            Interlocked.Increment(ref _keyframeCount);
+        }
+        lock (_diagnosticTimestampGate)
+        {
+            if (_haveDiagnosticCameraTimestamp)
+            {
+                uint delta = unchecked(frame.Microseconds - _lastDiagnosticCameraTimestamp);
+                Interlocked.Exchange(ref _lastCameraDeltaUs, delta);
+                if (delta == 0) Interlocked.Increment(ref _cameraZeroDeltas);
+                else if (delta > int.MaxValue) Interlocked.Increment(ref _cameraBackwardCandidates);
+                else RaiseMaximum(ref _maxCameraDeltaUs, delta);
+            }
+            _lastDiagnosticCameraTimestamp = frame.Microseconds;
+            _haveDiagnosticCameraTimestamp = true;
+        }
+    }
+
     public void AcquireOpus() => Interlocked.Increment(ref _opusDemand);
 
     public void ReleaseOpus()
@@ -200,6 +277,7 @@ public sealed class StreamHub : IStreamHub, IMediaSink
     public void PublishVideo(VideoFrame frame)
     {
         RecordVideoArrival(frame.Data.Length);
+        RecordVideoBuffer(frame);
         // Advance the RTP timestamp using the camera's microsecond counter when sane,
         // otherwise fall back to wall clock.
         uint deltaUs;
@@ -362,6 +440,7 @@ public sealed class StreamHub : IStreamHub, IMediaSink
             {
                 if (_gop.Count >= GopMaxPackets || _gopBytes + payloadBytes > GopMaxBytes)
                 {
+                    Interlocked.Increment(ref _gopCacheEvictions);
                     // GOP outgrew the cache budget (late keyframe / very high bitrate):
                     // stop caching until the next keyframe so a joiner falls back to
                     // waiting for one rather than being primed with a partial,
@@ -384,6 +463,12 @@ public sealed class StreamHub : IStreamHub, IMediaSink
 
     public void SourceStopped()
     {
+        // Diagnostic deltas must not interpret reconnect clock resets as camera reversals.
+        lock (_diagnosticTimestampGate)
+        {
+            _haveDiagnosticCameraTimestamp = false;
+            Interlocked.Exchange(ref _lastCameraDeltaUs, -1);
+        }
         // The transcoder is session-scoped too: kill its ffmpeg with the session
         // (a battery camera parking must not leave one idling). While Opus
         // listeners remain, the next session's first audio frame starts a fresh one.
