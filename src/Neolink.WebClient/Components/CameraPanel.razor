@@ -1,0 +1,3189 @@
+@using System.Text.Json
+@using System.Net.Http.Headers
+@using Microsoft.JSInterop
+@implements IDisposable
+@inject HttpClient Http
+@inject IJSRuntime JS
+@inject Translator T
+
+@* Per-camera settings/control dialog. Everything shown is discovered from the
+   camera: device info, encode profiles, and the controls the camera supports.
+   Deliberately modal: only the ✕ button dismisses it, so a stray click can't
+   close it mid-adjustment. *@
+
+<div class="backdrop panel-backdrop"></div>
+<aside class="campanel campanel-wide" role="dialog" aria-label="Camera settings">
+    <div class="campanel-head">
+        <span class="dot @(_caps?.Online == true ? "on" : "off")"></span>
+        <span class="campanel-title">@CameraName</span>
+        @* Suspend lives here, right-aligned — one always-reachable control instead
+           of a whole section. The privacy warning moved into its confirm card. *@
+        @if (Camera?.CanSuspend == true)
+        {
+            @if (_suspendBusy)
+            {
+                <span class="chip chip-off head-suspend" aria-busy="true"><span class="btn-spinner"></span>@T["Saving…"]</span>
+            }
+            else if (_suspended == true)
+            {
+                <button class="chip chip-active head-suspend" disabled="@(!CanEditRecording)"
+                        title="@T["Suspended in Neolink.NET — click to resume (the camera itself keeps running)"]"
+                        @onclick="() => SetSuspendAsync(false)">@UiIcon.Render("eye-off", 11) @T["suspended — resume"]</button>
+            }
+            else
+            {
+                <button class="chip chip-off head-suspend" disabled="@(!CanEditRecording)"
+                        title="@T["Suspend in Neolink.NET — no viewing or recording here until resumed"]"
+                        @onclick="RequestSuspendAsync">@UiIcon.Render("eye-off", 11) @T["suspend"]</button>
+            }
+        }
+        <button class="icon-btn" title="@T["Close"]" @onclick="CloseAsync">✕</button>
+    </div>
+
+    @if (_confirmSuspend)
+    {
+        @* Pinned above the scrollable body so it is in view no matter where the
+           panel was scrolled. Confirm persists the "don't show again" choice;
+           Cancel never does. *@
+        <div class="suspend-confirm" role="alertdialog" aria-label="@T["Suspend this camera?"]">
+            <div class="campanel-section-title">@UiIcon.Render("eye-off", 13) @T["SUSPEND THIS CAMERA?"]</div>
+            <div class="notice small">
+                @((MarkupString)T["Stops <b>Neolink.NET</b> from connecting to this camera — it can't be viewed or recorded here, and its Home Assistant entities go unavailable, until resumed. No restart needed; the setting survives one."])
+            </div>
+            <div class="notice warn small">
+                ⚠ @((MarkupString)T["This only stops <b>Neolink.NET</b>. The camera keeps running: its own <b>SD-card / cloud recording</b> and any <b>other system</b> pulling its stream directly are unaffected. It is not a privacy guarantee."])
+            </div>
+            <label class="suspend-skip">
+                <input type="checkbox" @bind="_suspendSkipFuture" />
+                <span>@T["Do not show me this again"]</span>
+            </label>
+            <div class="row-actions suspend-confirm-actions">
+                <button class="chip chip-danger" @onclick="ConfirmSuspendAsync">@T["Confirm — stop Neolink.NET for this camera"]</button>
+                <button class="chip" @onclick="() => _confirmSuspend = false">@T["Cancel"]</button>
+            </div>
+        </div>
+    }
+
+    @if (_retentionConfirm is { } rc)
+    {
+        @* Same pinned placement as the suspend card: a typed-in retention cut is
+           armed but inert until confirmed here — Cancel snaps the field back. *@
+        <div class="suspend-confirm" role="alertdialog" aria-label="@T["Shrink the retention window?"]">
+            <div class="campanel-section-title">@UiIcon.Render("clock", 13) @T["SHRINK THE RETENTION WINDOW?"]</div>
+            <div class="notice warn small">⚠ @rc.Message</div>
+            <div class="row-actions suspend-confirm-actions">
+                <button class="chip chip-danger" @onclick="ConfirmRetentionAsync">@T["Confirm — apply the shorter window"]</button>
+                <button class="chip" @onclick="CancelRetentionAsync">@T["Cancel"]</button>
+            </div>
+        </div>
+    }
+
+    @if (_error != null)
+    {
+        <div class="notice error">@_error</div>
+    }
+
+    @if (_loading)
+    {
+        <div class="notice">@T["Querying camera…"]</div>
+    }
+    else if (_suspended == true)
+    {
+        @* A suspended camera reads offline — this mini-panel replaces the offline
+           notice and explains the state. The ONE resume control is the header
+           chip above (a second button here just duplicated it). *@
+        <div class="campanel-section">
+            <div class="campanel-section-title">@UiIcon.Render("eye-off", 13) @T["SUSPENDED"]</div>
+            <div class="notice small">
+                @((MarkupString)T["This camera is <b>suspended in Neolink.NET</b> — no connection is held, so it isn't viewed or recorded here and its Home Assistant entities are unavailable. Resume it with the button in the header above."])
+            </div>
+            <div class="notice warn small">
+                ⚠ @T["The camera itself keeps running: its own SD-card / cloud recording and any other system pulling it directly are unaffected. Suspend is not a privacy guarantee."]
+            </div>
+        </div>
+    }
+    else
+    {
+        @* Identity strip: the address is known upfront and shows immediately; the
+           camera's own vitals (model/firmware/serial, Wi-Fi, SD) fill in once it
+           answers. Generic RTSP cameras report none, so the strip is just the
+           address (or nothing). *@
+        @if (_caps?.Version != null || !string.IsNullOrEmpty(Camera?.Address) || Camera?.Battery != null || Camera?.WifiSignal != null || _http?.WifiSignal != null || _http?.SdCards is { Count: > 0 })
+        {
+        <div class="campanel-devbar">
+            @if (!string.IsNullOrEmpty(_caps?.Version?.Model)) { <span class="devbar-item devbar-model" title="@T["Model"]">@_caps!.Version!.Model</span> }
+            @if (!string.IsNullOrEmpty(_caps?.Version?.Firmware)) { <span class="devbar-item"><span class="devbar-k">@T["Firmware"]</span>@_caps!.Version!.Firmware</span> }
+            @if (!string.IsNullOrEmpty(_caps?.Version?.Hardware)) { <span class="devbar-item"><span class="devbar-k">@T["Hardware"]</span>@_caps!.Version!.Hardware</span> }
+            @if (!string.IsNullOrEmpty(_caps?.Version?.Serial)) { <span class="devbar-item"><span class="devbar-k">@T["Serial"]</span>@_caps!.Version!.Serial</span> }
+            @if (!string.IsNullOrEmpty(Camera?.Address)) { <span class="devbar-item" title="@T["Configured network address"]"><span class="devbar-k">@T["Address"]</span>@Camera!.Address</span> }
+            @if (Camera?.Udp == true) { <span class="devbar-item" title="@T["Connected over UDP (Baichuan-over-UDP) — beta support for battery-only models"]"><span class="devbar-k">@T["Transport"]</span>UDP <span class="beta-tag">@T["BETA"]</span></span> }
+            @if (Camera?.Battery is { } bat) { <span class="devbar-item" title="@(T.F("Battery-powered camera: {0}%", bat.Percent) + (bat.Charging ? T[", charging"] : ""))"><span class="devbar-k">@T["Battery"]</span><span class="devbar-batt">@UiIcon.RenderBattery(bat.Percent, 13)@(bat.Charging ? UiIcon.Render("bolt", 11) : default)</span>@bat.Percent%</span> }
+            @if ((Camera?.WifiSignal ?? _http?.WifiSignal) is { } link)
+            {
+                <span class="devbar-item" title="@(link.IsWired ? T["Wired network (Ethernet) — no Wi-Fi signal to report"] : T.F("Wi-Fi signal: {0}", link.Label))">
+                    <span class="devbar-k">@(link.IsWired ? T["Network"] : "Wi-Fi")</span>
+                    <span class="devbar-wifi">@(link.IsWired ? UiIcon.Render("lan", 13) : UiIcon.RenderWifi(link.Level, 13))</span>@link.Label
+                </span>
+            }
+            @if (_http?.SdCards is { Count: > 0 } cards)
+            {
+                foreach (var card in cards)
+                {
+                    <span class="devbar-item"><span class="devbar-k">@T["SD card"]</span>@SdLabel(card)</span>
+                }
+            }
+            @if (_firmware is { UpdateAvailable: true } fw)
+            {
+                <span class="devbar-item devbar-model"
+                      title="@T["Reolink offers a newer firmware for this camera. Update it from the Reolink app or the camera's own web page — Neolink.NET never installs firmware."]">
+                    <span class="devbar-k">@T["Update"]</span>@(fw.NewVersion ?? T["available"])
+                </span>
+            }
+        </div>
+        }
+
+        @* While the camera is still answering, the wait is shown ON the Camera
+           settings tab (a spinner in its label) rather than as a banner here —
+           the tab stays selectable throughout, and the explanatory line appears
+           inside it for whoever actually opens it. *@
+        @if (!_probing && !_loading && _caps is { Online: false })
+        {
+            <div class="notice">@T["Camera is offline (reconnecting). Its settings are read from the device, so they appear when it comes back"]@(_recording != null ? " — " + T["the recording options below are server-side and work meanwhile"] : "").</div>
+        }
+        else if (!_probing && !_loading && _caps == null)
+        {
+            <div class="notice">@T["The camera didn't answer the capability query, so its settings can't be shown right now — reopen the panel to retry."]</div>
+        }
+
+        <div class="settings-tabs campanel-tabs" role="tablist">
+            @* Recording leads and is the default: it's the most-visited tab. *@
+            @if (_recording != null)
+            {
+                <button class="settings-tab @(_camTab == "recording" ? "active" : "")" role="tab"
+                        @onclick='() => _camTab = "recording"'>@UiIcon.Render("rec", 13) @T["Recording"]</button>
+            }
+            @* Offered from the start — including while the camera is still being
+               queried, with a spinner in the label — so it can be opened right
+               away instead of appearing under the pointer once the probe lands.
+               Afterwards it stays only if there is something to show: a generic
+               RTSP camera has no device controls, so its tab drops away. *@
+            @if (ShowControlsTab)
+            {
+                <button class="settings-tab @(_camTab == "controls" ? "active" : "")" role="tab"
+                        @onclick='() => _camTab = "controls"'>
+                    @UiIcon.Render("gear", 13) @T["Camera settings"]
+                    @if (_probing)
+                    {
+                        <span class="btn-spinner tab-spinner" title="@T["Querying the camera…"]"></span>
+                    }
+                    else if (PendingCount > 0)
+                    {
+                        <span class="tab-dot" title="@T["Unsaved changes"]">●</span>
+                    }
+                </button>
+                @* Live view of the camera's own service ports (msg 37) — always
+                   read from the camera when opened, never a stored value.
+                   ADMIN ONLY: the table is the camera's network surface. Baichuan
+                   only: there is no ONVIF equivalent, so it drops away once the
+                   probe says the camera is not a Reolink. Offered from the start
+                   until then, exactly as it always was — holding it back would
+                   delay it for every Reolink admin to tidy one case away. *@
+                @if (IsAdmin && !OnvifOnly)
+                {
+                    <button class="settings-tab @(_camTab == "ports" ? "active" : "")" role="tab"
+                            @onclick="OpenPortsTabAsync">@UiIcon.Render("lan", 13) @T["Ports"]</button>
+                }
+            }
+        </div>
+
+        @* Masonry body: sections flow into two columns on wide screens (one on
+           mobile) — each card keeps its grouping and never splits across columns.
+           The columns live on the inner wrapper so the body can scroll; the
+           Recording tab is one big card and gets the full width. *@
+        <div class="campanel-body">
+        <div class="campanel-cols @(_camTab == "recording" ? "one-col" : "")">
+        @* Opened before the camera answered: this is where the wait is explained,
+           for the person who actually went looking for the controls. *@
+        @if (_camTab == "controls" && _caps == null)
+        {
+            <div class="notice small campanel-probing">
+                <span class="btn-spinner"></span> Querying the camera — device info and controls appear in a moment.
+            </div>
+        }
+
+        @* PORTS: the camera's own service table, queried live on every visit.
+           Toggling is an explicit two-step (confirm card) — it flips the same
+           switch as the Reolink app's Port Settings screen. Admin-gated here
+           AND at the API; the Baichuan port is never toggleable anywhere. *@
+        @if (_camTab == "ports" && IsAdmin)
+        {
+        <div class="campanel-col">
+            <div class="campanel-section">
+                <div class="campanel-subtitle">@T["NETWORK SERVICES"]</div>
+                <div class="notice small">@T["Read from the camera itself each time this tab opens — its actual state right now, never a saved value. Disabled services limit what Neolink.NET can do: HTTP powers picture settings, small AI snapshots and firmware checks; ONVIF is the imaging fallback for HTTP-less models."]</div>
+                @if (_portsLoading)
+                {
+                    <div class="notice small campanel-probing">
+                        <span class="btn-spinner"></span> @T["Asking the camera…"]
+                    </div>
+                }
+                else if (_portsError != null)
+                {
+                    <div class="notice">@_portsError</div>
+                }
+                else if (_ports != null)
+                {
+                    @foreach (var p in _ports)
+                    {
+                        <div class="control-row">
+                            <span title="@ServiceHint(p.Service)">@ServiceLabel(p.Service)@(p.Port is { } port ? " · " + T.F("port {0}", port) : "")</span>
+                            @if (p.Service == "server")
+                            {
+                                @* Port 9000 is the branch this whole app sits on:
+                                   never a toggle, in the UI or anywhere below it. *@
+                                <button class="chip" disabled
+                                        title="@T["The Baichuan channel this very connection runs on — it can never be disabled from here."]">@T["on"]</button>
+                            }
+                            else if (p.Enabled == null)
+                            {
+                                <button class="chip" disabled
+                                        title="@T["The firmware reports no on/off switch for this service."]">@T["on"]</button>
+                            }
+                            else if (_togglingService == p.Service)
+                            {
+                                <span class="btn-spinner" title="@T["Applying…"]"></span>
+                            }
+                            else
+                            {
+                                @* The same on/off toggle chip as every other row —
+                                   clicking opens the confirm card below the row. *@
+                                <button class="chip @(p.Enabled == true ? "" : "chip-off")"
+                                        @onclick="() => { _confirmService = p.Service; _confirmOn = p.Enabled != true; }">
+                                    @(p.Enabled == true ? T["on"] : T["off"])</button>
+                            }
+                        </div>
+                        @if (_confirmService == p.Service && _togglingService == null)
+                        {
+                            <div class="notice small">
+                                @(_confirmOn
+                                    ? T["This changes the camera's own network settings — the same switch as the Reolink app's Port Settings screen. The service opens on your LAN and stays on until turned off again."]
+                                    : T.F("This turns {0} off on the camera itself — the same switch as the Reolink app's Port Settings screen.{1} It stays off until re-enabled.", ServiceLabel(p.Service), DisableConsequence(p.Service)))
+                            </div>
+                            <div class="row-actions">
+                                <button class="chip chip-danger" @onclick="() => ToggleServiceAsync(p.Service, _confirmOn)">@(_confirmOn ? T.F("Confirm — enable {0}", ServiceLabel(p.Service)) : T.F("Confirm — disable {0}", ServiceLabel(p.Service)))</button>
+                                <button class="chip" @onclick="() => _confirmService = null">@T["Cancel"]</button>
+                            </div>
+                        }
+                    }
+                    <div class="row-actions">
+                        <button class="chip" @onclick="LoadPortsAsync">@UiIcon.Render("refresh", 12) @T["Re-read from camera"]</button>
+                    </div>
+                }
+            </div>
+        </div>
+        }
+
+        @* The controls body reads capabilities/features, so it only renders once
+           the camera has answered (_caps != null) — the hint above covers the wait.
+           Two EXPLICIT columns (not flowed): sections lazy-load as their probes
+           answer, and with flowed columns every arrival reshuffled the layout.
+           SUSPEND leads the right column so it has a fixed, findable home. *@
+        @if (_camTab == "controls" && _caps != null)
+        {
+        <div class="campanel-col">
+        @if (_profiles is { Count: > 0 })
+        {
+            var canSetStream = _caps.Features?.StreamSettings == true;
+            <div class="campanel-section">
+                <div class="campanel-section-title">@UiIcon.Render("film", 13) @T["STREAMS"]</div>
+                @foreach (var group in _profiles.GroupBy(p => p.Type))
+                {
+                    @* The camera reports one encode table per selectable resolution;
+                       identical duplicates are deduped. Resolution picks the table,
+                       the selects offer that table's full fps/bitrate ranges. *@
+                    var options = group
+                        .DistinctBy(p => (p.Width, p.Height, p.DefaultFramerate, p.DefaultBitrate))
+                        .ToList();
+                    var kind = group.Key;
+                    var sel = SelectedTable(kind, options);
+                    var pending = _pendingStreams.GetValueOrDefault(kind);
+                    <div class="stream-group">
+                        <span class="stream-group-name">@group.First().Label @PendingMark(pending?.ToString())</span>
+                        <div class="stream-options">
+                            @foreach (var p in options)
+                            {
+                                @if (canSetStream)
+                                {
+                                    <button class="chip stream-chip clickable @(IsPendingTable(kind, p) ? "chip-pending" : IsActiveProfile(p) ? "chip-active" : "")"
+                                            disabled="@_applying"
+                                            title="@T.F("Framerates: {0} fps — Bitrates: {1} kbps", string.Join(", ", p.Framerates), string.Join(", ", p.Bitrates))"
+                                            @onclick="() => StageResolution(kind, p, options)">
+                                        @(p.Width)×@(p.Height)
+                                    </button>
+                                }
+                                else
+                                {
+                                    <span class="chip stream-chip @(IsActiveProfile(p) ? "chip-active" : "")"
+                                          title="@T.F("Framerates: {0} fps — Bitrates: {1} kbps", string.Join(", ", p.Framerates), string.Join(", ", p.Bitrates))">
+                                        @(p.Width)×@(p.Height) · @p.DefaultFramerate fps · @p.DefaultBitrate kbps
+                                    </span>
+                                }
+                            }
+                            @if (canSetStream && sel != null)
+                            {
+                                var shownFps = pending?.Fps ?? CurrentFps(kind) ?? sel.DefaultFramerate;
+                                var shownKbps = pending?.Kbps ?? CurrentKbps(kind) ?? sel.DefaultBitrate;
+                                <label class="stream-tune @(pending != null ? "tune-pending" : "")">
+                                    <select disabled="@_applying" value="@shownFps"
+                                            @onchange="e => StageFps(kind, uint.Parse((string)e.Value!), options)">
+                                        @foreach (var f in TableValues(sel.Framerates, shownFps))
+                                        {
+                                            <option value="@f">@f fps</option>
+                                        }
+                                    </select>
+                                </label>
+                                <label class="stream-tune @(pending != null ? "tune-pending" : "")">
+                                    <select disabled="@_applying" value="@shownKbps"
+                                            @onchange="e => StageKbps(kind, uint.Parse((string)e.Value!), options)">
+                                        @foreach (var b in TableValues(sel.Bitrates, shownKbps))
+                                        {
+                                            <option value="@b">@b kbps</option>
+                                        }
+                                    </select>
+                                </label>
+                            }
+                        </div>
+                    </div>
+                }
+                @* ONVIF reports rate ranges, not tables, and has no http_address to point at. *@
+                <div class="notice small">
+                    @(OnvifOnly
+                        ? canSetStream
+                            ? T["Read from the camera; the highlighted resolution is live and the menus offer common rates within the range the camera reports. Changes stage — nothing is sent until you apply below."]
+                            : T["Read from the camera; the highlighted profile is live."]
+                        : canSetStream
+                            ? T["Read from the camera; the highlighted resolution is live and the menus show its full framerate/bitrate tables. Changes stage — nothing is sent until you apply below."]
+                            : T["Read from the camera; the highlighted profile is live. To change profiles from here, set the camera's 'http_address' in the server config."])
+                </div>
+            </div>
+        }
+
+        @if (_caps.Features?.Battery == true && _battery != null)
+        {
+            <div class="campanel-section">
+                <div class="campanel-section-title">@UiIcon.Render("battery", 13) @T["BATTERY"]</div>
+                <table class="kv">
+                    @if (Num(_battery, "batteryPercent") is { } pct) { <tr><td>@T["Charge"]</td><td>@pct%</td></tr> }
+                    @if (Str(_battery, "chargeStatus") is { Length: > 0 } cs) { <tr><td>@T["Status"]</td><td>@cs</td></tr> }
+                    @if (Num(_battery, "temperature") is { } temp) { <tr><td>@T["Temperature"]</td><td>@temp °C</td></tr> }
+                </table>
+            </div>
+        }
+
+        @if (_caps.Features?.Ptz == true)
+        {
+            <div class="campanel-section">
+                <div class="campanel-section-title">@UiIcon.Render("move", 13) @T["PAN / TILT"]</div>
+                <div class="ptz-row">
+                    <div class="ptz-pad">
+                        <span></span>
+                        <button class="tool-btn" title="@T["Up (hold)"]"
+                                @onpointerdown='() => PtzAsync("up")' @onpointerup="PtzStopAsync" @onpointerleave="PtzStopAsync">▲</button>
+                        <span></span>
+                        <button class="tool-btn" title="@T["Left (hold)"]"
+                                @onpointerdown='() => PtzAsync("left")' @onpointerup="PtzStopAsync" @onpointerleave="PtzStopAsync">◀</button>
+                        <button class="tool-btn" title="@T["Stop"]" @onclick="PtzStopAsync">■</button>
+                        <button class="tool-btn" title="@T["Right (hold)"]"
+                                @onpointerdown='() => PtzAsync("right")' @onpointerup="PtzStopAsync" @onpointerleave="PtzStopAsync">▶</button>
+                        <span></span>
+                        <button class="tool-btn" title="@T["Down (hold)"]"
+                                @onpointerdown='() => PtzAsync("down")' @onpointerup="PtzStopAsync" @onpointerleave="PtzStopAsync">▼</button>
+                        <span></span>
+                    </div>
+                    <label class="ptz-speed">
+                        @T["Speed"] @_ptzSpeed
+                        <input type="range" min="1" max="64" @bind="_ptzSpeed" @bind:event="oninput" />
+                    </label>
+                </div>
+                @if (_http?.PtzPresets is { } presets)
+                {
+                    var saved = presets.Where(p => p.Enabled).ToList();
+                    <div class="campanel-divider"></div>
+                    <div class="campanel-subtitle">@UiIcon.Render("move", 12) @T["PRESETS"]</div>
+                    @if (saved.Count > 0)
+                    {
+                        <div class="stream-options">
+                            @foreach (var p in saved)
+                            {
+                                <button class="chip" disabled="@_presetBusy"
+                                        title="@T["Move the camera to this saved position"]"
+                                        @onclick="() => GoToPresetAsync(p.Id)">@p.Name</button>
+                            }
+                        </div>
+                    }
+                    <div class="control-row row-inline">
+                        <input class="ret-input" style="width:14ch" type="text" maxlength="31"
+                               placeholder="@T["name this position"]" @bind="_newPresetName" />
+                        <button class="chip" disabled="@(_presetBusy || string.IsNullOrWhiteSpace(_newPresetName))"
+                                title="@T["Saves where the camera points right now"]"
+                                @onclick="SavePresetAsync">@T["Save current"]</button>
+                    </div>
+                }
+            </div>
+        }
+
+        @if (_caps.Features?.Zoom == true && _zoomFocus?.Zoom is { Max: > 0 } zr)
+        {
+            <div class="campanel-section">
+                <div class="campanel-section-title">@UiIcon.Render("zoom", 13) @T["ZOOM / FOCUS"]</div>
+                @* Live controls like PTZ: the lens moves when you let go of the
+                   slider — an absolute position, so there is nothing to stage. *@
+                <div class="control-row">
+                    <span>@T["Optical zoom"]</span>
+                    <input class="zf-slider" type="range" min="@zr.Min" max="@zr.Max" step="1"
+                           disabled="@_zfBusy" value="@(_zoomShown ?? zr.Cur)"
+                           @oninput="e => _zoomShown = long.Parse((string)e.Value!)"
+                           @onchange="e => SetZoomFocusAsync(zoom: long.Parse((string)e.Value!))" />
+                    <span class="zf-pos">@(_zoomShown ?? zr.Cur)/@zr.Max</span>
+                </div>
+                @if (_zoomFocus.Focus is { Max: > 0 } fr)
+                {
+                    <div class="control-row">
+                        <span>@T["Focus"]</span>
+                        <input class="zf-slider" type="range" min="@fr.Min" max="@fr.Max" step="1"
+                               disabled="@_zfBusy" value="@(_focusShown ?? fr.Cur)"
+                               @oninput="e => _focusShown = long.Parse((string)e.Value!)"
+                               @onchange="e => SetZoomFocusAsync(focus: long.Parse((string)e.Value!))" />
+                        <span class="zf-pos">@(_focusShown ?? fr.Cur)/@fr.Max</span>
+                    </div>
+                    <div class="notice small">@T["Most cameras refocus automatically after a zoom — move the focus slider only to override."]</div>
+                }
+            </div>
+        }
+
+        @if (_caps.Features?.Led == true && _led != null)
+        {
+            <div class="campanel-section">
+                <div class="campanel-section-title">@UiIcon.Render("sun", 13) @T["LIGHTS"]</div>
+                @* LedState semantics (per the BC protocol): "state" drives the IR
+                   night-vision LEDs. "lightState" is the white spotlight on cameras
+                   that have one (its on/off) and the little status LED on those that
+                   don't — so it's labelled by the floodlight capability below. *@
+                @if (Str(_led, "state") is { Length: > 0 } irState)
+                {
+                    <div class="control-row">
+                        <span>@T["Infrared night vision"] @PendingMark(_pendingIr)</span>
+                        <select class="@(_pendingIr != null ? "input-pending" : "")" value="@(_pendingIr ?? irState)"
+                                disabled="@_applying" @onchange='e => StageIr((string?)e.Value)'>
+                            <option value="auto">@T["auto"]</option>
+                            <option value="open">@T["on"]</option>
+                            <option value="close">@T["off"]</option>
+                        </select>
+                    </div>
+                }
+                @if (Str(_led, "lightState") is { Length: > 0 } lightState)
+                {
+                    var shownLed = _pendingStatusLed ?? lightState;
+                    // lightState is the floodlight on/off on floodlight cams, otherwise
+                    // the little status LED (the white spotlight is the HTTP white LED).
+                    var lightLabel = _caps.Features?.Floodlight == true ? T["Floodlight"] : T["Status LED"];
+                    <div class="control-row">
+                        <span>@lightLabel @PendingMark(_pendingStatusLed)</span>
+                        <button class="chip @(shownLed == "open" ? "" : "chip-off") @(_pendingStatusLed != null ? "chip-pending" : "")"
+                                disabled="@_applying" @onclick="StageStatusLedToggle">
+                            @(shownLed == "open" ? T["on"] : T["off"])
+                        </button>
+                    </div>
+                }
+                @if (_caps.Features?.Floodlight == true && _floodlight is { } flCur)
+                {
+                    @* The spotlight's BEHAVIOR (staged like other device settings);
+                       the Floodlight on/off toggle above drives it directly. *@
+                    <div class="control-row">
+                        <span>@T["Floodlight brightness"] @PendingMark(_pendingFlBrightness?.ToString())</span>
+                        <input class="zf-slider @(_pendingFlBrightness != null ? "input-pending" : "")"
+                               type="range" min="@flCur.BrightnessMin" max="@flCur.BrightnessMax" step="1"
+                               disabled="@_applying" value="@(_pendingFlBrightness ?? flCur.Brightness)"
+                               @oninput="e => StageFlBrightness(long.Parse((string)e.Value!))" />
+                        <span class="zf-pos">@(_pendingFlBrightness ?? flCur.Brightness)</span>
+                    </div>
+                    <div class="control-row">
+                        <span>@T["Auto: on motion at night"] @PendingMark(_pendingFlAuto?.ToString())</span>
+                        <button class="chip @((_pendingFlAuto ?? flCur.Auto) ? "" : "chip-off") @(_pendingFlAuto != null ? "chip-pending" : "")"
+                                disabled="@_applying" @onclick="StageFlAutoToggle">
+                            @((_pendingFlAuto ?? flCur.Auto) ? T["on"] : T["off"])
+                        </button>
+                    </div>
+                }
+                @* The white spotlight over the HTTP API (Elite, ...): its on/off is the
+                   white-LED mode; brightness only matters (and only shows) while it's on. *@
+                @if (_caps.Features?.WhiteLed == true && _whiteLed is { } wl)
+                {
+                    var spotOn = _pendingWlAuto ?? (wl.Mode != 0);
+                    <div class="control-row">
+                        <span>@T["Spotlight"] @PendingMark(_pendingWlAuto?.ToString())</span>
+                        <button class="chip @(spotOn ? "" : "chip-off") @(_pendingWlAuto != null ? "chip-pending" : "")"
+                                disabled="@_applying" @onclick="StageWlAutoToggle">
+                            @(spotOn ? T["on"] : T["off"])
+                        </button>
+                    </div>
+                    @if (spotOn)
+                    {
+                        <div class="control-row">
+                            <span>@T["Spotlight brightness"] @PendingMark(_pendingWlBright?.ToString())</span>
+                            <input class="zf-slider @(_pendingWlBright != null ? "input-pending" : "")"
+                                   type="range" min="0" max="100" step="1"
+                                   disabled="@_applying" value="@(_pendingWlBright ?? wl.Bright)"
+                                   @oninput="e => StageWlBright(long.Parse((string)e.Value!))" />
+                            <span class="zf-pos">@(_pendingWlBright ?? wl.Bright)</span>
+                        </div>
+                    }
+                }
+                @* Gated on real doorbell ability (Support doorbellVersion), not just the
+                   field: the Elite WiFi line reports a doorbellLightState it doesn't have. *@
+                @if (_caps.Features?.Doorbell == true && Str(_led, "doorbellLightState") is { Length: > 0 } dbLight)
+                {
+                    var shownDb = _pendingDoorbellLed ?? dbLight;
+                    <div class="control-row">
+                        <span>@T["Doorbell light"] <span class="beta-tag">@T["BETA"]</span> @PendingMark(_pendingDoorbellLed)</span>
+                        <button class="chip @(shownDb == "open" ? "" : "chip-off") @(_pendingDoorbellLed != null ? "chip-pending" : "")"
+                                disabled="@_applying" @onclick="StageDoorbellLedToggle">
+                            @(shownDb == "open" ? T["on"] : T["off"])
+                        </button>
+                    </div>
+                }
+                @if (Num(_led, "IRLedBrightness") is { } irCur)
+                {
+                    <div class="control-row">
+                        <span>@T["Infrared brightness"] @PendingMark(_pendingIrBright?.ToString())</span>
+                        <input class="zf-slider @(_pendingIrBright != null ? "input-pending" : "")"
+                               type="range" min="0" max="100" step="1"
+                               disabled="@_applying" value="@(_pendingIrBright ?? irCur)"
+                               @oninput="e => StageIrBright(long.Parse((string)e.Value!))" />
+                        <span class="zf-pos">@(_pendingIrBright ?? irCur)</span>
+                    </div>
+                }
+            </div>
+        }
+
+        @if (_http?.Image is { } img)
+        {
+            <div class="campanel-section">
+                <div class="campanel-section-title">@UiIcon.Render("film", 13) @T["PICTURE"]</div>
+                @PictureSlider(T["Brightness"], img.Bright, _pendingBright, StageBright)
+                @PictureSlider(T["Contrast"], img.Contrast, _pendingContrast, StageContrast)
+                @PictureSlider(T["Saturation"], img.Saturation, _pendingSaturation, StageSaturation)
+                @PictureSlider(T["Hue"], img.Hue, _pendingHue, StageHue)
+                @PictureSlider(T["Sharpness"], img.Sharpen, _pendingSharpen, StageSharpen)
+                @if (img.DayNight is { Length: > 0 })
+                {
+                    <div class="control-row">
+                        <span>@T["Day / night mode"] @PendingMark(_pendingDayNight)</span>
+                        <select class="@(_pendingDayNight != null ? "input-pending" : "")"
+                                value="@(_pendingDayNight ?? img.DayNight)"
+                                disabled="@_applying" @onchange='e => StageDayNight((string?)e.Value)'>
+                            <option value="Auto">@T["auto"]</option>
+                            <option value="Color">@T["always color"]</option>
+                            @* Value must come from C#: Blazor does NOT decode HTML
+                               entities in attribute values, so value="Black&amp;White"
+                               would send the literal "&amp;" to the API. *@
+                            <option value="@DayNightBw">@T["always black & white"]</option>
+                        </select>
+                    </div>
+                }
+                @if (img.AntiFlicker is { Length: > 0 })
+                {
+                    <div class="control-row">
+                        <span>@T["Anti-flicker"] @PendingMark(_pendingAntiFlicker)</span>
+                        <select class="@(_pendingAntiFlicker != null ? "input-pending" : "")"
+                                value="@(_pendingAntiFlicker ?? img.AntiFlicker)"
+                                disabled="@_applying" @onchange='e => StageAntiFlicker((string?)e.Value)'>
+                            <option value="Off">@T["off"]</option>
+                            <option value="Outdoor">@T["outdoor"]</option>
+                            <option value="50HZ">50 Hz</option>
+                            <option value="60HZ">60 Hz</option>
+                        </select>
+                    </div>
+                }
+                @if (img.Hdr is { } hdrCur)
+                {
+                    <div class="control-row">
+                        <span>HDR <span class="beta-tag">@T["BETA"]</span> @PendingMark(_pendingHdr?.ToString())</span>
+                        <select class="@(_pendingHdr != null ? "input-pending" : "")"
+                                value="@(_pendingHdr ?? hdrCur)"
+                                disabled="@_applying" @onchange="e => StageHdr(int.Parse((string)e.Value!))">
+                            <option value="0">@T["off"]</option>
+                            @* The camera's range table says whether HDR is a plain
+                               on/off or the newer off/low/high three-step. *@
+                            @if ((img.HdrMax ?? 1) >= 2)
+                            {
+                                <option value="1">@T["low"]</option>
+                                <option value="2">@T["high"]</option>
+                            }
+                            else
+                            {
+                                <option value="1">@T["on"]</option>
+                            }
+                        </select>
+                    </div>
+                }
+                @if (img.Flip is { } flipCur)
+                {
+                    var shownFlip = _pendingFlip ?? flipCur;
+                    <div class="control-row">
+                        <span>@T["Flip upside-down"] @PendingMark(_pendingFlip?.ToString())</span>
+                        <button class="chip @(shownFlip ? "" : "chip-off") @(_pendingFlip != null ? "chip-pending" : "")"
+                                disabled="@_applying" @onclick="StageFlipToggle">
+                            @(shownFlip ? T["on"] : T["off"])
+                        </button>
+                    </div>
+                }
+                @if (img.Mirror is { } mirrorCur)
+                {
+                    var shownMirror = _pendingMirror ?? mirrorCur;
+                    <div class="control-row">
+                        <span>@T["Mirror horizontally"] @PendingMark(_pendingMirror?.ToString())</span>
+                        <button class="chip @(shownMirror ? "" : "chip-off") @(_pendingMirror != null ? "chip-pending" : "")"
+                                disabled="@_applying" @onclick="StageMirrorToggle">
+                            @(shownMirror ? T["on"] : T["off"])
+                        </button>
+                    </div>
+                }
+                <div class="notice small">@T["Read from the camera. 128 is neutral for the sliders; changes stage until applied below."]</div>
+            </div>
+        }
+
+        @if (_http?.Osd is { } osd)
+        {
+            var posOptions = osd.PosOptions ?? new List<string>();
+            <div class="campanel-section">
+                <div class="campanel-section-title">@UiIcon.Render("logs", 13) @T["ON-SCREEN DISPLAY"]</div>
+                @* ONVIF can move an overlay but has no way to switch one off — an
+                   overlay either exists on the camera or it does not. Offering a
+                   switch that always fails is worse than not offering one. *@
+                @if (!OnvifOnly)
+                {
+                    <div class="control-row">
+                        <span>@T["Camera name overlay"] @PendingMark(_pendingOsdName?.ToString())</span>
+                        <button class="chip @((_pendingOsdName ?? osd.ShowName) ? "" : "chip-off") @(_pendingOsdName != null ? "chip-pending" : "")"
+                                disabled="@_applying" @onclick="StageOsdNameToggle">
+                            @((_pendingOsdName ?? osd.ShowName) ? T["on"] : T["off"])
+                        </button>
+                    </div>
+                }
+                @if ((_pendingOsdName ?? osd.ShowName) && posOptions.Count > 0)
+                {
+                    <div class="control-row">
+                        <span>@T["Name position"] @PendingMark(_pendingOsdNamePos)</span>
+                        <select class="@(_pendingOsdNamePos != null ? "input-pending" : "")"
+                                value="@(_pendingOsdNamePos ?? osd.NamePos ?? posOptions[0])"
+                                disabled="@_applying" @onchange='e => StageOsdNamePos((string?)e.Value)'>
+                            @foreach (var pos in PosChoices(posOptions, osd.NamePos))
+                            {
+                                <option value="@pos">@pos.ToLowerInvariant()</option>
+                            }
+                        </select>
+                    </div>
+                }
+                @if (!OnvifOnly)
+                {
+                    <div class="control-row">
+                        <span>@T["Timestamp overlay"] @PendingMark(_pendingOsdTime?.ToString())</span>
+                        <button class="chip @((_pendingOsdTime ?? osd.ShowTime) ? "" : "chip-off") @(_pendingOsdTime != null ? "chip-pending" : "")"
+                                disabled="@_applying" @onclick="StageOsdTimeToggle">
+                            @((_pendingOsdTime ?? osd.ShowTime) ? T["on"] : T["off"])
+                        </button>
+                    </div>
+                }
+                @if ((_pendingOsdTime ?? osd.ShowTime) && posOptions.Count > 0)
+                {
+                    <div class="control-row">
+                        <span>@T["Timestamp position"] @PendingMark(_pendingOsdTimePos)</span>
+                        <select class="@(_pendingOsdTimePos != null ? "input-pending" : "")"
+                                value="@(_pendingOsdTimePos ?? osd.TimePos ?? posOptions[0])"
+                                disabled="@_applying" @onchange='e => StageOsdTimePos((string?)e.Value)'>
+                            @foreach (var pos in PosChoices(posOptions, osd.TimePos))
+                            {
+                                <option value="@pos">@pos.ToLowerInvariant()</option>
+                            }
+                        </select>
+                    </div>
+                }
+                @if (osd.Watermark is { } wmCur)
+                {
+                    <div class="control-row">
+                        <span>@T["Reolink watermark"] @PendingMark(_pendingOsdWatermark?.ToString())</span>
+                        <button class="chip @((_pendingOsdWatermark ?? wmCur) ? "" : "chip-off") @(_pendingOsdWatermark != null ? "chip-pending" : "")"
+                                disabled="@_applying" @onclick="StageOsdWatermarkToggle">
+                            @((_pendingOsdWatermark ?? wmCur) ? T["on"] : T["off"])
+                        </button>
+                    </div>
+                }
+                <div class="notice small">
+                    @T["Burned into the video by the camera itself — it shows in live view and every recording, here and elsewhere."]
+                    @if (OnvifOnly)
+                    {
+                        <text> </text>@T["Over ONVIF the overlays can be moved but not switched off — use the camera's own web page for that."]
+                    }
+                </div>
+            </div>
+        }
+        @* Every camera has a zone, so when there are no sensitivity sliders for it
+           to sit under — a generic RTSP camera, or a Baichuan one with no HTTP API
+           — it gets a section of its own rather than disappearing. It sits at the
+           end of this column, where the zone row sits on a Reolink; on a camera
+           with nothing else to show it is simply the only card here.
+           Only where the zone can actually be edited: an ONVIF camera, or one the server
+           knows keeps none. A Reolink whose HTTP API is down keeps its zone in the sensitivity row. *@
+        @if (!HasSensitivitySection && (OnvifOnly || _caps.Features?.LocalZone == true))
+        {
+            <div class="campanel-section">
+                <div class="campanel-section-title">@UiIcon.Render("bolt", 13) @T["DETECTION ZONE"]</div>
+                <div class="control-row">
+                    <span>@T["Detection zone"]</span>
+                    <button class="chip" @onclick="OpenZoneAsync">@T["Edit zone…"]</button>
+                </div>
+                @* Deliberately says nothing about WHERE the zone is kept: this card
+                   is rendered off the absence of sensitivity sliders, which is not
+                   the same question, and a Reolink that reports no sensitivities
+                   still holds its own zone. Only the editor has asked the camera,
+                   so only the editor answers that. *@
+                <div class="notice small">
+                    @T["Mark the parts of the picture worth watching. The editor shows what this zone covers and where it is kept."]
+                </div>
+            </div>
+        }
+        </div> @* /campanel-col (left) *@
+
+        <div class="campanel-col">
+        @if (_http is { } httpAudio && (httpAudio.Volume != null || httpAudio.RecordAudio != null
+             || httpAudio.TalkVolume != null || httpAudio.VisitorVolume != null))
+        {
+            <div class="campanel-section">
+                <div class="campanel-section-title">@UiIcon.Render("siren", 13) @T["AUDIO"]</div>
+                @if (httpAudio.RecordAudio is { } recAudio)
+                {
+                    <div class="control-row">
+                        <span>@T["Record audio"] @PendingMark(_pendingRecordAudio?.ToString())</span>
+                        <button class="chip @((_pendingRecordAudio ?? recAudio) ? "" : "chip-off") @(_pendingRecordAudio != null ? "chip-pending" : "")"
+                                disabled="@_applying" @onclick="StageRecordAudioToggle">
+                            @((_pendingRecordAudio ?? recAudio) ? T["on"] : T["off"])
+                        </button>
+                    </div>
+                }
+                @if (httpAudio.Volume is { } vol)
+                {
+                    <div class="control-row">
+                        <span>@T["Speaker volume"] @PendingMark(_pendingVolume?.ToString())</span>
+                        <input class="zf-slider @(_pendingVolume != null ? "input-pending" : "")"
+                               type="range" min="0" max="100" step="1"
+                               disabled="@_applying" value="@(_pendingVolume ?? vol)"
+                               @oninput="e => StageVolume(long.Parse((string)e.Value!))" />
+                        <span class="zf-pos">@(_pendingVolume ?? vol)</span>
+                    </div>
+                }
+                @if (httpAudio.TalkVolume is { } talkVol)
+                {
+                    <div class="control-row">
+                        <span>@T["Talk & reply volume"] @PendingMark(_pendingTalkVolume?.ToString())</span>
+                        <input class="zf-slider @(_pendingTalkVolume != null ? "input-pending" : "")"
+                               type="range" min="0" max="100" step="1"
+                               disabled="@_applying" value="@(_pendingTalkVolume ?? talkVol)"
+                               @oninput="e => StageTalkVolume(long.Parse((string)e.Value!))" />
+                        <span class="zf-pos">@(_pendingTalkVolume ?? talkVol)</span>
+                    </div>
+                }
+                @if (httpAudio.VisitorVolume is { } visitorVol)
+                {
+                    <div class="control-row">
+                        <span>@T["Visitor volume"] @PendingMark(_pendingVisitorVolume?.ToString())</span>
+                        <input class="zf-slider @(_pendingVisitorVolume != null ? "input-pending" : "")"
+                               type="range" min="0" max="100" step="1"
+                               disabled="@_applying" value="@(_pendingVisitorVolume ?? visitorVol)"
+                               @oninput="e => StageVisitorVolume(long.Parse((string)e.Value!))" />
+                        <span class="zf-pos">@(_pendingVisitorVolume ?? visitorVol)</span>
+                    </div>
+                }
+                <div class="notice small">@T["The camera's own audio settings — what it offers varies per model."]
+                    @if (httpAudio.RecordAudio != null)
+                    {
+                        <text> </text>@T["Record audio puts the microphone into every stream and recording, here and in the Reolink app alike."]
+                    }
+                    @if (httpAudio.Volume != null)
+                    {
+                        <text> </text>@T["Speaker volume covers sirens, alerts and two-way talk."]
+                    }
+                </div>
+            </div>
+        }
+
+        @if (_http?.AutoTrack is { } track)
+        {
+            <div class="campanel-section">
+                <div class="campanel-section-title">@UiIcon.Render("activity", 13) @T["AUTO-TRACKING"] <span class="beta-tag">@T["BETA"]</span></div>
+                <div class="control-row">
+                    <span>@T["Follow detected subjects"] @PendingMark(_pendingAutoTrack?.ToString())</span>
+                    <button class="chip @((_pendingAutoTrack ?? track) ? "" : "chip-off") @(_pendingAutoTrack != null ? "chip-pending" : "")"
+                            disabled="@_applying" @onclick="StageAutoTrackToggle">
+                        @((_pendingAutoTrack ?? track) ? T["on"] : T["off"])
+                    </button>
+                </div>
+            </div>
+        }
+
+        @if (HasSensitivitySection)
+        {
+            <div class="campanel-section">
+                <div class="campanel-section-title">@UiIcon.Render("bolt", 13) @T["DETECTION SENSITIVITY"]</div>
+                @if (_http?.MdSensitivity is { } mdSens)
+                {
+                    <div class="control-row">
+                        <span>@T["Motion"] @PendingMark(_pendingMdSens?.ToString())</span>
+                        <input class="zf-slider @(_pendingMdSens != null ? "input-pending" : "")"
+                               type="range" min="1" max="50" step="1"
+                               disabled="@_applying" value="@(_pendingMdSens ?? mdSens)"
+                               @oninput="e => StageMdSens(long.Parse((string)e.Value!))" />
+                        <span class="zf-pos">@(_pendingMdSens ?? mdSens)/50</span>
+                    </div>
+                }
+                @foreach (var ai in _http?.AiSensitivities ?? new List<ApiAiSensitivity>())
+                {
+                    var type = ai.Type;
+                    long? aiPending = _pendingAiSens.TryGetValue(type, out var pv) ? pv : null;
+                    <div class="control-row">
+                        <span>@T[ai.Label] @PendingMark(aiPending?.ToString())</span>
+                        <input class="zf-slider @(aiPending != null ? "input-pending" : "")"
+                               type="range" min="0" max="100" step="1"
+                               disabled="@_applying" value="@(aiPending ?? ai.Sensitivity)"
+                               @oninput="e => StageAiSens(type, long.Parse((string)e.Value!))" />
+                        <span class="zf-pos">@(aiPending ?? ai.Sensitivity)/100</span>
+                    </div>
+                }
+                <div class="control-row">
+                    <span>@T["Detection zone"]</span>
+                    <button class="chip" @onclick="OpenZoneAsync">@T["Edit zone…"]</button>
+                </div>
+                <div class="notice small">
+                    @((MarkupString)T["Higher = more sensitive (more alerts). These tune the <b>camera's own</b> detection thresholds — they affect its app notifications and this server's event recording alike."])
+                </div>
+            </div>
+        }
+
+        @if (_caps.Features?.Doorbell == true && _http?.QuickReplies is { Count: > 0 } replies)
+        {
+            <div class="campanel-section">
+                <div class="campanel-section-title">@UiIcon.Render("bell", 13) @T["QUICK REPLY"] <span class="beta-tag">@T["BETA"]</span></div>
+                <div class="control-row row-inline">
+                    <select class="qr-select" @bind="_quickReplyId">
+                        @foreach (var r in replies)
+                        {
+                            <option value="@r.Id">@r.Name</option>
+                        }
+                    </select>
+                    <button class="chip" disabled="@_quickReplyBusy" @onclick="PlayQuickReplyAsync">
+                        @(_quickReplyBusy ? T["Playing…"] : T["Play"])
+                    </button>
+                </div>
+                <div class="notice small">@T["Plays the selected pre-recorded message through the camera's speaker."]</div>
+            </div>
+        }
+
+        @if (_caps.Features?.Siren == true)
+        {
+            <div class="campanel-section">
+                <div class="campanel-section-title">@UiIcon.Render("siren", 13) @T["SIREN"]</div>
+                <div class="control-row">
+                    <span>@(_sirenOn == true ? T["Sounding now"] : T["Sound the siren"])</span>
+                    @if (_sirenOn == true)
+                    {
+                        <button class="chip chip-danger" @onclick="() => SirenAsync(false)">@T["Stop siren"]</button>
+                    }
+                    else if (!_confirmSiren)
+                    {
+                        <button class="chip" @onclick="() => _confirmSiren = true">@T["Siren…"]</button>
+                    }
+                    else
+                    {
+                        <span class="row-actions">
+                            <button class="chip chip-danger" @onclick="() => SirenAsync(true)">@T["Confirm — sounds until stopped"]</button>
+                            <button class="chip" @onclick="() => _confirmSiren = false">@T["Cancel"]</button>
+                        </span>
+                    }
+                </div>
+            </div>
+        }
+
+        @if (_caps.Features?.Privacy == true)
+        {
+            <div class="campanel-section">
+                <div class="campanel-section-title">@UiIcon.Render("eye-off", 13) @T["PRIVACY MODE"]</div>
+                <div class="control-row">
+                    <span>@T["Camera dark (no video, no detections)"]</span>
+                    @if (_privacyBusy)
+                    {
+                        @* Spinner while the write is in flight — the buttons are gone
+                           so a slow camera can't be double-toggled; caps at 10s. *@
+                        <span class="chip chip-off" aria-busy="true"><span class="btn-spinner"></span>@T["Switching…"]</span>
+                    }
+                    else if (_privacyOn == true)
+                    {
+                        <button class="chip chip-active" @onclick="() => SetPrivacyAsync(false)">@T["on — click to wake"]</button>
+                    }
+                    else if (!_confirmPrivacy)
+                    {
+                        <button class="chip chip-off" @onclick="() => _confirmPrivacy = true">@T["off"]</button>
+                    }
+                    else
+                    {
+                        <span class="row-actions">
+                            <button class="chip chip-danger" @onclick="() => SetPrivacyAsync(true)">@T["Confirm — stops video & recording"]</button>
+                            <button class="chip" @onclick="() => _confirmPrivacy = false">@T["Cancel"]</button>
+                        </span>
+                    }
+                </div>
+                @if (_privacyOn == true)
+                {
+                    <div class="notice small">@T["The stream drops while private; Neolink.NET keeps the control connection and the toggle stays available."]</div>
+                }
+            </div>
+        }
+
+        @if (_caps.Features?.Pir == true && _pir != null)
+        {
+            <div class="campanel-section">
+                <div class="campanel-section-title">@UiIcon.Render("activity", 13) @T["PIR MOTION SENSOR"]</div>
+                <div class="control-row">
+                    <span>@T["Enabled"] @PendingMark(_pendingPir?.ToString())</span>
+                    <button class="chip @((_pendingPir ?? PirEnabled) ? "" : "chip-off") @(_pendingPir != null ? "chip-pending" : "")"
+                            disabled="@_applying" @onclick="StagePirToggle">
+                        @((_pendingPir ?? PirEnabled) ? T["on"] : T["off"])
+                    </button>
+                </div>
+            </div>
+        }
+
+        @if (_caps.Features?.Reboot != false)
+        {
+            <div class="campanel-section">
+                <div class="campanel-section-title">@UiIcon.Render("wrench", 13) @T["MAINTENANCE"]</div>
+                <div class="control-row">
+                    <span>@T["Restart the camera"]</span>
+                    @if (!_confirmReboot)
+                    {
+                        <button class="chip" @onclick="() => _confirmReboot = true">@T["Reboot…"]</button>
+                    }
+                    else
+                    {
+                        <span class="row-actions">
+                            <button class="chip chip-danger" @onclick="RebootAsync">@T["Confirm reboot"]</button>
+                            <button class="chip" @onclick="() => _confirmReboot = false">@T["Cancel"]</button>
+                        </span>
+                    }
+                </div>
+            </div>
+        }
+        </div> @* /campanel-col (right) *@
+
+        }
+
+        @if (_camTab == "recording" && _recording != null)
+        {
+            <div class="campanel-section">
+                <div class="campanel-section-title">@UiIcon.Render("rec", 13) @T["RECORDING"]</div>
+                <div class="notice small">
+                    @((MarkupString)T["These are <b>Neolink.NET server</b> settings — what this server records from the camera's streams. Nothing here is sent to the camera or changes its own (SD-card) recording."])
+                </div>
+                @if (!CanEditRecording)
+                {
+                    <div class="notice small">@((MarkupString)T["Only an <b>admin</b> can change recording settings — shown read-only."])</div>
+                }
+                <fieldset class="rec-lock" disabled="@(!CanEditRecording)">
+                @if ((_recording.AvailableStreams?.Count ?? 0) > 1)
+                {
+                    <div class="control-row">
+                        <span>@T["Record from stream"]</span>
+                        <select class="event-filter" value="@(_recording.RecordStream ?? "")"
+                                title="@T["Which of this camera's streams gets taped (events and 24/7 alike)"]"
+                                @onchange='e => SetRecordingAsync(recordStream: (string?)e.Value ?? "")'>
+                            <option value="">@T.F("default ({0})", StreamLabel(_recording.DefaultRecordStream))</option>
+                            @foreach (var kind in _recording.AvailableStreams!)
+                            {
+                                <option value="@kind">@StreamLabel(kind)</option>
+                            }
+                        </select>
+                    </div>
+                }
+                <div class="campanel-divider"></div>
+                <div class="campanel-subtitle">@UiIcon.Render("bolt", 12) @T["EVENTS"]</div>
+                @if (_recording.EventsAvailable)
+                {
+                    <div class="control-row">
+                        <span>@T["Detection events"]</span>
+                        <button class="chip @(_recording.Events ? "" : "chip-off")"
+                                @onclick="() => SetRecordingAsync(events: !_recording.Events)">
+                            @(_recording.Events ? T["on"] : T["off"])
+                        </button>
+                    </div>
+                }
+                else
+                {
+                    <div class="notice small">
+                        @T["This camera has no detection pushes (generic RTSP), so event recording is unavailable — continuous (24/7) recording works normally."]
+                    </div>
+                }
+                @if (_recording.EventsAvailable && _recording.Events)
+                {
+                    <div class="control-row">
+                        <span>@T["Keep event clips (days)"]</span>
+                        <input class="ret-input" type="number" min="0" step="1"
+                               placeholder="@RetentionLabel(_recording.DefaultEventRetentionDays)"
+                               title="@T["How long this camera's event clips are kept. Blank = server default, 0 = keep forever."]"
+                               value="@(_recording.EventRetentionDays?.ToString() ?? "")"
+                               @onchange="e => SetRetentionAsync(forEvents: true, (string?)e.Value)" />
+                    </div>
+                    <div class="control-row rec-types-row">
+                        <span>@T["Event types"]</span>
+                        <div class="stream-options">
+                            @* Only types this camera can emit: the AI-alarm sweep proves which
+                               AI detections the firmware answers for, and the doorbell chip
+                               needs a doorbell. Types with no reliable capability signal
+                               (crying, perimeter, motion) always show, as does everything
+                               while the camera hasn't been probed yet (offline, no HTTP API). *@
+                            @foreach (var t in (_recording.KnownTypes ?? new List<string>()).Where(TypeChipVisible))
+                            {
+                                <button class="chip @(_recording.TypeEnabled(t) ? "" : "chip-off")"
+                                        title="@(_recording.TypeEnabled(t) ? T["Recording"] : T["Discarded"])"
+                                        @onclick="() => ToggleEventTypeAsync(t)">
+                                    @TypeIcon(t) @T[t]
+                                </button>
+                            }
+                        </div>
+                    </div>
+                    <div class="notice small">
+                        ⚠ @((MarkupString)T["Person/vehicle/animal labels only arrive when the matching Smart Detection is enabled <b>in the Reolink app</b> (camera → Settings → Detection) — the camera does the detecting. The chips filter what this server keeps; disabled types are discarded."])
+                        @if ((_recording.KnownTypes ?? new List<string>()).Any(t => !TypeChipVisible(t)))
+                        {
+                            <text> </text>@T["Detection types this camera doesn't support are hidden."]
+                        }
+                    </div>
+                    <div class="control-row">
+                        <span>@T["Scheduled capture"]</span>
+                        <button class="chip @(_recording.ScheduleEnabled ? "" : "chip-off")"
+                                title="@(_recording.ScheduleEnabled ? T["Events are captured only inside the schedule below — click to capture at all times"] : T["Events are captured at all times — click to restrict capture to a schedule"])"
+                                @onclick="() => SetRecordingAsync(scheduleEnabled: !_recording.ScheduleEnabled)">
+                            @(_recording.ScheduleEnabled ? T["on"] : T["off"])
+                        </button>
+                    </div>
+                    @if (_recording.ScheduleEnabled)
+                    {
+                        <div class="sched">
+                            <div class="sched-days">
+                                @foreach (var d in WeekDayTokens)
+                                {
+                                    var day = d;
+                                    <button class="chip sched-day @(DayEnabled(day) ? "" : "chip-off")"
+                                            title="@(DayEnabled(day) ? T.F("Capturing on {0} — click to skip this day", DayName(day)) : T.F("Skipping {0} — click to capture", DayName(day)))"
+                                            @onclick="() => ToggleScheduleDayAsync(day)">@DayLabel(day)</button>
+                                }
+                            </div>
+                            <div class="sched-times">
+                                <label class="sched-time">@T["from"]
+                                    <input type="time" value="@(_recording.ScheduleStart ?? "")"
+                                           title="@T["Capture from this time of day (blank = midnight)"]"
+                                           @onchange="e => SetScheduleTimeAsync(start: (string?)e.Value)" />
+                                </label>
+                                <label class="sched-time">@T["until"]
+                                    <input type="time" value="@(_recording.ScheduleEnd ?? "")"
+                                           title="@T["Capture until this time of day (blank = midnight). Earlier than 'from' spans midnight."]"
+                                           @onchange="e => SetScheduleTimeAsync(end: (string?)e.Value)" />
+                                </label>
+                                @if (HasTimeWindow)
+                                {
+                                    <button class="chip" title="@T["Clear the time window — capture at any hour"]"
+                                            @onclick='() => SetScheduleTimeAsync(start: "", end: "")'>@T["all day"]</button>
+                                }
+                            </div>
+                            <div class="event-sub">@ScheduleSummary</div>
+                        </div>
+                    }
+                    @* Event emails: on = every finished event mails the server's
+                       notification recipient, snapshots attached. The camera's
+                       event-type chips above already decide what records, so they
+                       decide what mails too — one filter, not two. *@
+                    @* The switch is always VISIBLE — a feature that vanishes when
+                       unconfigured reads as a feature that doesn't exist. Without
+                       a mail setup it sits off and disabled, and the line below
+                       says exactly what to do about it. *@
+                    <div class="campanel-divider"></div>
+                    <div class="campanel-section-title">@UiIcon.Render("bell", 13) @T["NOTIFICATIONS"]</div>
+                    <div class="control-row">
+                        <span>@T["Email events"]</span>
+                        <button class="chip @(_recording.EmailEvents ? "" : "chip-off")"
+                                disabled="@(!_recording.EmailAvailable && !_recording.EmailEvents)"
+                                title="@(!_recording.EmailAvailable && !_recording.EmailEvents
+                                    ? T["Unavailable — this server has no email set up yet"]
+                                    : _recording.EmailEvents
+                                        ? T["This camera's events are emailed to the notification recipient — click to stop"]
+                                        : T["Click to email this camera's events (snapshots attached) to the notification recipient"])"
+                                @onclick="() => SetRecordingAsync(emailEvents: !_recording.EmailEvents)">
+                            @(_recording.EmailEvents ? T["on"] : T["off"])
+                        </button>
+                    </div>
+                    @if (!_recording.EmailAvailable && !_recording.EmailEvents)
+                    {
+                        <div class="notice setup">
+                            @((MarkupString)T["No email is set up on this server yet. Add a recipient and mail server under <b>Server settings → Notifications</b> (and switch notifications on) — this toggle turns on once that is done."])
+                        </div>
+                    }
+                    else if (_recording.EmailEvents && !_recording.EmailAvailable)
+                    {
+                        <div class="notice setup">
+                            @((MarkupString)T["Email events are on for this camera, but this server no longer has email configured — nothing is being sent. Restore the recipient and mail server under <b>Server settings → Notifications</b>, or switch this off."])
+                        </div>
+                    }
+                    else if (_recording.EmailEvents)
+                    {
+                        <div class="event-sub email-sub">
+                            @T["Each email carries snapshots sampled across the clip; how many, when it is sent, the per-camera cooldown, and the recipient live under Server settings → Notifications. Only event types ticked above are recorded — and therefore emailed."]
+                        </div>
+                    }
+                    <div class="control-row">
+                        <span>@T["Webhook events"]</span>
+                        <button class="chip @(_recording.WebhookEvents ? "" : "chip-off")"
+                                disabled="@(!_recording.WebhookAvailable && !_recording.WebhookEvents)"
+                                title="@(!_recording.WebhookAvailable && !_recording.WebhookEvents
+                                    ? T["Unavailable — no webhook is set up on this server yet"]
+                                    : _recording.WebhookEvents
+                                        ? T["This camera's events are sent to the webhook — click to stop"]
+                                        : T["Click to send this camera's events to the webhook (snapshots included where the target supports them)"])"
+                                @onclick="() => SetRecordingAsync(webhookEvents: !_recording.WebhookEvents)">
+                            @(_recording.WebhookEvents ? T["on"] : T["off"])
+                        </button>
+                    </div>
+                    @if (!_recording.WebhookAvailable && !_recording.WebhookEvents)
+                    {
+                        <div class="notice setup">
+                            @((MarkupString)T["No webhook is set up on this server yet. Configure one under <b>Server settings → Notifications</b> (preset, URL, test) — this toggle turns on once that is done."])
+                        </div>
+                    }
+                    else if (_recording.WebhookEvents && !_recording.WebhookAvailable)
+                    {
+                        <div class="notice setup">
+                            @((MarkupString)T["Webhook events are on for this camera, but this server no longer has a webhook configured — nothing is being sent. Restore the URL under <b>Server settings → Notifications</b>, or switch this off."])
+                        </div>
+                    }
+                    else if (_recording.WebhookEvents)
+                    {
+                        <div class="event-sub email-sub">
+                            @T["Sent through the configured webhook. Timing, snapshot count and cooldown follow the event notification knobs under Server settings → Notifications."]
+                        </div>
+                    }
+                    @* Per-camera AI opt-in — only offered while the feature is ON
+                       globally (Settings → AI owns the endpoint and the budget). *@
+                    @if (_recording.AiAvailable)
+                    {
+                        <div class="campanel-divider"></div>
+                        <div class="control-row">
+                            <span>@T["AI descriptions"] <span class="beta-tag">@T["BETA"]</span></span>
+                            <button class="chip @(_recording.AiDescribe ? "" : "chip-off")"
+                                    title="@(_recording.AiDescribe
+                                        ? T["This camera's events are described by the configured LLM — click to stop"]
+                                        : T["Click to have the configured LLM describe this camera's events"])"
+                                    @onclick="() => SetRecordingAsync(aiDescribe: !_recording.AiDescribe)">
+                                @(_recording.AiDescribe ? T["on"] : T["off"])
+                            </button>
+                        </div>
+                        @if (_recording.AiDescribe)
+                        {
+                            <div class="event-sub ai-sub">
+                                @T["While an event records, low-res frames are sampled (from the stream itself when ffmpeg is installed, else via camera snapshots) and sent to the LLM from Settings → AI; its description lands in the event's metadata and the server log."]
+                            </div>
+                            @* Scene notes: what is ROUTINE in this camera's view. The
+                               threat call (green/yellow/red) is mostly context, and this
+                               field is the model's only source of it. Saved on blur. *@
+                            <div class="control-row ai-context-row">
+                                <textarea class="ai-context" maxlength="500" rows="2"
+                                          placeholder="@T["Scene notes for the AI, e.g. 'faces the street — passing cars are routine; the white SUV belongs here'"]"
+                                          title="@T["Owner's notes sent with every event: tell the model what this camera watches and what counts as normal, so its descriptions and threat levels fit the scene"]"
+                                          value="@(_recording.AiContext ?? "")"
+                                          @onchange='e => SetRecordingAsync(aiContext: (string?)e.Value ?? "")'></textarea>
+                            </div>
+                        }
+                    }
+                }
+                @if (_recording.ContinuousAvailable)
+                {
+                    @* Hairline between the event-based half above and 24/7 below. *@
+                    <div class="campanel-divider"></div>
+                    <div class="campanel-subtitle">@UiIcon.Render("clock", 12) @T["CONTINUOUS (24/7)"]</div>
+                    <div class="control-row">
+                        <span>@T["Record around the clock"]</span>
+                        <button class="chip @(_recording.Continuous ? "" : "chip-off")"
+                                disabled="@_recording.ContinuousBlockedBySleep"
+                                title="@(_recording.ContinuousBlockedBySleep ? T["Unavailable — this battery camera is allowed to sleep"] : null)"
+                                @onclick="() => SetRecordingAsync(continuous: !_recording.Continuous)">
+                            @(_recording.Continuous ? T["on"] : T["off"])
+                        </button>
+                    </div>
+                    @if (_recording.ContinuousBlockedBySleep)
+                    {
+                        <div class="notice small">
+                            @((MarkupString)T["This battery camera is allowed to sleep, and taping around the clock would hold it awake until the battery dies. To record 24/7, set <b>Always on</b> to 'hold the connection' in this camera's setup (Settings → Cameras) — sensible only on constant power."])
+                        </div>
+                        @* The battery-safe replacement: tape frames that are already
+                           flowing (self-wakes, viewing sessions) — never wakes the
+                           camera or holds it awake, so it costs the battery nothing. *@
+                        <div class="control-row">
+                            <span>@T["Record wake events"]</span>
+                            <button class="chip @(_recording.WakeTimeline ? "" : "chip-off")"
+                                    title="@(_recording.WakeTimeline
+                                        ? T["Footage from self-wakes and viewing sessions is taped while it's streaming anyway — click to stop keeping it"]
+                                        : T["Wake footage is not kept — click to tape self-wakes while the camera streams anyway"])"
+                                    @onclick="() => SetRecordingAsync(wakeTimeline: !_recording.WakeTimeline)">
+                                @(_recording.WakeTimeline ? T["on"] : T["off"])
+                            </button>
+                        </div>
+                        @if (_recording.WakeTimeline)
+                        {
+                            <div class="event-sub">
+                                @((MarkupString)T["This footage goes on the <b>Timeline</b> — islands around each wake and viewing session, with honest gaps while the camera sleeps. Zero battery cost: it only tapes what is already streaming, and the camera is still released on the usual timeouts."])
+                            </div>
+                        }
+                    }
+                    @if (_recording.Continuous || (_recording.ContinuousBlockedBySleep && _recording.WakeTimeline))
+                    {
+                        <div class="control-row">
+                            <span>@T["Keep continuous footage (days)"]</span>
+                            <input class="ret-input" type="number" min="0" step="1"
+                                   placeholder="@RetentionLabel(_recording.DefaultContinuousRetentionDays)"
+                                   title="@T["How long this camera's timeline footage is kept. Blank = server default, 0 = keep forever."]"
+                                   value="@(_recording.ContinuousRetentionDays?.ToString() ?? "")"
+                                   @onchange="e => SetRetentionAsync(forEvents: false, (string?)e.Value)" />
+                        </div>
+                    }
+                }
+                @if (_recording.ArchiveAvailable)
+                {
+                    <div class="campanel-divider"></div>
+                    <div class="campanel-subtitle">@UiIcon.Render("archive", 12) @T["ARCHIVE"]</div>
+                    @* Purpose up-front — visible BEFORE anything is switched on. *@
+                    <div class="event-sub lc-explain">
+                        @T["Normally footage is deleted when its retention ends. Archiving moves it to the server's archive drive instead — still playable, just off the main disk. Watch the lifecycle strip below react as you toggle."]
+                    </div>
+                    <div class="control-row">
+                        <span>@T["Archive event clips"]</span>
+                        <button class="chip @(_recording.ArchiveEvents ? "" : "chip-off")"
+                                title="@(_recording.ArchiveEvents
+                                    ? T["When their retention expires, event clips MOVE to the archive drive instead of being deleted — click for plain deletion"]
+                                    : T["Expired event clips are deleted — click to move them to the archive drive instead"])"
+                                @onclick="() => SetRecordingAsync(archiveEvents: !_recording.ArchiveEvents)">
+                            @(_recording.ArchiveEvents ? T["on"] : T["off"])
+                        </button>
+                    </div>
+                    <div class="control-row">
+                        <span>@T["Archive continuous footage"]</span>
+                        <button class="chip @(_recording.ArchiveContinuous ? "" : "chip-off")"
+                                title="@(_recording.ArchiveContinuous
+                                    ? T["When its retention expires, 24/7 footage MOVES to the archive drive instead of being deleted — click for plain deletion"]
+                                    : T["Expired 24/7 footage is deleted — click to move it to the archive drive instead"])"
+                                @onclick="() => SetRecordingAsync(archiveContinuous: !_recording.ArchiveContinuous)">
+                            @(_recording.ArchiveContinuous ? T["on"] : T["off"])
+                        </button>
+                    </div>
+                    @if (_recording.ArchiveEvents || _recording.ArchiveContinuous)
+                    {
+                        <div class="control-row">
+                            <span>@T["Keep in archive (days)"]</span>
+                            <input class="ret-input" type="number" min="0" step="1"
+                                   placeholder="@T["forever"]"
+                                   title="@T["How long archived footage is kept before final deletion. Blank or 0 = keep forever."]"
+                                   value="@(_recording.ArchiveRetentionDays?.ToString() ?? "")"
+                                   @onchange="e => SetArchiveDaysAsync((string?)e.Value)" />
+                        </div>
+                    }
+                }
+                @if ((_recording.EventsAvailable && _recording.Events) || _recording.Continuous
+                     || (_recording.ContinuousBlockedBySleep && _recording.WakeTimeline))
+                {
+                    @* The story of this camera's footage, told with the CURRENT settings —
+                       it re-renders on every toggle, so cause and effect are immediate. *@
+                    <div class="lifecycle"
+                         title="@T["Applied by the hourly cleanup. Blank retention = the server default; 0 = keep forever."]">
+                        <div class="lc-title">@T["FOOTAGE LIFECYCLE"]</div>
+                        @if (_recording.EventsAvailable && _recording.Events)
+                        {
+                            @LifecycleRow(T["Events"], _recording.EventRetentionDays ?? _recording.DefaultEventRetentionDays, _recording.ArchiveEvents)
+                        }
+                        @if (_recording.Continuous)
+                        {
+                            @LifecycleRow("24/7", _recording.ContinuousRetentionDays ?? _recording.DefaultContinuousRetentionDays, _recording.ArchiveContinuous)
+                        }
+                        @if (_recording.ContinuousBlockedBySleep && _recording.WakeTimeline)
+                        {
+                            @* Wake-tap footage is continuous footage — same retention, same archive routing. *@
+                            @LifecycleRow(T["Wake footage"], _recording.ContinuousRetentionDays ?? _recording.DefaultContinuousRetentionDays, _recording.ArchiveContinuous)
+                        }
+                        @if (_recording.ArchiveEvents || _recording.ArchiveContinuous)
+                        {
+                            <div class="event-sub">@T["Archived footage stays playable in Events and the Timeline."]</div>
+                        }
+                    </div>
+                }
+                </fieldset>
+            </div>
+        }
+
+        </div> @* /campanel-cols *@
+        </div> @* /campanel-body *@
+
+        @if (_toast != null)
+        {
+            <div class="campanel-toast @(_toastError ? "toast-err" : "toast-ok")" role="status">@_toast</div>
+        }
+
+        @* Detection-zone editor: its own layer above the panel — the grid wants
+           all the width it can get. Painting is pure browser-side (see
+           neolink.zoneInit); the circuit only sees the final table on save. *@
+        @if (_zoneOpen)
+        {
+            <div class="zone-editor">
+                <div class="zone-dialog">
+                    <div class="zone-head">
+                        <span class="campanel-title">@T["DETECTION ZONE"] · @CameraName</span>
+                        <button class="icon-btn" title="@T["Close"]" @onclick="CloseZone">✕</button>
+                    </div>
+                    @* Type chips only when the camera really keeps a grid per type.
+                       Most keep ONE zone for everything; offering tabs there would
+                       promise a split the camera doesn't have. *@
+                    @if (ZoneTypes().Count > 1)
+                    {
+                        <div class="zone-types">
+                            @foreach (var zt in ZoneTypes())
+                            {
+                                var key = zt.Key;
+                                <button class="chip @(key == _zoneType ? "chip-active" : "")"
+                                        disabled="@(_zoneLoading || _zoneSaving)"
+                                        @onclick="() => SwitchZoneAsync(key)">@T[zt.Label]</button>
+                            }
+                        </div>
+                    }
+                    @* The frame is FIXED: head, type chips and the button row keep their
+                       places whether a grid loaded or not, so switching types can't
+                       resize the dialog under the pointer. Only this middle flexes. *@
+                    <div class="zone-body">
+                        @if (_zoneLoading)
+                        {
+                            <div class="notice small">@T["Reading the zone from the camera…"]</div>
+                        }
+                        else if (_zone == null)
+                        {
+                            <div class="notice small">
+                                @(_zoneError ?? T["This camera doesn't report a zone for this detection type."])
+                            </div>
+                            @if (_zoneError != null)
+                            {
+                                <button class="chip zone-retry" @onclick="() => SwitchZoneAsync(_zoneType)">@T["Try again"]</button>
+                            }
+                        }
+                        else
+                        {
+                            <div class="zone-mode">
+                                <button class="chip @(_zoneMode == "block" ? "chip-active" : "")"
+                                        @onclick='() => SetZoneModeAsync("block")'>@UiIcon.Render("eye-off", 12) @T["Block"]</button>
+                                <button class="chip @(_zoneMode == "watch" ? "chip-active" : "")"
+                                        @onclick='() => SetZoneModeAsync("watch")'>@UiIcon.Render("eye", 12) @T["Watch"]</button>
+                            </div>
+                            <canvas class="zone-canvas" @key="_zoneType" @ref="_zoneCanvas"></canvas>
+                            @* A zone Neolink keeps is not the camera's zone, and the
+                               difference decides what the user is actually buying:
+                               the camera goes on alerting exactly as before. Say so
+                               where the grid is drawn, not in a tooltip. *@
+                            @if (_zone.StoredOnServer)
+                            {
+                                <div class="notice small zone-local">
+                                    <b>@T["This zone is stored on Neolink, not on the camera."]</b>
+                                    <text> </text>@T["Neolink cannot edit a detection zone on this camera itself, so the grid is kept here. It limits the live object boxes Neolink draws over this camera. The camera's own motion and AI alerts, and the events recorded from them, are not changed by it, and nothing is written to the camera."]
+                                </div>
+                            }
+                            <div class="notice small">
+                                @if (_zone.StoredOnServer)
+                                {
+                                    @T["Drag a box to mark an area — in Block mode no object boxes are drawn there, in Watch mode they are again. Build any shape from a few boxes; the grid overlays the camera's latest picture."]
+                                }
+                                else if (OnvifOnly)
+                                {
+                                    @* The camera's ONVIF cell motion grid: it decides where MOTION
+                                       counts, and nothing else — its other analytics rules keep
+                                       their own areas, so the Reolink wording would overclaim. *@
+                                    @T["Drag a box to mark an area — in Block mode the camera's motion detection ignores it, in Watch mode it watches it again. Build any shape from a few boxes; the grid overlays the camera's latest picture. This is the camera's own motion grid: it governs its motion alarms, while any other analytics rules it runs (line crossing, intrusion and so on) keep their own areas."]
+                                }
+                                else
+                                {
+                                    @T["Drag a box to mark an area — in Block mode the camera ignores it (no motion or AI alarms fire there), in Watch mode it watches it again. Build any shape from a few boxes; the grid overlays the camera's latest snapshot."]
+                                    @if (_zone.IsGlobal)
+                                    {
+                                        <text> </text>@T["This camera keeps one zone for every detection type, so it governs motion, person, vehicle and the rest alike."]
+                                    }
+                                }
+                            </div>
+                        }
+                    </div>
+                    <div class="row-actions zone-actions">
+                        @if (_zone != null)
+                        {
+                            <button class="chip" disabled="@_zoneSaving" @onclick="() => ZoneFillAsync(true)">@T["Watch everywhere"]</button>
+                            <button class="chip" disabled="@_zoneSaving" @onclick="() => ZoneFillAsync(false)">@T["Block everywhere"]</button>
+                        }
+                        <span class="tile-spacer"></span>
+                        <button class="chip" disabled="@_zoneSaving" @onclick="CloseZone">
+                            @(_zone == null ? T["Close"] : T["Cancel"])
+                        </button>
+                        @if (_zone != null)
+                        {
+                            <button class="chip chip-active" disabled="@_zoneSaving" @onclick="SaveZoneAsync">
+                                @(_zoneSaving ? T["Applying…"]
+                                    : _zone.StoredOnServer ? T["Save to Neolink"] : T["Apply to camera"])
+                            </button>
+                        }
+                    </div>
+                    @if (_toast != null)
+                    {
+                        <div class="campanel-toast @(_toastError ? "toast-err" : "toast-ok")" role="status">@_toast</div>
+                    }
+                </div>
+            </div>
+        }
+
+        @* Staged device edits: nothing above is sent to the camera until Apply.
+           Disruptive changes get called out BEFORE the user commits to them. *@
+        @if (PendingCount > 0)
+        {
+            <div class="campanel-pending">
+                @if (PendingMayReboot)
+                {
+                    <div class="notice warn small">
+                        ⚠ @((MarkupString)T["The staged <b>resolution change</b> makes some cameras <b>reboot</b> — expect video (and recording) to drop for up to a minute."])
+                    </div>
+                }
+                else if (PendingDisruptive)
+                {
+                    <div class="notice warn small">
+                        ⚠ @T["Applying restarts the camera's video stream briefly — live view resumes in a few seconds."]
+                    </div>
+                }
+                <div class="campanel-pending-row">
+                    <span class="event-sub">
+                        @(PendingCount == 1
+                            ? T["1 unsaved change — closing the panel discards it."]
+                            : T.F("{0} unsaved changes — closing the panel discards them.", PendingCount))
+                    </span>
+                    <span class="tile-spacer"></span>
+                    <button class="chip" disabled="@_applying" @onclick="DiscardPending">@T["Discard"]</button>
+                    <button class="chip chip-active" disabled="@_applying" @onclick="ApplyPendingAsync">
+                        @(_applying ? T["Applying…"] : T["Apply to camera"])
+                    </button>
+                </div>
+            </div>
+        }
+    }
+</aside>
+
+@code {
+    [Parameter] public string Server { get; set; } = "";
+    /// <summary>The server as the BROWSER reaches it. <see cref="Server"/> is the
+    /// circuit's view and may resolve to the host's loopback, which the visitor's
+    /// browser cannot fetch — URLs handed to media elements must use this one so
+    /// they traverse the same proxy the page came through.</summary>
+    [Parameter] public string? MediaServer { get; set; }
+    [Parameter] public string CameraName { get; set; } = "";
+    /// <summary>Live stream state (from /api/cameras) used to highlight the active encode profile.</summary>
+    [Parameter] public ApiCamera? Camera { get; set; }
+    [Parameter] public string? User { get; set; }
+    [Parameter] public string? Pass { get; set; }
+    /// <summary>Web-UI session token; when present it supersedes the Basic credentials.</summary>
+    [Parameter] public string? Token { get; set; }
+    /// <summary>Recording settings persist server-side, so only admins may change
+    /// them once accounts exist (mirrors the API's gate); false renders them read-only.</summary>
+    [Parameter] public bool CanEditRecording { get; set; } = true;
+
+    /// <summary>Whether the signed-in user is an admin (or auth is off). Gates the
+    /// Ports tab — the camera's network surface is admin territory; the API
+    /// enforces the same rule server-side.</summary>
+    [Parameter] public bool IsAdmin { get; set; }
+    [Parameter] public EventCallback OnClose { get; set; }
+
+    /// <summary>Raised with the camera name after a zone reaches the camera: anything
+    /// drawing against that zone (the live object boxes) is now holding a stale one.</summary>
+    [Parameter] public EventCallback<string> OnZoneSaved { get; set; }
+
+    private ApiCapabilities? _caps;
+    private ApiRecordingSettings? _recording;
+    private List<ApiEncodeProfile>? _profiles;
+    private JsonElement? _battery;
+    private JsonElement? _led;
+    private JsonElement? _pir;
+    private ApiZoomFocus? _zoomFocus;
+    private ApiFloodlight? _floodlight;
+    private ApiWhiteLed? _whiteLed;
+    private ApiHttpFeatures? _http;
+    /// <summary>Read-only firmware-update verdict; null = not checkable.</summary>
+    private ApiFirmware? _firmware;
+    /// <summary>The camera API's black-and-white day/night value ("Black&amp;White").</summary>
+    private const string DayNightBw = "Black&White";
+    /// <summary>Panel tab: "controls" (device) or "recording" (server-side).</summary>
+    private string _camTab = "controls";
+
+    /// <summary>Every setting on this camera came over ONVIF (a non-Reolink camera).
+    /// The standard covers less than Reolink's own API, so some controls are left
+    /// out rather than offered and refused.</summary>
+    private bool OnvifOnly => _caps?.Features?.Onvif == true;
+
+    /// <summary>Whether the camera reports detection thresholds to tune. When it
+    /// doesn't, the detection zone stands on its own instead of riding along under
+    /// sliders that aren't there.</summary>
+    private bool HasSensitivitySection =>
+        _http?.MdSensitivity != null || _http?.AiSensitivities is { Count: > 0 };
+
+    /// <summary>Whether to offer the Camera settings tab. It is present from the
+    /// start — including during the capability probe, when it carries a spinner and
+    /// its body explains the wait — so it can be opened immediately. Once the probe
+    /// lands it stays for any camera that is ONLINE, because every camera now has at
+    /// least a detection zone to edit.
+    ///
+    /// The online requirement is load-bearing: everything in this tab is read from
+    /// the device, and a camera that cannot be reached has nothing to show but
+    /// controls that can only fail. (For a Baichuan camera this is exactly the old
+    /// condition — its Reboot feature made the old HasDeviceControls test true
+    /// whenever it was online — so nothing changed for Reolink.)</summary>
+    private bool ShowControlsTab => _probing || _caps is { Online: true };
+    private bool _loading;
+    /// <summary>Phase 2 in flight: the camera is being queried for its capabilities
+    /// and control state. The server-side recording settings already render; this
+    /// gates the "querying the camera" hint and the device-controls tab.</summary>
+    private bool _probing;
+    private string? _error;
+    // Action feedback: a green (applied) / red (rejected) toast at the panel's
+    // bottom edge that dismisses itself. The sequence number keeps a stale
+    // dismiss timer from clearing a newer toast.
+    private string? _toast;
+    private bool _toastError;
+    private int _toastSeq;
+    private bool _disposed;
+    private bool _confirmReboot;
+    private bool _confirmSiren;
+    private bool _confirmPrivacy;
+
+    // ---------------------------------------------------------------- ports tab
+    // The list is fetched from the camera LIVE whenever the tab is opened or
+    // refreshed and is deliberately not persisted anywhere.
+    private sealed class ApiServicePort
+    {
+        public string Service { get; set; } = "";
+        public int? Port { get; set; }
+        public bool? Enabled { get; set; }   // null = firmware exposes no toggle
+        public bool CanToggle { get; set; }
+    }
+    private sealed class ApiServicesReply { public List<ApiServicePort>? Services { get; set; } }
+    private List<ApiServicePort>? _ports;
+    private bool _portsLoading;
+    private string? _portsError;
+    private string? _confirmService;  // confirm card open for this service…
+    private bool _confirmOn;          // …asking to enable (true) or disable (false)
+    private string? _togglingService;
+
+    /// <summary>What breaks when this service goes off — shown in the disable
+    /// confirm card so the choice is made with open eyes.</summary>
+    private string DisableConsequence(string service) => service switch
+    {
+        "http" or "https" => " " + T["Neolink.NET loses picture settings, scaled snapshots (small AI frames) and firmware checks over it."],
+        "onvif" => " " + T["Neolink.NET loses the ONVIF imaging fallback for HTTP-less models."],
+        "rtsp" => " " + T["Anything streaming RTSP directly from the camera stops (Neolink.NET itself is unaffected)."],
+        _ => "",
+    };
+
+    private static string ServiceLabel(string service) => service switch
+    {
+        "server" => "Baichuan",
+        "http" => "HTTP",
+        "https" => "HTTPS",
+        "rtsp" => "RTSP",
+        "rtmp" => "RTMP",
+        "onvif" => "ONVIF",
+        _ => service.ToUpperInvariant(),
+    };
+
+    private string ServiceHint(string service) => service switch
+    {
+        "server" => T["The protocol Neolink.NET speaks to this camera (port 9000 by default)."],
+        "http" => T["The camera's web API — Neolink.NET uses it for picture settings, scaled snapshots (small AI frames) and firmware checks."],
+        "https" => T["The camera's web API over TLS — same features as HTTP."],
+        "rtsp" => T["Direct RTSP streaming from the camera (not needed by Neolink.NET, which restreams itself)."],
+        "rtmp" => T["Legacy RTMP streaming from the camera (not used by Neolink.NET)."],
+        "onvif" => T["Standards-based control — Neolink.NET's imaging fallback for models without the HTTP API."],
+        _ => "",
+    };
+
+    private async Task OpenPortsTabAsync()
+    {
+        _camTab = "ports";
+        // Re-query on EVERY visit to the tab, not just the first: the promise of
+        // this tab is the camera's actual state right now, never a cached list.
+        if (!_portsLoading)
+            await LoadPortsAsync();
+    }
+
+    private async Task LoadPortsAsync()
+    {
+        _portsLoading = true;
+        _portsError = null;
+        _confirmService = null;
+        StateHasChanged();
+        try
+        {
+            using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+            using var res = await Http.SendAsync(NewRequest(HttpMethod.Get, "services"), cts.Token);
+            if (res.IsSuccessStatusCode)
+            {
+                var reply = await res.Content.ReadFromJsonAsync<ApiServicesReply>(cancellationToken: cts.Token);
+                _ports = reply?.Services;
+                if (_ports is not { Count: > 0 })
+                    _portsError = T["The camera answered without a service table."];
+            }
+            else
+            {
+                _portsError = await ReadErrorAsync(res) ?? T.F("Query failed ({0}).", (int)res.StatusCode);
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            _portsError = T["The camera did not answer in time — it may be asleep or busy. Try re-reading."];
+        }
+        catch (Exception ex)
+        {
+            _portsError = T.F("Cannot reach {0}: {1}", Server, ex.Message);
+        }
+        finally
+        {
+            _portsLoading = false;
+        }
+    }
+
+    private async Task ToggleServiceAsync(string service, bool on)
+    {
+        _confirmService = null;
+        _togglingService = service;
+        StateHasChanged();
+        try
+        {
+            if (await PostAsync($"services/{Uri.EscapeDataString(service)}/{(on ? "enable" : "disable")}", new { }))
+                ShowToast(on
+                    ? T.F("{0} enabled on the camera.", ServiceLabel(service))
+                    : T.F("{0} disabled on the camera.", ServiceLabel(service)));
+        }
+        finally
+        {
+            _togglingService = null;
+        }
+        await LoadPortsAsync(); // success or not, show what the camera NOW reports
+    }
+    private bool _privacyBusy;   // a privacy-mode write is in flight (spinner shown)
+    private bool? _suspended;    // Neolink-side suspend (beta); null when unsupported
+    private bool _confirmSuspend;
+    private bool _suspendBusy;
+    // "Do not show me this again" for the suspend warning. With web accounts the
+    // choice lives in the per-user settings blob (/api/me/settings/confirms), so
+    // it follows the account across browsers; without accounts there is no
+    // cross-browser identity, so this browser's localStorage is the best truth.
+    private bool _suspendSkipFuture;      // the checkbox in the confirm card
+    private bool _skipSuspendWarning;     // the loaded, honored preference
+    private bool _confirmPrefsFromServer; // where the preference was read from
+    private Dictionary<string, JsonElement>? _confirmPrefs; // full blob, preserved on save
+    private int _requerySeq;     // invalidates the post-resume reconnect poll
+    private bool? _sirenOn;   // last known state (pushes / this panel's own actions)
+    private bool? _privacyOn;
+    private int _ptzSpeed = 32;
+    private string? _loadedFor;
+
+    // Zoom/focus are LIVE controls: the shown value tracks the slider while it
+    // drags; the position is written on release and re-read afterwards.
+    private long? _zoomShown;
+    private long? _focusShown;
+    private bool _zfBusy;
+
+    private bool PirEnabled => Num(_pir, "enable") == 1;
+
+    // ---------------------------------------------------------- staged edits
+    // Device settings stage locally and are sent only on "Apply to camera":
+    // a mis-click can be discarded, and disruptive changes (a profile write
+    // restarts the stream; a resolution change reboots some models) are
+    // announced by a warning before the user commits. Staging the current
+    // value again simply un-stages it.
+
+    /// <summary>One stream's staged encode change: the resolution table + the
+    /// fps/bitrate picked from that table's ranges.</summary>
+    private sealed record PendingStream(ApiEncodeProfile Table, uint Fps, uint Kbps);
+
+    private readonly Dictionary<string, PendingStream> _pendingStreams = new(StringComparer.Ordinal);
+    private List<ApiStreamEnc>? _encCurrent; // the camera's CURRENT selections (null when it can't report them)
+    private string? _pendingIr;          // "auto" | "open" | "close"
+    private string? _pendingStatusLed;   // "open" | "close"
+    private bool? _pendingPir;
+    private long? _pendingFlBrightness;
+    private bool? _pendingFlAuto;
+    private long? _pendingWlBright;      // white-LED brightness (0-100)
+    private bool? _pendingWlAuto;        // white-LED "on automatically at night" (mode)
+    // HTTP-API extras (beta) — staged like the rest.
+    private long? _pendingBright, _pendingContrast, _pendingSaturation, _pendingHue, _pendingSharpen;
+    private string? _pendingDayNight, _pendingAntiFlicker;
+    private bool? _pendingFlip, _pendingMirror;
+    private long? _pendingVolume;
+    private bool? _pendingRecordAudio;   // camera-side record-audio switch (Enc audio flag)
+    private long? _pendingTalkVolume, _pendingVisitorVolume; // extra AudioCfg volumes (per-model)
+    private bool? _pendingAutoTrack;
+    private long? _pendingIrBright;      // LedState IRLedBrightness (0-100)
+    private string? _pendingDoorbellLed; // LedState doorbellLightState
+    private int? _pendingHdr;            // ISP hdr (0 = off, up to hdrMax)
+    private long? _pendingMdSens;        // motion sensitivity (1-50)
+    /// <summary>Per-AI-type staged sensitivities; a key present = staged.</summary>
+    private readonly Dictionary<string, long> _pendingAiSens = new(StringComparer.Ordinal);
+    private bool? _pendingOsdName, _pendingOsdTime, _pendingOsdWatermark;
+    private string? _pendingOsdNamePos, _pendingOsdTimePos;
+    private string _newPresetName = "";
+    private bool _presetBusy;
+    private int _quickReplyId;
+    private bool _quickReplyBusy;
+    private bool _applying;
+
+    private int PendingCount =>
+        _pendingStreams.Count + (_pendingIr != null ? 1 : 0)
+        + (_pendingStatusLed != null ? 1 : 0) + (_pendingPir != null ? 1 : 0)
+        + (_pendingFlBrightness != null ? 1 : 0) + (_pendingFlAuto != null ? 1 : 0)
+        + (_pendingWlBright != null ? 1 : 0) + (_pendingWlAuto != null ? 1 : 0)
+        + (_pendingBright != null ? 1 : 0) + (_pendingContrast != null ? 1 : 0)
+        + (_pendingSaturation != null ? 1 : 0) + (_pendingHue != null ? 1 : 0)
+        + (_pendingSharpen != null ? 1 : 0)
+        + (_pendingDayNight != null ? 1 : 0) + (_pendingAntiFlicker != null ? 1 : 0)
+        + (_pendingFlip != null ? 1 : 0) + (_pendingMirror != null ? 1 : 0)
+        + (_pendingVolume != null ? 1 : 0) + (_pendingAutoTrack != null ? 1 : 0)
+        + (_pendingRecordAudio != null ? 1 : 0)
+        + (_pendingTalkVolume != null ? 1 : 0) + (_pendingVisitorVolume != null ? 1 : 0)
+        + (_pendingIrBright != null ? 1 : 0) + (_pendingDoorbellLed != null ? 1 : 0)
+        + (_pendingHdr != null ? 1 : 0) + (_pendingMdSens != null ? 1 : 0)
+        + _pendingAiSens.Count
+        + (_pendingOsdName != null ? 1 : 0) + (_pendingOsdTime != null ? 1 : 0)
+        + (_pendingOsdWatermark != null ? 1 : 0)
+        + (_pendingOsdNamePos != null ? 1 : 0) + (_pendingOsdTimePos != null ? 1 : 0);
+
+    /// <summary>Any staged change that interrupts the device when applied.
+    /// Flip/mirror make the camera restart its video pipeline, like a profile write.</summary>
+    private bool PendingDisruptive =>
+        _pendingStreams.Count > 0 || _pendingFlip != null || _pendingMirror != null;
+
+    /// <summary>A resolution change (not just fps/bitrate) makes some models fully
+    /// reboot. "Same resolution" is checked against the camera's reported encode
+    /// selection first, the live stream's dimensions as fallback — unknown counts
+    /// as a change, so uncertainty over-warns rather than under-warns.</summary>
+    private bool PendingMayReboot =>
+        _pendingStreams.Any(kv =>
+            !(CurrentEnc(kv.Key) is { } e && e.Width == kv.Value.Table.Width && e.Height == kv.Value.Table.Height)
+            && Camera?.Streams.Any(s => s.Kind == kv.Value.Table.Type
+                && s.Width == kv.Value.Table.Width && s.Height == kv.Value.Table.Height) != true);
+
+    /// <summary>The little "· pending" tag next to a staged control's label.</summary>
+    private static string PendingMark(string? pending) => pending != null ? "· pending" : "";
+
+    // ---- streams: resolution picks the table, fps/kbps come from its ranges ----
+
+    private ApiStreamEnc? CurrentEnc(string kind) => _encCurrent?.FirstOrDefault(e => e.Stream == kind);
+    private uint? CurrentFps(string kind) => CurrentEnc(kind) is { Framerate: > 0 } e ? e.Framerate : null;
+    private uint? CurrentKbps(string kind) => CurrentEnc(kind) is { Bitrate: > 0 } e ? e.Bitrate : null;
+
+    private bool IsPendingTable(string kind, ApiEncodeProfile p) =>
+        _pendingStreams.GetValueOrDefault(kind) is { } ps && SameTable(ps.Table, p);
+
+    private static bool SameTable(ApiEncodeProfile a, ApiEncodeProfile b) =>
+        a.Width == b.Width && a.Height == b.Height;
+
+    /// <summary>The table whose fps/bitrate ranges the selects offer: the staged
+    /// one, else the live resolution's, else the camera's first.</summary>
+    private ApiEncodeProfile? SelectedTable(string kind, List<ApiEncodeProfile> options) =>
+        _pendingStreams.GetValueOrDefault(kind)?.Table
+        ?? options.FirstOrDefault(IsActiveProfile)
+        ?? options.FirstOrDefault();
+
+    /// <summary>The table's values, with the shown value included even when the
+    /// camera reports something off-table (older firmware quirks).</summary>
+    private static IEnumerable<uint> TableValues(List<uint> table, uint shown) =>
+        table.Contains(shown) ? table : table.Append(shown).OrderByDescending(v => v);
+
+    private void StageStream(string kind, ApiEncodeProfile table, uint fps, uint kbps, List<ApiEncodeProfile> options)
+    {
+        // Clamp to the chosen table's ranges (switching tables can strand values).
+        if (!table.Framerates.Contains(fps)) fps = table.DefaultFramerate;
+        if (!table.Bitrates.Contains(kbps)) kbps = table.DefaultBitrate;
+
+        // Staging exactly the live state again un-stages (nothing to send).
+        bool liveTable = IsActiveProfile(table);
+        bool liveRates = fps == (CurrentFps(kind) ?? table.DefaultFramerate)
+                         && kbps == (CurrentKbps(kind) ?? table.DefaultBitrate);
+        if (liveTable && liveRates)
+            _pendingStreams.Remove(kind);
+        else
+            _pendingStreams[kind] = new PendingStream(table, fps, kbps);
+    }
+
+    private void StageResolution(string kind, ApiEncodeProfile table, List<ApiEncodeProfile> options)
+    {
+        var ps = _pendingStreams.GetValueOrDefault(kind);
+        StageStream(kind, table,
+            ps?.Fps ?? CurrentFps(kind) ?? table.DefaultFramerate,
+            ps?.Kbps ?? CurrentKbps(kind) ?? table.DefaultBitrate, options);
+    }
+
+    private void StageFps(string kind, uint fps, List<ApiEncodeProfile> options)
+    {
+        var table = SelectedTable(kind, options);
+        if (table == null) return;
+        var ps = _pendingStreams.GetValueOrDefault(kind);
+        StageStream(kind, table, fps, ps?.Kbps ?? CurrentKbps(kind) ?? table.DefaultBitrate, options);
+    }
+
+    private void StageKbps(string kind, uint kbps, List<ApiEncodeProfile> options)
+    {
+        var table = SelectedTable(kind, options);
+        if (table == null) return;
+        var ps = _pendingStreams.GetValueOrDefault(kind);
+        StageStream(kind, table, ps?.Fps ?? CurrentFps(kind) ?? table.DefaultFramerate, kbps, options);
+    }
+
+    private void StageIr(string? value) =>
+        _pendingIr = value == null || value == Str(_led, "state") ? null : value;
+
+    private void StageStatusLedToggle()
+    {
+        var target = (_pendingStatusLed ?? Str(_led, "lightState")) == "open" ? "close" : "open";
+        _pendingStatusLed = target == Str(_led, "lightState") ? null : target;
+    }
+
+    private void StagePirToggle()
+    {
+        var target = !(_pendingPir ?? PirEnabled);
+        _pendingPir = target == PirEnabled ? null : target;
+    }
+
+    private void StageFlBrightness(long value) =>
+        _pendingFlBrightness = value == _floodlight?.Brightness ? null : value;
+
+    private void StageFlAutoToggle()
+    {
+        var target = !(_pendingFlAuto ?? _floodlight?.Auto ?? false);
+        _pendingFlAuto = target == _floodlight?.Auto ? null : target;
+    }
+
+    private void StageWlBright(long value) =>
+        _pendingWlBright = value == _whiteLed?.Bright ? null : value;
+
+    private void StageWlAutoToggle()
+    {
+        bool cur = _whiteLed is { } wl && wl.Mode != 0;
+        var target = !(_pendingWlAuto ?? cur);
+        _pendingWlAuto = target == cur ? null : target;
+    }
+
+    // ---- HTTP-API extras (beta): staged the same way ----
+
+    private void StageBright(long v) => _pendingBright = v == _http?.Image?.Bright ? null : v;
+    private void StageContrast(long v) => _pendingContrast = v == _http?.Image?.Contrast ? null : v;
+    private void StageSaturation(long v) => _pendingSaturation = v == _http?.Image?.Saturation ? null : v;
+    private void StageHue(long v) => _pendingHue = v == _http?.Image?.Hue ? null : v;
+    private void StageSharpen(long v) => _pendingSharpen = v == _http?.Image?.Sharpen ? null : v;
+
+    private void StageDayNight(string? v) =>
+        _pendingDayNight = v == null || v == _http?.Image?.DayNight ? null : v;
+
+    private void StageAntiFlicker(string? v) =>
+        _pendingAntiFlicker = v == null || v == _http?.Image?.AntiFlicker ? null : v;
+
+    private void StageFlipToggle()
+    {
+        var cur = _http?.Image?.Flip ?? false;
+        var target = !(_pendingFlip ?? cur);
+        _pendingFlip = target == cur ? null : target;
+    }
+
+    private void StageMirrorToggle()
+    {
+        var cur = _http?.Image?.Mirror ?? false;
+        var target = !(_pendingMirror ?? cur);
+        _pendingMirror = target == cur ? null : target;
+    }
+
+    private void StageVolume(long v) => _pendingVolume = v == _http?.Volume ? null : v;
+
+    private void StageRecordAudioToggle()
+    {
+        var cur = _http?.RecordAudio ?? false;
+        var target = !(_pendingRecordAudio ?? cur);
+        _pendingRecordAudio = target == cur ? null : target;
+    }
+
+    private void StageTalkVolume(long v) => _pendingTalkVolume = v == _http?.TalkVolume ? null : v;
+    private void StageVisitorVolume(long v) => _pendingVisitorVolume = v == _http?.VisitorVolume ? null : v;
+
+    private void StageAutoTrackToggle()
+    {
+        var cur = _http?.AutoTrack ?? false;
+        var target = !(_pendingAutoTrack ?? cur);
+        _pendingAutoTrack = target == cur ? null : target;
+    }
+
+    private void StageIrBright(long v) => _pendingIrBright = v == Num(_led, "IRLedBrightness") ? null : v;
+
+    private void StageHdr(int v) => _pendingHdr = v == _http?.Image?.Hdr ? null : v;
+
+    private void StageMdSens(long v) => _pendingMdSens = v == _http?.MdSensitivity ? null : v;
+
+    private void StageAiSens(string type, long v)
+    {
+        var cur = _http?.AiSensitivities?.FirstOrDefault(a => a.Type == type)?.Sensitivity;
+        if (v == cur) _pendingAiSens.Remove(type);
+        else _pendingAiSens[type] = v;
+    }
+
+    // -------------------------------------------------------------- zone editor
+
+    private bool _zoneOpen;
+    private string _zoneType = "md";
+    private ApiDetectionZone? _zone;
+    private string? _zoneError;
+    private bool _zoneLoading;
+    private bool _zoneSaving;
+    private bool _zoneNeedsInit;
+    private string _zoneMode = "block";
+    private ElementReference _zoneCanvas;
+
+    /// <summary>The tabs to offer. Driven by what the CAMERA reports a separate grid
+    /// for — not by which types it can score, which is a different question: nearly
+    /// every model tunes sensitivity per type while governing them all with one zone.</summary>
+    private List<(string Key, string Label)> ZoneTypes()
+    {
+        var types = _zone?.ZoneTypes;
+        if (types is not { Count: > 1 })
+            return new List<(string, string)> { ("md", "Motion") };
+        var list = new List<(string, string)>();
+        foreach (var t in types)
+            list.Add((t, t == "md" ? "Motion"
+                : _http?.AiSensitivities?.FirstOrDefault(a => a.Type == t)?.Label ?? t));
+        return list;
+    }
+
+    private Task OpenZoneAsync()
+    {
+        _zoneOpen = true;
+        _zoneMode = "block";
+        return SwitchZoneAsync(_zoneType);
+    }
+
+    private async Task SetZoneModeAsync(string mode)
+    {
+        _zoneMode = mode;
+        try { await JS.InvokeVoidAsync("neolink.zoneMode", _zoneCanvas, mode); }
+        catch { }
+    }
+
+    private async Task SwitchZoneAsync(string type)
+    {
+        _zoneType = type;
+        _zone = null;
+        _zoneError = null;
+        _zoneLoading = true;
+        StateHasChanged();
+        try
+        {
+            using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+            using var res = await Http.SendAsync(
+                NewRequest(HttpMethod.Get, $"detectionzone?type={Uri.EscapeDataString(type)}"), cts.Token);
+            if (res.IsSuccessStatusCode)
+                _zone = await res.Content.ReadFromJsonAsync<ApiDetectionZone>(cancellationToken: cts.Token);
+            // 404 is "this camera has no such zone" and speaks for itself; anything
+            // else carries a reason the reader can act on (and a retry worth taking).
+            else if (res.StatusCode != System.Net.HttpStatusCode.NotFound)
+                _zoneError = await ReadErrorAsync(res) ?? T.F("Request failed ({0})", (int)res.StatusCode);
+        }
+        catch (OperationCanceledException)
+        {
+            _zoneError = T["The camera is taking too long to answer."];
+        }
+        catch (Exception ex)
+        {
+            _zoneError = T.F("Cannot reach {0}: {1}", Server, ex.Message);
+        }
+        _zoneLoading = false;
+        _zoneNeedsInit = _zone != null;
+        StateHasChanged();
+    }
+
+    private void CloseZone()
+    {
+        _zoneOpen = false;
+        _zone = null;
+        _zoneError = null;
+    }
+
+    protected override async Task OnAfterRenderAsync(bool firstRender)
+    {
+        // The canvas exists only after the render that shows it; painting state
+        // lives entirely in the browser from here on.
+        if (_zoneNeedsInit && _zone is { } z)
+        {
+            _zoneNeedsInit = false;
+            // A cancelled call means the circuit went away, not that the editor is
+            // broken; anything else escaping here would tear the circuit down and
+            // discard the grid the user is painting.
+            try
+            {
+                await JS.InvokeVoidAsync("neolink.zoneInit", _zoneCanvas, z.Cols, z.Rows, z.Table,
+                    SnapshotUrl(), T["no snapshot available"], _zoneMode);
+            }
+            catch (Exception ex) when (ex is JSDisconnectedException or TaskCanceledException)
+            {
+            }
+        }
+    }
+
+    private string SnapshotUrl() =>
+        $"{(string.IsNullOrEmpty(MediaServer) ? Server : MediaServer).TrimEnd('/')}"
+        + $"/api/cameras/{Uri.EscapeDataString(CameraName)}/snapshot.jpg?maxAge=15&maxStale=600"
+        + (string.IsNullOrEmpty(Token) ? "" : $"&token={Uri.EscapeDataString(Token)}");
+
+    /// <summary>Paints every cell watched or ignored. Staged like any other edit —
+    /// nothing reaches the camera until Apply.</summary>
+    private async Task ZoneFillAsync(bool watch)
+    {
+        try { await JS.InvokeVoidAsync("neolink.zoneFill", _zoneCanvas, watch); }
+        catch { }
+    }
+
+    private async Task SaveZoneAsync()
+    {
+        string? table = null;
+        try { table = await JS.InvokeAsync<string?>("neolink.zoneRead", _zoneCanvas); }
+        catch { }
+        if (table == null || _zone == null) return;
+        _zoneSaving = true;
+        // Cols/Rows ride along for a zone Neolink keeps: the grid on screen is the
+        // one being saved, and re-deriving its shape server-side would reject the
+        // first save of a camera whose stream became ready while the editor was open.
+        // A zone on the camera takes its dimensions from the camera and ignores them.
+        // Storage says where the editor believed the zone lived: if that has changed
+        // since it opened, the server saves it nowhere rather than somewhere else.
+        if (await PostAsync("detectionzone",
+                new { type = _zoneType, table, cols = _zone.Cols, rows = _zone.Rows, storage = _zone.Storage }))
+        {
+            _zone = _zone with { Table = table, Storage = _lastPostStorage ?? _zone.Storage };
+            // Where it went is what the SERVER did, not what the dialog assumed when
+            // it opened — those can differ if the camera answered differently since.
+            ShowToast(_lastPostStorage == "neolink" ? T["Zone saved to Neolink."]
+                : _lastPostStorage == "camera" ? T["Zone saved to the camera."]
+                : _zone.StoredOnServer ? T["Zone saved to Neolink."] : T["Zone saved to the camera."]);
+            await OnZoneSaved.InvokeAsync(CameraName);
+        }
+        else if (_lastPostStatus == 409)
+        {
+            // The grid on screen belongs to where the zone USED to live (a camera
+            // that answered for the first time while this was open, say). Reload
+            // it as it now stands, and say why the drawing went.
+            await SwitchZoneAsync(_zoneType);
+            ShowToast(T["Where this zone is kept changed while the editor was open, so it has been reloaded. Draw your changes again and save."], error: true);
+        }
+        _zoneSaving = false;
+    }
+
+    private void StageOsdNameToggle()
+    {
+        var cur = _http?.Osd?.ShowName ?? false;
+        var target = !(_pendingOsdName ?? cur);
+        _pendingOsdName = target == cur ? null : target;
+    }
+
+    private void StageOsdTimeToggle()
+    {
+        var cur = _http?.Osd?.ShowTime ?? false;
+        var target = !(_pendingOsdTime ?? cur);
+        _pendingOsdTime = target == cur ? null : target;
+    }
+
+    private void StageOsdWatermarkToggle()
+    {
+        var cur = _http?.Osd?.Watermark ?? false;
+        var target = !(_pendingOsdWatermark ?? cur);
+        _pendingOsdWatermark = target == cur ? null : target;
+    }
+
+    private void StageOsdNamePos(string? v) =>
+        _pendingOsdNamePos = v == null || v == _http?.Osd?.NamePos ? null : v;
+
+    private void StageOsdTimePos(string? v) =>
+        _pendingOsdTimePos = v == null || v == _http?.Osd?.TimePos ? null : v;
+
+    /// <summary>The firmware's position list, with the camera's current value kept
+    /// selectable even when the range table didn't include it.</summary>
+    private static IEnumerable<string> PosChoices(List<string> options, string? current) =>
+        current == null || options.Contains(current) ? options : options.Append(current);
+
+    private void StageDoorbellLedToggle()
+    {
+        var cur = Str(_led, "doorbellLightState");
+        var target = (_pendingDoorbellLed ?? cur) == "open" ? "close" : "open";
+        _pendingDoorbellLed = target == cur ? null : target;
+    }
+
+    /// <summary>One 0-255 picture slider row (skipped when the camera lacks the field).</summary>
+    private RenderFragment PictureSlider(string label, int? cur, long? pending, Action<long> stage) => __builder =>
+    {
+        @if (cur is { } c)
+        {
+            <div class="control-row">
+                <span>@label @PendingMark(pending?.ToString())</span>
+                <input class="zf-slider @(pending != null ? "input-pending" : "")"
+                       type="range" min="0" max="255" step="1"
+                       disabled="@_applying" value="@(pending ?? c)"
+                       @oninput="e => stage(long.Parse((string)e.Value!))" />
+                <span class="zf-pos">@(pending ?? c)</span>
+            </div>
+        }
+    };
+
+    private string SdLabel(ApiSdCard card) =>
+        !card.Mounted ? T["not mounted"]
+        : !card.Formatted ? T["not formatted"]
+        : T.F("{0} GB free of {1} GB", $"{card.FreeMb / 1024.0:0.#}", $"{card.TotalMb / 1024.0:0.#}");
+
+    private void DiscardPending()
+    {
+        _pendingStreams.Clear();
+        _pendingIr = _pendingStatusLed = null;
+        _pendingPir = null;
+        _pendingFlBrightness = null;
+        _pendingFlAuto = null;
+        _pendingWlBright = null;
+        _pendingWlAuto = null;
+        _pendingBright = _pendingContrast = _pendingSaturation = _pendingHue = _pendingSharpen = null;
+        _pendingDayNight = _pendingAntiFlicker = null;
+        _pendingFlip = _pendingMirror = null;
+        _pendingVolume = null;
+        _pendingRecordAudio = null;
+        _pendingTalkVolume = _pendingVisitorVolume = null;
+        _pendingAutoTrack = null;
+        _pendingIrBright = null;
+        _pendingDoorbellLed = null;
+        _pendingHdr = null;
+        _pendingMdSens = null;
+        _pendingAiSens.Clear();
+        _pendingOsdName = _pendingOsdTime = _pendingOsdWatermark = null;
+        _pendingOsdNamePos = _pendingOsdTimePos = null;
+    }
+
+    /// <summary>Sends the staged changes one at a time (the camera answers control
+    /// commands serially). Whatever fails stays staged, so Apply can be retried.</summary>
+    private async Task ApplyPendingAsync()
+    {
+        if (_applying) return;
+        _applying = true;
+        var applied = new List<string>();
+        bool? appliedFlip = null, appliedMirror = null;
+        try
+        {
+            if (_pendingIr is { } ir && await PostAsync("led", new { state = ir }))
+            {
+                _pendingIr = null;
+                applied.Add(T["night vision"]);
+            }
+            if (_pendingStatusLed is { } led && await PostAsync("led", new { lightState = led }))
+            {
+                _pendingStatusLed = null;
+                applied.Add(T["status LED"]);
+            }
+            if (_pendingPir is { } pir && await PostAsync("pir", new { enabled = pir }))
+            {
+                _pendingPir = null;
+                applied.Add(T["PIR"]);
+            }
+            if ((_pendingFlBrightness != null || _pendingFlAuto != null)
+                && await PostAsync("floodlight", new { brightness = _pendingFlBrightness, auto = _pendingFlAuto }))
+            {
+                _pendingFlBrightness = null;
+                _pendingFlAuto = null;
+                applied.Add(T["floodlight behavior"]);
+            }
+            if ((_pendingWlBright != null || _pendingWlAuto != null)
+                && await PostAsync("whiteled", new
+                {
+                    brightness = _pendingWlBright,
+                    mode = _pendingWlAuto is { } a ? (a ? 1 : 0) : (int?)null,
+                }))
+            {
+                _pendingWlBright = null;
+                _pendingWlAuto = null;
+                applied.Add(T["spotlight"]);
+            }
+            if (_pendingDoorbellLed is { } dbl && await PostAsync("led", new { doorbellLightState = dbl }))
+            {
+                _pendingDoorbellLed = null;
+                applied.Add(T["doorbell light"]);
+            }
+            if (_pendingIrBright is { } irb && await PostAsync("led", new { irBrightness = irb }))
+            {
+                _pendingIrBright = null;
+                applied.Add(T["IR brightness"]);
+            }
+            if ((_pendingBright != null || _pendingContrast != null || _pendingSaturation != null
+                 || _pendingHue != null || _pendingSharpen != null || _pendingDayNight != null
+                 || _pendingAntiFlicker != null || _pendingFlip != null || _pendingMirror != null)
+                && await PostAsync("image", new
+                {
+                    bright = _pendingBright,
+                    contrast = _pendingContrast,
+                    saturation = _pendingSaturation,
+                    hue = _pendingHue,
+                    sharpen = _pendingSharpen,
+                    dayNight = _pendingDayNight,
+                    antiFlicker = _pendingAntiFlicker,
+                    flip = _pendingFlip,
+                    mirror = _pendingMirror,
+                }))
+            {
+                _pendingBright = _pendingContrast = _pendingSaturation = _pendingHue = _pendingSharpen = null;
+                _pendingDayNight = _pendingAntiFlicker = null;
+                (appliedFlip, appliedMirror) = (_pendingFlip, _pendingMirror);
+                _pendingFlip = _pendingMirror = null;
+                applied.Add(T["picture"]);
+            }
+            if (_pendingHdr is { } hdr && await PostAsync("hdr", new { value = hdr }))
+            {
+                _pendingHdr = null;
+                applied.Add(T["HDR"]);
+            }
+            if (_pendingMdSens is { } mds && await PostAsync("mdsensitivity", new { sensitivity = mds }))
+            {
+                _pendingMdSens = null;
+                applied.Add(T["motion sensitivity"]);
+            }
+            foreach (var (aiType, aiVal) in _pendingAiSens.ToList())
+            {
+                if (!await PostAsync("aisensitivity", new { type = aiType, sensitivity = aiVal }))
+                    break; // whatever failed stays staged for retry
+                _pendingAiSens.Remove(aiType);
+                applied.Add(T.F("{0} sensitivity", aiType));
+            }
+            if ((_pendingOsdName != null || _pendingOsdTime != null || _pendingOsdWatermark != null
+                 || _pendingOsdNamePos != null || _pendingOsdTimePos != null)
+                && await PostAsync("osd", new
+                {
+                    showName = _pendingOsdName,
+                    namePos = _pendingOsdNamePos,
+                    showTime = _pendingOsdTime,
+                    timePos = _pendingOsdTimePos,
+                    watermark = _pendingOsdWatermark,
+                }))
+            {
+                _pendingOsdName = _pendingOsdTime = _pendingOsdWatermark = null;
+                _pendingOsdNamePos = _pendingOsdTimePos = null;
+                applied.Add(T["on-screen display"]);
+            }
+            if (_pendingVolume is { } pv && await PostAsync("volume", new { volume = pv }))
+            {
+                _pendingVolume = null;
+                applied.Add(T["speaker volume"]);
+            }
+            if (_pendingRecordAudio is { } pra && await PostAsync("audio", new { recordAudio = pra }))
+            {
+                _pendingRecordAudio = null;
+                applied.Add(pra ? T["record audio on"] : T["record audio off"]);
+            }
+            if ((_pendingTalkVolume != null || _pendingVisitorVolume != null)
+                && await PostAsync("audio", new { talkVolume = _pendingTalkVolume, visitorVolume = _pendingVisitorVolume }))
+            {
+                if (_pendingTalkVolume != null) applied.Add(T["talk & reply volume"]);
+                if (_pendingVisitorVolume != null) applied.Add(T["visitor volume"]);
+                _pendingTalkVolume = _pendingVisitorVolume = null;
+            }
+            if (_pendingAutoTrack is { } pat && await PostAsync("autotrack", new { on = pat }))
+            {
+                _pendingAutoTrack = null;
+                applied.Add(T["auto-tracking"]);
+            }
+            // The disruptive ones go LAST: the quick settings land before the
+            // stream restarts make the camera briefly deaf to commands.
+            foreach (var (kind, ps) in _pendingStreams.ToList())
+            {
+                if (!await PostAsync("settings/stream", new
+                    {
+                        stream = kind,
+                        width = ps.Table.Width,
+                        height = ps.Table.Height,
+                        framerate = ps.Fps,
+                        bitrate = ps.Kbps,
+                    }))
+                    break; // whatever failed stays staged for retry
+                _pendingStreams.Remove(kind);
+                applied.Add($"{ps.Table.Label} stream → {ps.Table.Width}×{ps.Table.Height} @{ps.Fps} fps {ps.Kbps} kbps " +
+                            T["(the camera restarts the stream; video resumes shortly)"]);
+            }
+
+            if (applied.Count > 0 && PendingCount == 0)
+                ShowToast(T.F("Applied: {0}.", string.Join(", ", applied)));
+            else if (applied.Count > 0)
+                // Something in the batch failed (its own red toast already showed);
+                // say what DID land so the retry scope is clear.
+                ShowToast(T.F("Applied: {0} — the rest failed and stays staged for retry.", string.Join(", ", applied)), error: true);
+
+            // Refresh what the camera now reports (best-effort).
+            if (_caps?.Features?.Led == true) _led = await GetAsync<JsonElement?>("led");
+            if (_caps?.Features?.Pir == true) _pir = await GetAsync<JsonElement?>("pir");
+            if (_caps?.Features?.Floodlight == true) _floodlight = await GetAsync<ApiFloodlight?>("floodlight");
+            if (_caps?.Features?.WhiteLed == true) _whiteLed = await GetAsync<ApiWhiteLed?>("whiteled");
+            if (_caps?.Features?.StreamSettings == true) _encCurrent = await GetAsync<List<ApiStreamEnc>?>("settings/stream");
+            if (_http != null && await GetAsync<ApiHttpFeatures?>("httpfeatures") is { } freshHttp)
+                _http = MergeHttp(freshHttp, _http);
+            // A CONFIRMED flip/mirror write outranks the camera's echo for this
+            // refresh: the camera applies these by restarting its video pipeline
+            // and can still report the pre-write value while it does — the panel
+            // then looked like the toggle didn't take.
+            if ((appliedFlip != null || appliedMirror != null) && _http?.Image is { } img)
+                _http = _http with
+                {
+                    Image = img with { Flip = appliedFlip ?? img.Flip, Mirror = appliedMirror ?? img.Mirror },
+                };
+        }
+        finally
+        {
+            _applying = false;
+        }
+    }
+
+    /// <summary>Post-apply refresh guard: a camera busy applying a write (an OSD
+    /// change re-renders the burned-in overlays; flip/mirror restarts the video
+    /// pipeline) can time out parts of the combined httpfeatures re-read, which
+    /// then reports those features as ABSENT — and their panel sections vanish
+    /// right after a successful apply, looking like the feature broke. Any member
+    /// the fresh read couldn't get keeps its previous reading instead.</summary>
+    private static ApiHttpFeatures MergeHttp(ApiHttpFeatures fresh, ApiHttpFeatures old) => new(
+        fresh.Image ?? old.Image,
+        fresh.Volume ?? old.Volume,
+        fresh.WifiSignal ?? old.WifiSignal,
+        fresh.PtzPresets ?? old.PtzPresets,
+        fresh.QuickReplies ?? old.QuickReplies,
+        fresh.AutoTrack ?? old.AutoTrack,
+        fresh.SdCards ?? old.SdCards,
+        fresh.MdSensitivity ?? old.MdSensitivity,
+        fresh.AiSensitivities ?? old.AiSensitivities,
+        fresh.Osd ?? old.Osd,
+        fresh.RecordAudio ?? old.RecordAudio,
+        fresh.TalkVolume ?? old.TalkVolume,
+        fresh.VisitorVolume ?? old.VisitorVolume);
+
+    protected override async Task OnParametersSetAsync()
+    {
+        if (_loadedFor != CameraName)
+        {
+            _loadedFor = CameraName;
+            await LoadAsync();
+            return;
+        }
+        // The probe concluded "offline" but the wall's state feed now says the
+        // camera is back: probe again, so an open panel grows its device tabs
+        // without a close/reopen. Rate-limited — the wall refresh drives this,
+        // and a camera the probe still calls offline shouldn't be hammered.
+        // Sleep-capable cameras get a settle period first: "online" appears the
+        // moment the connection is up, mid-wake, and the capability sweep's
+        // round-trips would fight the stream spin-up for the battery cam's thin
+        // radio — the sweep waits until the wake has had the radio to itself.
+        if (Camera is not { Online: true })
+        {
+            _onlineSince = default;
+            return;
+        }
+        if (_onlineSince == default) _onlineSince = DateTime.UtcNow;
+        var settle = Camera.Sleeps ? TimeSpan.FromSeconds(20) : TimeSpan.Zero;
+        if (!_loading && !_probing && _caps is not { Online: true }
+            && DateTime.UtcNow - _onlineSince >= settle
+            && DateTime.UtcNow - _lastAutoProbe > TimeSpan.FromSeconds(10))
+        {
+            _lastAutoProbe = DateTime.UtcNow;
+            await LoadAsync();
+        }
+    }
+    private DateTime _lastAutoProbe;
+    private DateTime _onlineSince;
+
+    private async Task LoadAsync()
+    {
+        _loading = true;
+        _probing = false;
+        _error = _toast = null;
+        _caps = null;
+        _recording = null;
+        _profiles = null;
+        _battery = _led = _pir = null;
+        _zoomFocus = null;
+        _floodlight = null;
+        _whiteLed = null;
+        _http = null;
+        _firmware = null;
+        _encCurrent = null;
+        _zoomShown = _focusShown = null;
+        _sirenOn = _privacyOn = null;
+        _newPresetName = "";
+        _presetBusy = _quickReplyBusy = false;
+        _quickReplyId = 0;
+        _camTab = "controls";
+        _confirmReboot = _confirmSiren = _confirmPrivacy = _privacyBusy = false;
+        _confirmSuspend = _suspendBusy = _suspendSkipFuture = false;
+        _zoneOpen = _zoneLoading = _zoneSaving = _zoneNeedsInit = false;
+        _zone = null;
+        _zoneError = null;
+        _zoneType = "md";
+        // The suspend-warning opt-out loads in the background; until it lands the
+        // warning shows, which is the safe default.
+        _ = LoadConfirmPrefsAsync();
+        // Suspend state: seeded from the camera list (reachable even while the
+        // camera is offline), then confirmed against the server — the list entry
+        // the parent passed in can be stale, e.g. right after resuming from this
+        // very panel, and it must not flip the panel back to "suspended".
+        _suspended = Camera?.CanSuspend == true ? Camera.Suspended : null;
+        DiscardPending(); // switching cameras must not carry staged edits across
+        StateHasChanged();
+
+        if (Camera?.CanSuspend == true &&
+            (await GetAsync<JsonElement?>("suspend"))?.TryGetProperty("suspended", out var su) == true
+            && su.ValueKind is JsonValueKind.True or JsonValueKind.False)
+        {
+            _suspended = su.GetBoolean();
+        }
+
+        // Phase 1 — known upfront, no camera round-trip: the recording settings are
+        // pure server state (retention, event-type filter), readable even while the
+        // camera is offline. Fetch and render them FIRST so the panel is useful in a
+        // few milliseconds instead of waiting on the camera's capability probe.
+        _recording = await GetAsync<ApiRecordingSettings>("recording"); // null when the server records nothing
+        if (_recording != null) _camTab = "recording";
+        _loading = false;
+        _probing = true;
+        StateHasChanged();
+
+        // Phase 2 — the slow part: capability discovery probes the camera with a
+        // handful of commands, and each control read is another round-trip. Runs in
+        // the background behind the "querying the camera" hint; the device-controls
+        // tab appears once this lands.
+        _caps = await GetAsync<ApiCapabilities>("capabilities");
+        if (_caps is { Online: true })
+        {
+            // A camera that came online since phase 1 (or records nothing) still
+            // wants the controls tab as its default.
+            if (_recording == null) _camTab = "controls";
+            _profiles = (await GetAsync<ApiStreamProfiles>("streaminfo"))?.Profiles;
+            if (_caps.Features?.Battery == true) _battery = await GetAsync<JsonElement?>("battery");
+            if (_caps.Features?.Led == true) _led = await GetAsync<JsonElement?>("led");
+            if (_caps.Features?.Pir == true) _pir = await GetAsync<JsonElement?>("pir");
+            if (_caps.Features?.Zoom == true) _zoomFocus = await GetAsync<ApiZoomFocus?>("zoomfocus");
+            if (_caps.Features?.Floodlight == true) _floodlight = await GetAsync<ApiFloodlight?>("floodlight");
+            if (_caps.Features?.WhiteLed == true) _whiteLed = await GetAsync<ApiWhiteLed?>("whiteled");
+            if (_caps.Features?.StreamSettings == true) _encCurrent = await GetAsync<List<ApiStreamEnc>?>("settings/stream");
+            if (_caps.Features?.Siren == true) _sirenOn = (await GetAsync<JsonElement?>("siren"))?.TryGetProperty("on", out var so) == true && so.ValueKind != JsonValueKind.Null ? so.GetBoolean() : null;
+            if (_caps.Features?.Privacy == true) _privacyOn = (await GetAsync<JsonElement?>("privacy"))?.TryGetProperty("on", out var po) == true && po.ValueKind != JsonValueKind.Null ? po.GetBoolean() : null;
+            // The HTTP-API extras (beta): one combined read; 404/null just hides them.
+            // Also fetched for ONVIF-only cameras (no http_address) — the sweep then
+            // returns just the picture settings ONVIF can provide.
+            if (_caps.Features?.StreamSettings == true || _caps.Features?.Imaging == true
+                || _caps.Features?.Onvif == true)
+            {
+                _http = await GetAsync<ApiHttpFeatures?>("httpfeatures");
+                _quickReplyId = _http?.QuickReplies?.FirstOrDefault()?.Id ?? 0;
+                // The (server-cached) firmware-update check — display-only.
+                _firmware = await GetAsync<ApiFirmware?>("firmware");
+            }
+        }
+        _loading = false;
+        _probing = false;
+        // The tab was offered during the probe; a camera that never answered it at
+        // all has no tab to return to — don't strand the reader there.
+        if (_camTab is "controls" or "ports" && !ShowControlsTab && _recording != null)
+            _camTab = "recording";
+        // Ports was offered during the probe too, and drops away once the camera
+        // turns out to be non-Reolink (it has no service table). Someone who clicked
+        // it in the meantime must not be left on a tab whose button has gone.
+        else if (_camTab == "ports" && OnvifOnly)
+            _camTab = "controls";
+    }
+
+    private Task CloseAsync() => OnClose.InvokeAsync();
+
+    public void Dispose() => _disposed = true;
+
+    /// <summary>Shows the bottom-of-panel feedback toast; it replaces any current
+    /// one and dismisses itself after 5 seconds.</summary>
+    private void ShowToast(string message, bool error = false)
+    {
+        _toast = message;
+        _toastError = error;
+        _ = DismissToastLaterAsync(++_toastSeq);
+    }
+
+    private async Task DismissToastLaterAsync(int seq)
+    {
+        await Task.Delay(TimeSpan.FromSeconds(5));
+        if (_disposed || seq != _toastSeq) return;
+        _toast = null;
+        await InvokeAsync(StateHasChanged);
+    }
+
+    // ------------------------------------------------------------ actions
+
+    private Task PtzAsync(string command) => PostAsync("ptz", new { command, speed = (float)_ptzSpeed });
+    private Task PtzStopAsync() => PtzAsync("stop");
+
+    /// <summary>Live lens control: write the absolute position, then re-read where
+    /// the lens actually landed (zooming usually moves the focus too).</summary>
+    private async Task SetZoomFocusAsync(long? zoom = null, long? focus = null)
+    {
+        if (_zfBusy) return;
+        _zfBusy = true;
+        try
+        {
+            if (await PostAsync("zoomfocus", new { zoom, focus }))
+            {
+                _zoomFocus = await GetAsync<ApiZoomFocus?>("zoomfocus") ?? _zoomFocus;
+                _zoomShown = _focusShown = null;
+            }
+        }
+        finally
+        {
+            _zfBusy = false;
+        }
+    }
+
+    private async Task SirenAsync(bool on)
+    {
+        _confirmSiren = false;
+        if (await PostAsync("siren", new { on }))
+        {
+            _sirenOn = on;
+            ShowToast(on ? T["Siren ON — it sounds until you stop it."] : T["Siren stopped."]);
+        }
+    }
+
+    private async Task SetPrivacyAsync(bool on)
+    {
+        if (_privacyBusy) return; // ignore repeat clicks while a switch is in flight
+        _confirmPrivacy = false;
+        _privacyBusy = true;
+        _toast = null;
+        try
+        {
+            // The write blocks until the camera acknowledges (msg 575). Cap the
+            // wait at 10s so a slow/offline camera can't hang the spinner forever.
+            using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+            if (await PostAsync("privacy", new { on }, cts.Token))
+            {
+                _privacyOn = on;
+                ShowToast(on
+                    ? T["Privacy mode ON — the camera goes dark until switched back."]
+                    : T["Privacy mode off — the camera wakes and video resumes shortly."]);
+            }
+        }
+        finally
+        {
+            _privacyBusy = false;
+        }
+    }
+
+    /// <summary>The suspend click: straight to work when the user opted out of the
+    /// warning, otherwise the confirm card (checkbox always starts unticked).</summary>
+    private async Task RequestSuspendAsync()
+    {
+        if (_skipSuspendWarning)
+        {
+            await SetSuspendAsync(true);
+            return;
+        }
+        _suspendSkipFuture = false;
+        _confirmSuspend = true;
+    }
+
+    /// <summary>Confirm from the warning card: persist "don't show again" only on
+    /// this path — ticking the box and then cancelling must not stick.</summary>
+    private async Task ConfirmSuspendAsync()
+    {
+        _confirmSuspend = false;
+        if (_suspendSkipFuture && !_skipSuspendWarning)
+        {
+            _skipSuspendWarning = true;
+            await SaveConfirmPrefsAsync();
+        }
+        await SetSuspendAsync(true);
+    }
+
+    /// <summary>Reads the confirm preferences: the account blob when signed in
+    /// (follows the user across browsers), this browser's localStorage otherwise.</summary>
+    private async Task LoadConfirmPrefsAsync()
+    {
+        try
+        {
+            using var res = await Http.SendAsync(ServerRequest(HttpMethod.Get, "api/me/settings/confirms"));
+            if (res.IsSuccessStatusCode)
+            {
+                _confirmPrefs = await res.Content.ReadFromJsonAsync<Dictionary<string, JsonElement>>() ?? new();
+                _confirmPrefsFromServer = true;
+                _skipSuspendWarning = _confirmPrefs.TryGetValue("skipSuspendWarning", out var v)
+                                      && v.ValueKind == JsonValueKind.True;
+                return;
+            }
+        }
+        catch { /* fall through to the local fallback */ }
+        _confirmPrefsFromServer = false;
+        try
+        {
+            _skipSuspendWarning =
+                await JS.InvokeAsync<string?>("neolink.lsGet", "neolink.skipSuspendWarning") == "1";
+        }
+        catch { /* prerendering or JS unavailable: keep showing the warning */ }
+    }
+
+    /// <summary>Persists the choice where it was read from, keeping any other keys
+    /// in the account blob intact (read-modify-write of this page's own blob).</summary>
+    private async Task SaveConfirmPrefsAsync()
+    {
+        if (_confirmPrefsFromServer)
+        {
+            try
+            {
+                _confirmPrefs ??= new();
+                _confirmPrefs["skipSuspendWarning"] =
+                    JsonSerializer.SerializeToElement(_skipSuspendWarning);
+                var req = ServerRequest(HttpMethod.Put, "api/me/settings/confirms");
+                req.Content = JsonContent.Create(_confirmPrefs);
+                using var res = await Http.SendAsync(req);
+                if (res.IsSuccessStatusCode) return;
+            }
+            catch { /* fall through: at least this browser remembers */ }
+        }
+        try { await JS.InvokeVoidAsync("neolink.lsSet", "neolink.skipSuspendWarning", _skipSuspendWarning ? "1" : ""); }
+        catch { }
+    }
+
+    /// <summary>Suspends/resumes the camera in Neolink (server-side; persisted). No
+    /// camera write — this only drops/keeps Neolink's own connection.</summary>
+    private async Task SetSuspendAsync(bool suspend)
+    {
+        if (_suspendBusy) return;
+        _confirmSuspend = false;
+        _suspendBusy = true;
+        try
+        {
+            if (await PostAsync("suspend", new { suspended = suspend }))
+            {
+                _suspended = suspend;
+                _requerySeq++; // a new toggle supersedes any resume poll in flight
+                ShowToast(suspend
+                    ? T["Suspended — Neolink.NET won't view or record this camera until resumed. The camera itself keeps running."]
+                    : T["Resumed — Neolink.NET is reconnecting to this camera."]);
+                if (!suspend)
+                {
+                    // Repopulate now (honest offline notice while it reconnects),
+                    // then keep re-querying until the camera answers so the panel
+                    // fills in by itself — no close/reopen needed.
+                    await LoadAsync();
+                    _ = RequeryUntilOnlineAsync(_requerySeq, CameraName);
+                }
+            }
+        }
+        finally
+        {
+            _suspendBusy = false;
+        }
+    }
+
+    /// <summary>After a resume the camera needs a few seconds to reconnect: probe
+    /// it every 2 s (up to a minute) and reload the panel once it reports online.
+    /// Stops quietly when the panel closes, switches camera, or is re-suspended.</summary>
+    private async Task RequeryUntilOnlineAsync(int seq, string camera)
+    {
+        for (int i = 0; i < 30; i++)
+        {
+            await Task.Delay(TimeSpan.FromSeconds(2));
+            if (_disposed || seq != _requerySeq || _loadedFor != camera || _suspended != false)
+                return;
+            if (_caps is { Online: true }) return; // already populated — done
+            await InvokeAsync(async () =>
+            {
+                // Light probe first; the full (multi-query) reload only runs once
+                // the camera actually answers, so the panel doesn't churn.
+                var caps = await GetAsync<ApiCapabilities>("capabilities");
+                if (caps is { Online: true }) await LoadAsync();
+                else if (caps != null) _caps = caps;
+                StateHasChanged();
+            });
+            if (_caps is { Online: true }) return;
+        }
+    }
+
+    private bool IsActiveProfile(ApiEncodeProfile p) =>
+        Camera?.Streams.Any(s => s.Kind == p.Type && s.Width == p.Width && s.Height == p.Height) == true;
+
+    private static MarkupString TypeIcon(string label) => UiIcon.Render(UiIcon.ForLabel(label), 12);
+
+    // Live probe results win; the server's cached signals (in the phase-1
+    // /recording payload) fill in until then — so the chip list renders already
+    // filtered instead of showing everything and pruning when the probe lands.
+    // It only visibly shifts when the camera's answers changed (firmware update,
+    // camera swapped) — rare by design.
+    private bool TypeChipVisible(string t) =>
+        EventTypeSupported(t,
+            _http?.AiSensitivities is { Count: > 0 } live
+                ? live.Select(a => a.Type).ToList()
+                : _recording?.SupportedAiTypes,
+            _caps?.Features?.Doorbell ?? _recording?.SupportedDoorbell);
+
+    /// <summary>
+    /// Whether an event-type chip should be offered for this camera. Hide only
+    /// what is DISPROVEN: the AI-alarm sweep answers per type (a camera without
+    /// e.g. package detection rejects that query), and the doorbell type needs a
+    /// doorbell. Types with no reliable capability signal (crying, the perimeter
+    /// trio, motion) always show — hiding on a guess would strand a camera that
+    /// genuinely emits them. Null inputs mean "not probed yet": show everything.
+    /// </summary>
+    public static bool EventTypeSupported(string type, IReadOnlyList<string>? aiTypes, bool? doorbell) => type switch
+    {
+        "person" => AiAnswered(aiTypes, "people"),
+        "vehicle" => AiAnswered(aiTypes, "vehicle"),
+        "animal" => AiAnswered(aiTypes, "dog_cat"),
+        "package" => AiAnswered(aiTypes, "package"),
+        "doorbell" => doorbell ?? true,
+        _ => true,
+    };
+
+    private static bool AiAnswered(IReadOnlyList<string>? ai, string type) =>
+        ai is not { Count: > 0 } || ai.Contains(type);
+
+    private async Task SetRecordingAsync(bool? events = null, bool? continuous = null, List<string>? eventTypes = null,
+        int? eventRetentionDays = null, int? continuousRetentionDays = null, string? recordStream = null,
+        List<string>? scheduleDays = null, string? scheduleStart = null, string? scheduleEnd = null,
+        bool? scheduleEnabled = null,
+        bool? archiveEvents = null, bool? archiveContinuous = null, int? archiveRetentionDays = null,
+        bool? wakeTimeline = null, bool? aiDescribe = null, string? aiContext = null,
+        bool? emailEvents = null, bool? webhookEvents = null)
+    {
+        object body = new
+        {
+            events, continuous, eventTypes, eventRetentionDays, continuousRetentionDays, recordStream,
+            scheduleDays, scheduleStart, scheduleEnd, scheduleEnabled,
+            archiveEvents, archiveContinuous, archiveRetentionDays, wakeTimeline, aiDescribe, aiContext,
+            emailEvents, webhookEvents,
+        };
+        if (await PostAsync("recording", body))
+            _recording = await GetAsync<ApiRecordingSettings>("recording");
+    }
+
+    /// <summary>Blank/invalid input clears the override (the API takes negative = clear).
+    /// Shrinking opens the same confirm card as the main retention fields: the
+    /// archive is footage's last stop, so an expiry here is a permanent delete.</summary>
+    private Task SetArchiveDaysAsync(string? raw)
+    {
+        if (_recording == null) return Task.CompletedTask;
+        int days = int.TryParse(raw?.Trim(), out var d) && d >= 0 ? d : -1;
+        int oldEff = _recording.ArchiveRetentionDays ?? 0;   // 0/blank = keep forever
+        int newEff = days > 0 ? days : 0;
+        if (newEff != 0 && (oldEff == 0 || newEff < oldEff))
+        {
+            _retentionConfirm = ("archive", days, T.F(
+                "Keep archived footage for {0} days instead of {1}?\n\nArchived footage older than {0} days will be deleted permanently on the next cleanup pass — within the hour. The archive is the last stop; this cannot be undone.",
+                newEff, oldEff == 0 ? T["forever"] : oldEff.ToString()));
+            return Task.CompletedTask;
+        }
+        return SetRecordingAsync(archiveRetentionDays: days);
+    }
+
+    private string StreamLabel(string? kind) => kind switch
+    {
+        "mainStream" => T["Main"],
+        "subStream" => T["Sub"],
+        "externStream" => T["Ext"],
+        _ => kind ?? T["Main"],
+    };
+
+    private string RetentionLabel(int days) =>
+        days > 0 ? T.F("default ({0}d)", days) : T["default (forever)"];
+
+    private string DaysLabel(int days) => days == 1 ? T["1 day"] : T.F("{0} days", days);
+
+    /// <summary>One lifecycle-strip line: live window → archive → deletion, from
+    /// the settings as they stand right now (retention 0 = nothing ever expires).</summary>
+    private RenderFragment LifecycleRow(string name, int days, bool archives) => __builder =>
+    {
+        <div class="lc-row">
+            <span class="lc-name">@name</span>
+            @if (days <= 0)
+            {
+                <span class="lc-pill lc-live">@T["kept forever"]</span>
+            }
+            else
+            {
+                <span class="lc-pill lc-live">@T.F("{0} on this server", DaysLabel(days))</span>
+                <span class="lc-arrow">→</span>
+                @if (archives)
+                {
+                    var keep = _recording?.ArchiveRetentionDays ?? 0;
+                    <span class="lc-pill lc-archive">@T["archive"]@(keep > 0 ? $" · {DaysLabel(keep)}" : " · " + T["forever"])</span>
+                    @if (keep > 0)
+                    {
+                        <span class="lc-arrow">→</span>
+                        <span class="lc-pill lc-del">@T["deleted"]</span>
+                    }
+                }
+                else
+                {
+                    <span class="lc-pill lc-del">@T["deleted"]</span>
+                }
+            }
+        </div>
+    };
+
+    /// <summary>A retention reduction typed but not yet confirmed. Kind is
+    /// "events" | "continuous" | "archive"; Days is what the API will receive.</summary>
+    private (string Kind, int Days, string Message)? _retentionConfirm;
+
+    /// <summary>Blank/invalid input resets to the server default (the API takes negative = clear).
+    /// Shrinking the window opens a confirm card first: retention judges EXISTING
+    /// footage on the next hourly cleanup pass, so 30 → 5 deletes (or archives)
+    /// ~25 days of history within the hour — a decision, never a typo.</summary>
+    private async Task SetRetentionAsync(bool forEvents, string? raw)
+    {
+        if (_recording == null) return;
+        int days = int.TryParse(raw?.Trim(), out var d) && d >= 0 ? d : -1;
+        int oldEff = (forEvents ? _recording.EventRetentionDays : _recording.ContinuousRetentionDays)
+                     ?? (forEvents ? _recording.DefaultEventRetentionDays : _recording.DefaultContinuousRetentionDays);
+        int newEff = days >= 0 ? days
+            : forEvents ? _recording.DefaultEventRetentionDays : _recording.DefaultContinuousRetentionDays;
+        // A reduction = the new window is finite and tighter (0 = forever).
+        if (newEff != 0 && (oldEff == 0 || newEff < oldEff))
+        {
+            bool archived = forEvents ? _recording.ArchiveEvents : _recording.ArchiveContinuous;
+            var fate = archived
+                ? T["moved to the archive"]
+                : T["deleted permanently — this cannot be undone"];
+            var what = forEvents ? T["event clips"] : T["continuous footage"];
+            _retentionConfirm = (forEvents ? "events" : "continuous", days, T.F(
+                "Keep {0} for {1} days instead of {2}?\n\nExisting {0} older than {1} days will be {3} on the next cleanup pass — within the hour.",
+                what, newEff, oldEff == 0 ? T["forever"] : oldEff.ToString(), fate));
+            return;
+        }
+        if (forEvents) await SetRecordingAsync(eventRetentionDays: days);
+        else await SetRecordingAsync(continuousRetentionDays: days);
+    }
+
+    private async Task ConfirmRetentionAsync()
+    {
+        if (_retentionConfirm is not { } rc) return;
+        _retentionConfirm = null;
+        await (rc.Kind switch
+        {
+            "events" => SetRecordingAsync(eventRetentionDays: rc.Days),
+            "continuous" => SetRecordingAsync(continuousRetentionDays: rc.Days),
+            _ => SetRecordingAsync(archiveRetentionDays: rc.Days),
+        });
+    }
+
+    private async Task CancelRetentionAsync()
+    {
+        _retentionConfirm = null;
+        // Snap the input back to what is actually stored.
+        _recording = await GetAsync<ApiRecordingSettings>("recording");
+    }
+
+    private Task ToggleEventTypeAsync(string label)
+    {
+        if (_recording == null) return Task.CompletedTask;
+        // null filter = all types; materialize it before toggling one off.
+        var types = (_recording.EventTypes ?? _recording.KnownTypes ?? new List<string>()).ToList();
+        if (!types.Remove(label)) types.Add(label);
+        return SetRecordingAsync(eventTypes: types);
+    }
+
+    // ------------------------------------------------------------ capture schedule
+
+    private static readonly string[] WeekDayTokens = { "mon", "tue", "wed", "thu", "fri", "sat", "sun" };
+
+    private bool DayEnabled(string day) =>
+        _recording?.ScheduleDays is not { Count: > 0 } days || days.Contains(day);
+
+    private string DayLabel(string day) => T[char.ToUpperInvariant(day[0]) + day[1..]];
+    private string DayName(string day) => day switch
+    {
+        "mon" => T["Mondays"], "tue" => T["Tuesdays"], "wed" => T["Wednesdays"], "thu" => T["Thursdays"],
+        "fri" => T["Fridays"], "sat" => T["Saturdays"], _ => T["Sundays"],
+    };
+
+    private static int MinutesOf(string? hhmm) =>
+        hhmm is { Length: >= 5 }
+        && int.TryParse(hhmm.AsSpan(0, 2), out var h) && int.TryParse(hhmm.AsSpan(3, 2), out var m)
+            ? h * 60 + m
+            : 0;
+
+    private bool HasTimeWindow =>
+        _recording != null && MinutesOf(_recording.ScheduleStart) != MinutesOf(_recording.ScheduleEnd);
+
+    private async Task ToggleScheduleDayAsync(string day)
+    {
+        if (_recording == null) return;
+        var days = _recording.ScheduleDays is { Count: > 0 } d ? d.ToList() : WeekDayTokens.ToList();
+        if (!days.Remove(day)) days.Add(day);
+        if (days.Count == 0)
+        {
+            // No days = capture nothing, which is what the events switch is for.
+            ShowToast(T["At least one day stays selected — to stop capturing entirely, turn off detection events."], error: true);
+            return;
+        }
+        await SetRecordingAsync(scheduleDays: days);
+    }
+
+    /// <summary>Time inputs post only the field that changed (null = leave alone).</summary>
+    private Task SetScheduleTimeAsync(string? start = null, string? end = null) =>
+        SetRecordingAsync(scheduleStart: Hhmm(start), scheduleEnd: Hhmm(end));
+
+    /// <summary>Browsers may report "HH:mm:ss" — the API wants strict HH:mm ("" clears).</summary>
+    private static string? Hhmm(string? raw) =>
+        raw is { Length: > 5 } ? raw[..5] : raw;
+
+    private string ScheduleSummary
+    {
+        get
+        {
+            if (_recording == null) return "";
+            var days = _recording.ScheduleDays;
+            string dayPart;
+            if (days is not { Count: > 0 } || days.Count >= 7)
+                dayPart = T["every day"];
+            else
+            {
+                var ordered = WeekDayTokens.Where(days.Contains).ToList();
+                dayPart = string.Join(", ", ordered) switch
+                {
+                    "mon, tue, wed, thu, fri" => T["on weekdays"],
+                    "sat, sun" => T["at weekends"],
+                    _ => T.F("on {0}", string.Join(", ", ordered.Select(DayLabel))),
+                };
+            }
+            if (!HasTimeWindow) return T.F("Capturing events all day, {0}.", dayPart);
+            int s = MinutesOf(_recording.ScheduleStart), e = MinutesOf(_recording.ScheduleEnd);
+            string from = s == 0 ? T["midnight"] : _recording.ScheduleStart!;
+            string until = e == 0 ? T["midnight"] : _recording.ScheduleEnd!;
+            string wrap = s > e && e != 0 ? " " + T["(overnight)"] : "";
+            return T.F("Capturing events {0}–{1}{2}, {3}. Anything outside is discarded.", from, until, wrap, dayPart);
+        }
+    }
+
+    private async Task RebootAsync()
+    {
+        _confirmReboot = false;
+        if (await PostAsync("reboot", new { }))
+            ShowToast(T["Reboot accepted — the camera will drop offline for a minute."]);
+    }
+
+    // ------------------------------------------------ HTTP-API extras (beta)
+
+    private async Task GoToPresetAsync(int id)
+    {
+        if (_presetBusy) return;
+        _presetBusy = true;
+        try
+        {
+            if (await PostAsync("ptzpreset", new { id }))
+                ShowToast(T["Moving to the preset position."]);
+        }
+        finally
+        {
+            _presetBusy = false;
+        }
+    }
+
+    /// <summary>Saves the current position: an existing preset with the same name is
+    /// overwritten, otherwise the first free slot is used.</summary>
+    private async Task SavePresetAsync()
+    {
+        var name = _newPresetName.Trim();
+        if (name.Length == 0 || _presetBusy || _http?.PtzPresets is not { } presets) return;
+        var slot = presets.FirstOrDefault(p => p.Enabled && string.Equals(p.Name, name, StringComparison.OrdinalIgnoreCase))
+                   ?? presets.FirstOrDefault(p => !p.Enabled);
+        if (slot == null)
+        {
+            ShowToast(T["All preset slots are taken — reuse an existing preset's name to overwrite it."], error: true);
+            return;
+        }
+        _presetBusy = true;
+        try
+        {
+            if (await PostAsync("ptzpreset", new { id = slot.Id, name, save = true }))
+            {
+                _newPresetName = "";
+                ShowToast(T.F("Saved this position as \"{0}\".", name));
+                if (_http != null && await GetAsync<ApiHttpFeatures?>("httpfeatures") is { } freshHttp)
+                    _http = MergeHttp(freshHttp, _http);
+            }
+        }
+        finally
+        {
+            _presetBusy = false;
+        }
+    }
+
+    private async Task PlayQuickReplyAsync()
+    {
+        if (_quickReplyBusy) return;
+        _quickReplyBusy = true;
+        try
+        {
+            if (await PostAsync("quickreply", new { id = _quickReplyId }))
+                ShowToast(T["Playing the quick reply on the camera."]);
+        }
+        finally
+        {
+            _quickReplyBusy = false;
+        }
+    }
+
+    // ------------------------------------------------------------ HTTP helpers
+
+    private HttpRequestMessage NewRequest(HttpMethod method, string path) =>
+        ServerRequest(method, $"api/cameras/{Uri.EscapeDataString(CameraName)}/{path}");
+
+    /// <summary>An authenticated request against the server root (not this camera) —
+    /// the per-user settings endpoints live there.</summary>
+    private HttpRequestMessage ServerRequest(HttpMethod method, string path)
+    {
+        var req = new HttpRequestMessage(method, $"{Server.TrimEnd('/')}/{path}");
+        if (!string.IsNullOrEmpty(Token))
+        {
+            req.Headers.Authorization = new AuthenticationHeaderValue("Bearer", Token);
+        }
+        else if (!string.IsNullOrEmpty(User))
+        {
+            var token = Convert.ToBase64String(System.Text.Encoding.UTF8.GetBytes($"{User}:{Pass}"));
+            req.Headers.Authorization = new AuthenticationHeaderValue("Basic", token);
+        }
+        return req;
+    }
+
+    private async Task<TValue?> GetAsync<TValue>(string path)
+    {
+        try
+        {
+            // The shared client's timeout is only a cap; panel reads get 30s —
+            // room for a slow camera sweep (the server bounds those tighter),
+            // while a genuinely stuck server still fails within the panel's
+            // attention span.
+            using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+            using var res = await Http.SendAsync(NewRequest(HttpMethod.Get, path), cts.Token);
+            if (!res.IsSuccessStatusCode) return default;
+            return await res.Content.ReadFromJsonAsync<TValue>(cancellationToken: cts.Token);
+        }
+        catch (OperationCanceledException)
+        {
+            _error = T["The camera is taking too long to answer — it may be busy or slow to respond. Close and reopen this panel to retry."];
+            return default;
+        }
+        catch (Exception ex)
+        {
+            _error = T.F("Cannot reach {0}: {1}", Server, ex.Message);
+            return default;
+        }
+    }
+
+    /// <summary>The "storage" a successful POST reported, when it reported one —
+    /// the zone save is the only caller that cares. Read from the response rather
+    /// than assumed, so the toast says what actually happened.</summary>
+    private string? _lastPostStorage;
+    /// <summary>The HTTP status of the last POST that failed (0 when it never got
+    /// an answer), for the one caller that treats a status differently.</summary>
+    private int _lastPostStatus;
+
+    private static async Task<string?> ReadStorageAsync(HttpResponseMessage res)
+    {
+        try
+        {
+            var doc = await res.Content.ReadFromJsonAsync<JsonElement>();
+            return doc.ValueKind == JsonValueKind.Object
+                   && doc.TryGetProperty("storage", out var s) && s.ValueKind == JsonValueKind.String
+                ? s.GetString() : null;
+        }
+        catch { return null; }
+    }
+
+    private async Task<bool> PostAsync(string path, object body, CancellationToken ct = default)
+    {
+        _toast = null;
+        _lastPostStorage = null;
+        _lastPostStatus = 0;
+        try
+        {
+            var req = NewRequest(HttpMethod.Post, path);
+            req.Content = JsonContent.Create(body);
+            using var cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            cts.CancelAfter(TimeSpan.FromSeconds(30));
+            using var res = await Http.SendAsync(req, cts.Token);
+            if (res.IsSuccessStatusCode)
+            {
+                _error = null;
+                _lastPostStorage = await ReadStorageAsync(res);
+                return true;
+            }
+            _lastPostStatus = (int)res.StatusCode;
+            ShowToast(res.StatusCode == System.Net.HttpStatusCode.Unauthorized
+                ? T["Not authorized — set your credentials under server settings (⚙)."]
+                : await ReadErrorAsync(res) ?? T.F("Request failed ({0})", (int)res.StatusCode), error: true);
+            return false;
+        }
+        catch (OperationCanceledException)
+        {
+            ShowToast(T["Timed out waiting for the camera to confirm — it may be slow or offline. Check its state and try again."], error: true);
+            return false;
+        }
+        catch (Exception ex)
+        {
+            ShowToast(T.F("Cannot reach {0}: {1}", Server, ex.Message), error: true);
+            return false;
+        }
+    }
+
+    private static async Task<string?> ReadErrorAsync(HttpResponseMessage res)
+    {
+        try
+        {
+            var el = await res.Content.ReadFromJsonAsync<JsonElement>();
+            return el.TryGetProperty("error", out var err) ? err.GetString() : null;
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    // ------------------------------------------------------------ JSON helpers
+
+    private static string? Str(JsonElement? el, string name) =>
+        el is { ValueKind: JsonValueKind.Object } obj && obj.TryGetProperty(name, out var v)
+            ? v.ValueKind switch
+            {
+                JsonValueKind.String => v.GetString(),
+                JsonValueKind.Number => v.GetRawText(),
+                _ => null,
+            }
+            : null;
+
+    private static long? Num(JsonElement? el, string name) =>
+        el is { ValueKind: JsonValueKind.Object } obj
+        && obj.TryGetProperty(name, out var v)
+        && v.ValueKind == JsonValueKind.Number
+            ? v.GetInt64()
+            : null;
+}

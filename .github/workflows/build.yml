@@ -1,0 +1,26 @@
+name: Build
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-dotnet@v6
+        with:
+          dotnet-version: '10.0.x'
+      - name: Build .NET projects
+        run: dotnet build src/Neolink.Server/Neolink.Server.csproj --configuration Release
+      - name: Run upstream self-tests
+        run: dotnet run --project src/Neolink.Server/Neolink.Server.csproj --configuration Release --no-build -- selftest
+      - name: Run Protect contract tests
+        run: dotnet run --project tests/Neolink.ProtectTests/Neolink.ProtectTests.csproj --configuration Release
+      - name: Build container
+        run: docker build --tag reolink-bridge:ci .

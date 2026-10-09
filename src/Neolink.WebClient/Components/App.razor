@@ -1,0 +1,123 @@
+@using Neolink.WebClient.Localization
+<!DOCTYPE html>
+<html lang="@InitialLang">
+
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Neolink.NET</title>
+    <base href="@BaseHref" />
+    @* ?v= cache-buster: without it, phones especially would serve a STALE cached
+       stylesheet/script long after a server update (heuristic caching skips
+       revalidation) — seen live as the settings dialog rendering with layout
+       bugs fixed releases ago. The version changes every release/beta, so each
+       update fetches fresh assets exactly once. *@
+    <link rel="stylesheet" href="_content/Neolink.WebClient/css/app.css?v=@AssetVersion" />
+    @* App icon: SVG for modern browsers, PNG for Safari/iOS and the home-screen
+       shortcut. Relative hrefs resolve against <base href="/"> so they work on
+       every route (like the stylesheet above). *@
+    <link rel="icon" type="image/svg+xml" href="_content/Neolink.WebClient/favicon.svg" />
+    <link rel="icon" type="image/png" sizes="256x256" href="_content/Neolink.WebClient/favicon.png" />
+    <link rel="apple-touch-icon" href="_content/Neolink.WebClient/favicon.png" />
+    @* PWA: lets browsers install the app as its own window (Chrome/Edge "Install
+       app", Safari "Add to Dock"/home screen). The UI stays server-rendered —
+       the installed app is the same live client in a standalone window. *@
+    <link rel="manifest" href="_content/Neolink.WebClient/manifest.webmanifest" />
+    <meta name="theme-color" content="#0b0d12" />
+    <HeadOutlet @rendermode="InteractiveServer" />
+</head>
+
+<body>
+    <Routes @rendermode="InteractiveServer" Language="@InitialLang" />
+
+    @* Custom reconnect overlay: when this element exists, Blazor toggles its
+       state classes (components-reconnect-show/failed/rejected) here instead
+       of injecting its unthemed white default dialog. *@
+    <div id="components-reconnect-modal" class="reconnect-modal">
+        <div class="reconnect-box">
+            <div class="reconnect-spinner" aria-hidden="true"></div>
+            <div class="reconnect-when-show">
+                <div class="reconnect-title">@L("Connection lost")</div>
+                <div class="reconnect-sub">
+                    @L("Reconnecting to the server…")
+                    <span class="reconnect-attempts">(@L("attempt")
+                        <span id="components-reconnect-current-attempt"></span> @L("of")
+                        <span id="components-reconnect-max-retries"></span>)</span>
+                </div>
+            </div>
+            <div class="reconnect-when-failed">
+                <div class="reconnect-title">@L("Server unreachable")</div>
+                <div class="reconnect-sub">@L("The connection could not be re-established.")</div>
+                <button class="chip chip-active" onclick="(window.Blazor &amp;&amp; Blazor.reconnect) ? Blazor.reconnect() : location.reload()">@L("Try again")</button>
+                <button class="chip" onclick="location.reload()">@L("Reload page")</button>
+            </div>
+            <div class="reconnect-when-rejected">
+                <div class="reconnect-title">@L("Reload needed")</div>
+                <div class="reconnect-sub">@L("The connection was away too long or the server restarted. Reloading signs you right back in.")</div>
+                <button class="chip chip-active" onclick="location.reload()">@L("Reload page")</button>
+            </div>
+        </div>
+    </div>
+
+    <script src="_framework/blazor.web.js"></script>
+    <script src="_content/Neolink.WebClient/js/neolink.js?v=@AssetVersion"></script>
+</body>
+
+</html>
+
+@code {
+    [Inject] public ServerLanguage ServerLang { get; set; } = default!;
+
+    // This page is rendered STATICALLY, before any circuit exists, so it cannot
+    // use the scoped Translator — it resolves the language itself and looks
+    // strings up directly. It matters for the reconnect overlay above: that
+    // markup is what a user sees when the circuit is gone, so it is the one part
+    // of the UI that can never be re-rendered into their language later.
+    private string L(string text) => Translations.Get(InitialLang, text);
+
+    /// <summary>The language this page paints in, and the one the circuit adopts.
+    /// The cookie is the user's own choice (written the moment they pick one);
+    /// absent it, the server default applies — which is what a first visit, the
+    /// sign-in screen and a fresh browser all get.</summary>
+    private string InitialLang
+    {
+        get
+        {
+            var cookie = HttpContext?.Request.Cookies[Translator.CookieName];
+            return Lang.IsSupported(cookie) ? Lang.Normalize(cookie) : ServerLang.Code;
+        }
+    }
+
+    // The entry assembly's informational version (e.g. "0.9.8" or "0.9.8-beta.3")
+    // — the same value -p:Version stamps at release/beta build time, so asset
+    // URLs change exactly when the shipped assets can have.
+    private static readonly string AssetVersion = Uri.EscapeDataString(
+        System.Reflection.Assembly.GetEntryAssembly()
+            ?.GetCustomAttributes(typeof(System.Reflection.AssemblyInformationalVersionAttribute), false)
+            .OfType<System.Reflection.AssemblyInformationalVersionAttribute>()
+            .FirstOrDefault()?.InformationalVersion ?? "0");
+
+    // A reverse proxy that serves the UI under a path prefix (notably Home Assistant
+    // ingress, which puts a per-session token in the path) sends that prefix in
+    // X-Ingress-Path. The <base href> must carry it so every relative asset, the
+    // Blazor SignalR endpoint and the API calls resolve inside the proxied scope.
+    // Absent the header we serve from the root, unchanged.
+    [CascadingParameter] public Microsoft.AspNetCore.Http.HttpContext? HttpContext { get; set; }
+
+    private string BaseHref
+    {
+        get
+        {
+            var prefix = HttpContext?.Request.Headers["X-Ingress-Path"].ToString();
+            // Only trust a plain absolute path (HA ingress sends /api/hassio_ingress/<token>).
+            // Reject anything that could retarget <base> to another origin — a
+            // protocol-relative //host, a scheme (contains ':'), or CR/LF — and fall
+            // back to the root, so a spoofed header on a directly-exposed instance
+            // can't hijack where the browser loads assets and the API from.
+            if (string.IsNullOrEmpty(prefix) || prefix[0] != '/' || prefix.StartsWith("//")
+                || prefix.Contains(':') || prefix.Contains('\r') || prefix.Contains('\n'))
+                return "/";
+            return $"{prefix.TrimEnd('/')}/";
+        }
+    }
+}

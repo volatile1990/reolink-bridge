@@ -1,0 +1,50 @@
+# One virtual camera per container/IP. All addresses here are examples.
+services:
+  camera-bridge:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: reolink-bridge:pilot
+    restart: "no"
+    init: true
+    user: "${BRIDGE_UID:-1654}:${BRIDGE_GID:-1654}"
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,noexec,size=64m,mode=1777
+    volumes:
+      - type: bind
+        source: ./secrets/bridge-config.json
+        target: /run/secrets/bridge-config.json
+        read_only: true
+        bind:
+          create_host_path: false
+    networks:
+      camera_vlan:
+        ipv4_address: ${BRIDGE_IP:-10.30.0.113}
+    mac_address: ${BRIDGE_MAC:-02:42:0a:1e:00:71}
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "--max-time", "5", "http://127.0.0.1:8080/health"]
+      interval: 30s
+      timeout: 6s
+      retries: 3
+      start_period: 90s
+    logging:
+      driver: json-file
+      options:
+        max-size: "5m"
+        max-file: "2"
+    stop_grace_period: 20s
+
+networks:
+  camera_vlan:
+    driver: macvlan
+    driver_opts:
+      parent: ${BRIDGE_PARENT:?Set BRIDGE_PARENT to the NAS interface connected to the camera VLAN}
+    ipam:
+      config:
+        - subnet: ${CAMERA_SUBNET:-10.30.0.0/24}
+          gateway: ${CAMERA_GATEWAY:-10.30.0.1}

@@ -1,0 +1,4718 @@
+﻿// Copyright (c) 2026 Oluwabori Olaleye
+// Licensed under the GNU Affero General Public License v3.0; see the LICENSE file
+// in the repository root.
+using System.Net.WebSockets;
+using System.Text;
+using System.Text.Json;
+using System.Text.Json.Nodes;
+using System.Xml.Linq;
+using Microsoft.AspNetCore.Builder;
+using Microsoft.AspNetCore.Hosting;
+using Microsoft.AspNetCore.Http;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Logging;
+using Neolink.Config;
+using Neolink.Media;
+using Neolink.Protocol;
+using Neolink.Recording;
+using Neolink.Streaming;
+
+namespace Neolink.Web;
+
+/// <summary>One camera stream as exposed over the web API.</summary>
+public sealed record WebStreamInfo(string Kind, string Path, IStreamHub Hub);
+/// <param name="ContinuousActive">Probe: is 24/7 footage being written right now? Null when the camera has no continuous recorder.</param>
+/// <param name="SupportsEvents">Whether this camera can produce detections at all. A
+/// Baichuan camera always can; a non-Reolink one can when its ONVIF event service
+/// answers, which is only known once it has — see <see cref="WebCameraInfo.EventsProbe"/>.</param>
+/// <param name="Battery">Latest battery reading, or null (mains-powered / generic RTSP / unknown yet).</param>
+/// <param name="WifiSignal">Latest Wi-Fi RSSI pushed over Baichuan (dBm), or null — the only Wi-Fi source on cameras without the HTTP API.</param>
+/// <param name="NetType">Link type the camera last announced over Baichuan ("wifi", "ethernet"), or null.</param>
+/// <param name="Asleep">Probe: is the camera intentionally disconnected so it can sleep (battery doze)?</param>
+/// <param name="SirenOn">Latest siren state the camera pushed, or null (no push yet / unsupported).</param>
+/// <param name="PrivacyOn">Latest privacy-mode state the camera pushed, or null (no push yet / unsupported).</param>
+/// <param name="Suspended">Probe: has the user suspended this camera in Neolink (no connection held)?</param>
+/// <param name="SetSuspended">Suspends/resumes the camera at runtime and persists it; null when unsupported.</param>
+/// <param name="ActiveSegment">Probe: the continuous segment being written right now (day, file, media seconds) — the recorder's in-memory truth for the day listing.</param>
+/// <param name="ContinuousEnabled">Probe: is 24/7 recording EFFECTIVELY on for this camera (the persisted setting minus the battery-sleep veto, not whether a segment is open right now)? Null when the camera has no continuous recorder.</param>
+/// <param name="SetContinuousEnabled">Turns 24/7 recording on/off at runtime and persists it (same setting as the web UI toggle); refuses ON for a battery camera that is allowed to sleep. Null when unsupported.</param>
+public sealed record WebCameraInfo(string Name, List<WebStreamInfo> Streams, ICameraControl Control,
+    HashSet<string>? PermittedUsers, Func<bool>? ContinuousActive = null, bool SupportsEvents = true,
+    Func<BatteryPush?>? Battery = null, Func<int?>? WifiSignal = null, Func<string?>? NetType = null,
+    Func<bool>? Asleep = null,
+    Func<bool?>? SirenOn = null, Func<bool?>? PrivacyOn = null,
+    Func<bool>? Suspended = null, Action<bool>? SetSuspended = null,
+    Func<(string Date, string File, double Seconds)?>? ActiveSegment = null,
+    Func<bool>? ContinuousEnabled = null, Action<bool>? SetContinuousEnabled = null)
+{
+    /// <summary>The camera's event recorder when server-side event recording runs —
+    /// the shared entry point for on-demand clips (web UI button and HA switch).</summary>
+    public EventRecorder? EventRecorder { get; set; }
+
+    /// <summary>Live answer to "can this camera produce detections?", for cameras
+    /// where it is not knowable up front: a non-Reolink camera's ONVIF event service
+    /// has to be asked, and the answer arrives a few seconds after start-up. Null =
+    /// <see cref="SupportsEvents"/> is the whole truth.</summary>
+    public Func<bool>? EventsProbe { get; init; }
+
+    /// <summary>Whether detections are possible here, asking the probe when there is
+    /// one. Everything that decides which entities or controls a camera gets should
+    /// use this rather than the constructor flag.</summary>
+    public bool EventsAvailableNow => EventsProbe?.Invoke() ?? SupportsEvents;
+
+    /// <summary>The configured network address (host, or host:port when non-default) —
+    /// shown on the camera-settings identity strip. Null for generic RTSP cameras
+    /// (their address lives in the stream URL) or when unknown.</summary>
+    public string? Address { get; init; }
+
+    /// <summary>Baichuan-over-UDP transport (beta): UDP-only battery models
+    /// (Argus family). Surfaced so the UI can badge these cameras as beta.</summary>
+    public bool Udp { get; init; }
+
+    /// <summary>Feeds an external wake hint to this camera's wake-capture scan (the
+    /// generic entry for POST /api/cameras/{name}/wake-hint — Home Assistant, a
+    /// router webhook, any external motion source). No-op unless the camera is a
+    /// parked wake-capture battery camera; see CameraService.NotifyWakeHint.</summary>
+    public Action<string>? WakeHint { get; init; }
+
+    /// <summary>Holds a dozing battery camera awake (emergency mode), or lets it
+    /// doze again. Null when the camera has no sleep policy to override.</summary>
+    public Action<bool>? SetHoldAwake { get; init; }
+
+    /// <summary>True for a battery camera Neolink lets doze (no always_on). The web
+    /// UI treats these tiles differently: watching one costs the camera charge, so
+    /// it marks them, bounds how long a tile streams, and offers a keep-awake
+    /// override. Null/false = stream it around the clock, as before.</summary>
+    public Func<bool>? SleepFriendly { get; init; }
+}
+
+/// <summary>Everything the web API needs from the host.</summary>
+public sealed class WebApiOptions
+{
+    public required string BindAddr { get; init; }
+    public required int Port { get; init; }
+    public required bool WebUi { get; init; }
+    public required IReadOnlyList<WebCameraInfo> Cameras { get; init; }
+    public required IReadOnlyDictionary<string, string> Users { get; init; }
+    public required int RtspPort { get; init; }
+    public EventStore? Events { get; init; }
+    public RecordingSettings? RecordingSettings { get; init; }
+    /// <summary>Recording defaults (retention etc.) reported to the UI; null when recording is off.</summary>
+    public RecordingConfig? Recording { get; init; }
+    /// <summary>An archive storage tier is configured, so per-camera archiving can be offered.</summary>
+    public bool ArchiveAvailable { get; init; }
+    /// <summary>Configured storage tiers and their capacity (feeds the monitor and the full-storage banners).</summary>
+    public StorageLocations? Storage { get; init; }
+    /// <summary>Free-space trend per location — the "~N days until full" forecast on the monitor.</summary>
+    public StorageForecast? Forecast { get; init; }
+    /// <summary>The server secret (key source/fingerprint reporting for admins).</summary>
+    public Neolink.Notifications.SecretProtector? Secrets { get; init; }
+    public required UserStore UserStore { get; init; }
+    public bool ResetAdminPassword { get; init; }
+    public double TrickleSpeed { get; init; } = 4;
+    /// <summary>Beta: two-way talk (browser mic → camera speaker). Off unless ui.talk enables it.</summary>
+    public bool TalkEnabled { get; init; }
+    /// <summary>Show the admin background-process strip in the web UI (ui.show_background_tasks).</summary>
+    public bool ShowBackgroundTasks { get; init; } = true;
+    /// <summary>ui.language from the config file — the SEED for the default UI
+    /// language on a server whose state has none yet (a fresh provisioned deploy).
+    /// Once anyone picks a language in the UI, the stored choice wins.</summary>
+    public string? ConfigLanguage { get; init; }
+    public required string Version { get; init; }
+    public required string ConfigPath { get; init; }
+    /// <summary>--demo: a public throwaway showroom. Suppresses the "secure this
+    /// server" first-run prompt — inviting every visitor to set an admin password
+    /// on a shared demo would be a trap, not security.</summary>
+    public bool Demo { get; init; }
+    public UpdateChecker? Updates { get; init; }
+    /// <summary>Process/disk resource sampler feeding the UI's monitor page.</summary>
+    public SystemMonitor? Monitor { get; init; }
+    /// <summary>Live viewers (RTSP and web), listed for admins on the monitor page.</summary>
+    public ViewerRegistry Viewers { get; init; } = new();
+    /// <summary>Recent recording write-failure tracker — surfaced in /api/features
+    /// so the dashboard's browser alerts can fire on it.</summary>
+    public Neolink.Recording.RecordingHealth? RecordingHealth { get; init; }
+    /// <summary>Email-notification service (config store + test send); admin only.</summary>
+    public Neolink.Notifications.Notifier? Notifier { get; init; }
+    /// <summary>AI event descriptions: the global settings store (admin only).
+    /// Its Enabled switch also gates the per-camera opt-in.</summary>
+    public Neolink.Ai.AiStore? Ai { get; init; }
+    /// <summary>Emergency mode (beta); null when the feature is not wired.</summary>
+    public Neolink.Notifications.EmergencyMode? Emergency { get; init; }
+    /// <summary>Live object boxes (preview): the settings store and the files the
+    /// browser's detector loads. Null when the feature is not wired.</summary>
+    public (Neolink.Detect.DetectStore Store, Neolink.Detect.DetectAssets Assets)? Detect { get; init; }
+    /// <summary>Is this event's AI description queued or in flight right now?
+    /// (AiDescriber.IsPending — lets the UI say "describing…" instead of nothing.)</summary>
+    public Func<string, bool>? AiPending { get; init; }
+    /// <summary>Captured server log lines for the UI's live log stream (admin only).</summary>
+    public LogBuffer? Logs { get; init; }
+    /// <summary>Gracefully stops the process; the supervisor (docker/systemd) restarts it.</summary>
+    public required Action RestartRequested { get; init; }
+    /// <summary>Invoked (fire-and-forget) with a camera name after a web-UI/API change
+    /// to one of its settings, so the Home Assistant bridge can re-publish that
+    /// camera's state at once instead of waiting for its periodic refresh. Null when
+    /// MQTT isn't configured.</summary>
+    public Func<string, Task>? OnCameraChanged { get; init; }
+    /// <summary>Per-camera persisted runtime state: suspend, plus the cached
+    /// detection-capability signals that let the settings dialog filter its
+    /// event-type chips before the live probe answers. Null in tests.</summary>
+    public CameraStateStore? CameraState { get; init; }
+}
+
+/// <summary>
+/// HTTP/WebSocket API for web clients, optionally serving the Blazor web UI:
+///   GET /api/cameras                        — JSON list of cameras and their streams
+///   WS  /api/stream?path=...                — live fMP4 video (MSE-compatible)
+///   GET /api/cameras/{name}/capabilities    — discovered device info + feature flags
+///   GET /api/cameras/{name}/streaminfo      — encode profiles (resolution/fps/bitrate tables)
+///   GET/POST/PUT .../settings/stream        — current encode selection / change it (needs http_address, or ONVIF)
+///   GET/POST .../led /pir /zoomfocus /floodlight /siren /privacy /whiteled;
+///   POST .../ptz /reboot; GET .../battery   — camera control
+///   GET .../httpfeatures — combined HTTP-API extras (picture/volume/Wi-Fi/presets/
+///   quick replies/auto-track/SD); POST .../image /volume /ptzpreset /quickreply /autotrack
+///   GET/POST .../detectionzone[?type=]      — the camera's watched/ignored cell grid
+///   GET /api/cameras/{name}/snapshot.jpg     — a current still (server-cached; ?maxAge= seconds)
+///   GET /api/events[?camera=&amp;reviewed=&amp;limit=] — recorded detection events (when enabled)
+///   GET /api/events/{id}[/clip /thumb /preview] — one event / its artifacts; POST .../review to (un)dismiss
+///   (footage URLs — snapshot + event clip/thumb/preview — also take RTSP Basic credentials)
+///   POST /api/events/delete {ids[],estimate} — bulk delete events + files (admin; ?estimate summarizes)
+///   GET/POST /api/cameras/{name}/recording  — per-camera recording switches + event-type filter
+///   POST /api/cameras/{name}/record         — start/stop an on-demand clip (one clip, auto-capped)
+///   POST /api/cameras/{name}/wake-hint      — external "the camera is up for an event" signal (battery cams)
+///   GET /api/recordings/{camera}[/{date}[/{file}]] — browse/play continuous footage
+///   GET .../{date}/export?from=&to=[&format=mp4][&estimate=1] — a range (≤ one day) as one MP4 or a zip
+///   /api/auth/* (status/setup/login/reset-admin), /api/users (admin CRUD),
+///   GET/PUT /api/me/settings[/{page}] — web-UI accounts; once any account exists, every
+///   other /api route requires a Bearer session token (or ?token= where headers
+///   can't go: media elements and the stream WebSocket)
+///   /                                       — web UI (when enabled in the config)
+/// Mutating endpoints require HTTP Basic auth when users are configured (same
+/// credentials and per-camera permissions as RTSP).
+/// </summary>
+public static class WebApi
+{
+    private sealed record LedRequest(string? State, string? LightState,
+        string? DoorbellLightState, int? IrBrightness);
+    private sealed record PirRequest(bool? Enabled);
+    private sealed record PtzRequest(string? Command, float? Speed);
+    private sealed record ZoomFocusRequest(uint? Zoom, uint? Focus);
+    private sealed record FloodlightRequest(int? Brightness, bool? Auto);
+    private sealed record WhiteLedRequest(int? Brightness, bool? On, int? Mode);
+    private sealed record ImageRequest(int? Bright, int? Contrast, int? Saturation, int? Hue, int? Sharpen,
+        string? DayNight, string? AntiFlicker, bool? Flip, bool? Mirror);
+    private sealed record VolumeRequest(int? Volume);
+
+    private sealed record AudioRequest(bool? RecordAudio, int? TalkVolume, int? VisitorVolume);
+    private sealed record PtzPresetRequest(int? Id, string? Name, bool? Save);
+    private sealed record QuickReplyRequest(int? Id);
+    private sealed record AutoReplyRequest(int? FileId, int? Timeout);
+    /// <summary>Camera add/edit. Password is WRITE-ONLY: null keeps the stored one,
+    /// "" clears it, a value sets it. RTSP URLs sent back masked ("****") mean keep.</summary>
+    /// <summary>AlwaysOn is a STRING tri-state ("auto"|"true"|"false") because the
+    /// config key is itself tri-state: absent = auto (battery cams sleep, the rest
+    /// stay on). A bool? could not tell "auto" apart from "leave unchanged".</summary>
+    private sealed record AdminCameraRequest(string? OriginalName, string? Name, string? Type,
+        string? Address, string? Username, string? Password, int? ChannelId, string? HttpAddress,
+        string? RtspMain, string? RtspSub,
+        string? Uid, string? AlwaysOn, string? Stream, string? OnvifAddress,
+        bool? Record, bool? Udp, bool? UdpProbe, bool? WakeCapture, double? KeepAliveHours,
+        string? PtzMode = null, int? PtzPort = null);
+    /// <summary>Uid/Udp matter here as much as they do on save: a UDP-only battery
+    /// camera never listens on TCP, so testing it the TCP way always times out.
+    /// OnvifAddress rides along so a generic camera's test can also say whether its
+    /// settings will be reachable, before the entry is saved.</summary>
+    private sealed record AdminCameraTestRequest(string? Name, string? Type, string? Address,
+        string? Username, string? Password, int? ChannelId, string? RtspMain, string? RtspSub,
+        string? Uid, bool? Udp, string? OnvifAddress = null);
+    private sealed record AutoTrackRequest(bool? On);
+    private sealed record MdSensitivityRequest(int? Sensitivity);
+    private sealed record AiSensitivityRequest(string? Type, int? Sensitivity);
+    /// <summary>Cols/Rows are only read for a zone Neolink keeps itself, where the
+    /// editor that drew the grid is the authority on its shape. A zone on the camera
+    /// takes its dimensions from the camera and ignores them.</summary>
+    private sealed record DetectionZoneRequest(string? Type, string? Table, int? Cols = null, int? Rows = null,
+        string? Storage = null);
+    private sealed record HdrRequest(int? Value);
+    private sealed record OsdRequest(bool? ShowName, string? NamePos, bool? ShowTime, string? TimePos, bool? Watermark);
+    private sealed record SirenRequest(bool? On);
+    private sealed record PrivacyRequest(bool? On);
+    private sealed record SuspendRequest(bool? Suspended);
+    private sealed record RecordOnDemandRequest(bool Active);
+    /// <summary>Timeline bookmark: a named [From, To] range (seconds of day) on one date.</summary>
+    private sealed record BookmarkRequest(string? Date, double? From, double? To, string? Name);
+    private sealed record StreamSettingsRequest(string? Stream, uint? Width, uint? Height,
+        uint? Framerate, uint? Bitrate);
+    private sealed record ReviewRequest(bool? Reviewed);
+    private sealed record EventDeleteRequest(List<string>? Ids, bool? Estimate);
+    /// <summary>Notification settings update. Password is WRITE-ONLY: null keeps the
+    /// stored one, "" clears it, a value sets it. It is never returned by GET.</summary>
+    private sealed record NotificationRequest(bool? Enabled, string? Recipient,
+        string? SmtpHost, int? SmtpPort, string? Security, string? Username, string? Password,
+        string? From, string? FromName,
+        bool? AlertStorage, bool? AlertOverload, bool? AlertCameraOffline, bool? AlertWriteFailure,
+        int? OfflineThresholdMinutes, Dictionary<string, int>? CameraOfflineOverrides,
+        int? EventSnapshots = null, int? EventCooldownMinutes = null,
+        int? EventEmailDelaySeconds = null,
+        bool? WebhookEnabled = null, string? WebhookUrl = null, bool? WebhookInsecureTls = null,
+        string? WebhookToken = null, string? WebhookMethod = null,
+        string? WebhookBodyMode = null, string? WebhookBodyTemplate = null,
+        List<string>? WebhookHeaders = null, string? WebhookPreset = null,
+        bool? WebhookServerAlerts = null, string? PublicUrl = null,
+        string? EventSnapshotMode = null,
+        bool? OfflineAttachSnapshots = null, int? OfflineSnapshotCount = null,
+        int? OfflineSnapshotLookbackMinutes = null);
+    private sealed record EmergencyCameraRequest(bool? Email, bool? Webhook, bool? Siren, bool? Lights);
+    /// <summary>Emergency mode: null = unchanged. A camera entry with every field
+    /// null still counts as an entry, so clearing an override sends the camera key
+    /// with nulls or omits the whole map.</summary>
+    private sealed record EmergencyRequest(bool? Enabled, bool? Email, bool? Webhook,
+        bool? Siren, bool? Lights, Dictionary<string, EmergencyCameraRequest>? Cameras);
+    /// <summary>Live object boxes: null = unchanged. Groups is set whenever present,
+    /// so an empty list means "back to the default set".</summary>
+    private sealed record DetectRequest(bool? Enabled, int? MinConfidence, int? Fps, List<string>? Groups,
+        bool? Detailed = null);
+    /// <summary>Retention fields: null = unchanged, negative = back to the server default, 0 = keep forever.
+    /// RecordStream: null = unchanged, "" = back to the server default, else a served stream kind.
+    /// Capture schedule: applied only while ScheduleEnabled; ScheduleDays null = unchanged,
+    /// empty or all seven = every day; ScheduleStart/ScheduleEnd null = unchanged,
+    /// "" = midnight (both cleared = all day).</summary>
+    private sealed record RecordingSettingsRequest(bool? Events, bool? Continuous, List<string>? EventTypes,
+        int? EventRetentionDays = null, int? ContinuousRetentionDays = null, string? RecordStream = null,
+        List<string>? ScheduleDays = null, string? ScheduleStart = null, string? ScheduleEnd = null,
+        bool? ScheduleEnabled = null,
+        bool? ArchiveEvents = null, bool? ArchiveContinuous = null, int? ArchiveRetentionDays = null,
+        bool? WakeTimeline = null, bool? AiDescribe = null, string? AiContext = null,
+        bool? EmailEvents = null, bool? WebhookEvents = null);
+    /// <summary>AI-description settings update. ApiKey is WRITE-ONLY: null keeps the
+    /// stored one, "" clears it, a value sets it. It is never returned by GET.</summary>
+    private sealed record AiSettingsRequest(bool? Enabled, string? Provider,
+        string? Endpoint, string? Model, string? ApiKey,
+        string? OllamaEndpoint, string? OllamaModel,
+        string? AnthropicEndpoint, string? AnthropicModel, string? AnthropicApiKey,
+        string? Prompt, bool? NoThink, int? MaxFrames, int? TimeoutSeconds,
+        int? SampleEverySeconds = null);
+    private sealed record CredentialsRequest(string? Username, string? Password, string? Language = null);
+    private sealed record LanguageRequest(string? Language);
+    /// <summary>Partial like the AI request: null fields keep their stored value.</summary>
+    private sealed record SecuritySettingsRequest(bool? Enabled, int? MaxAttempts, int? LockMinutes);
+
+    /// <summary>
+    /// Serves a recording segment or event clip. Old-format (fragmented) files —
+    /// pre-upgrade archives and the segment currently being recorded — are
+    /// presented through <see cref="VirtualMp4"/> with a classic seek index
+    /// synthesized in memory, so jumping around them costs a couple of range
+    /// requests instead of a crawl over thousands of per-frame fragment headers.
+    /// Files that don't parse as our own fragmented shape fall back to plain
+    /// file serving, the pre-existing behavior.
+    /// </summary>
+    /// <summary>Event artifacts never change once the event has closed, so the
+    /// browser may cache them hard — without this every events-page visit
+    /// re-downloads every visible thumbnail (brutal on NAS-backed storage).</summary>
+    private static void SetArtifactCaching(HttpContext ctx, Neolink.Recording.EventRecord? rec)
+    {
+        // An ongoing event's artifacts change constantly under a constant URL
+        // (v=live) — never let a browser cache a partial clip against it.
+        ctx.Response.Headers.CacheControl = rec is { Ongoing: false }
+            ? "private, max-age=31536000, immutable"
+            : "no-store";
+    }
+
+    private static IResult ServeMp4(HttpContext ctx, string path, string? downloadName = null)
+    {
+        // Home Assistant's ingress proxy mishandles ranged media (field report:
+        // finished clips decode-fail mid-play through ingress while the same
+        // bytes download and play everywhere) — so behind ingress a clip is one
+        // plain 200 stream the proxy cannot mis-stitch. Direct port, Docker and
+        // reverse-proxy access keep full range support.
+        bool ingress = ctx.Request.Headers.ContainsKey("X-Ingress-Path");
+        try
+        {
+            var stream = VirtualMp4.Open(path, out var snapLen, out var snapTime, out var growing);
+            // A still-growing file gets the same one-plain-200 treatment as
+            // ingress: Chrome resumes a ranged stream with If-Range long after
+            // any snapshot of a growing file has rolled, and a mismatched
+            // resume is a FATAL media error, not a clean restart. One
+            // connection, one representation, nothing to mismatch.
+            bool ranges = !ingress && !growing;
+            if (!ranges)
+                ctx.Response.Headers.AcceptRanges = "none";
+            return Results.Stream(stream, "video/mp4",
+                fileDownloadName: downloadName, lastModified: snapTime,
+                entityTag: new Microsoft.Net.Http.Headers.EntityTagHeaderValue(
+                    $"\"{snapLen:x}-{snapTime.Ticks:x}\""),
+                enableRangeProcessing: ranges);
+        }
+        catch (Exception ex)
+        {
+            Log.Debug($"Recordings: no virtual index for {Path.GetFileName(path)} ({Log.Flatten(ex)}); serving raw");
+            Microsoft.Net.Http.Headers.EntityTagHeaderValue? etag = null;
+            DateTimeOffset? mtime = null;
+            try
+            {
+                var info = new FileInfo(path);
+                etag = new Microsoft.Net.Http.Headers.EntityTagHeaderValue(
+                    $"\"{info.Length:x}-{info.LastWriteTimeUtc.Ticks:x}\"");
+                mtime = info.LastWriteTimeUtc;
+            }
+            catch { }
+            if (ingress)
+                ctx.Response.Headers.AcceptRanges = "none";
+            // Still through the vault: an encrypted file must decrypt on this
+            // fallback path too (a plaintext file comes back as a raw FileStream).
+            return Results.Stream(FootageVault.OpenRead(path), "video/mp4",
+                fileDownloadName: downloadName, lastModified: mtime, entityTag: etag,
+                enableRangeProcessing: !ingress);
+        }
+    }
+    private sealed record PasswordRequest(string? Password);
+    private sealed record AdminUiSettings(double? TrickleSpeed, string? StateDir, bool? ResetAdminPassword,
+        bool? Talk = null, bool? ShowBackgroundTasks = null);
+    private sealed record AdminRecordingSettings(string? Path, int? RetentionDays, int? PreSeconds,
+        int? PostSeconds, int? MaxClipSeconds, string? Stream, int? SegmentMinutes, int? ContinuousRetentionDays,
+        bool? Encrypt = null, string? ClipsPath = null, string? ArchivePath = null, int? MaxSegmentSizeMb = null);
+    /// <summary>Password is write-only: null keeps the stored one, a value sets it,
+    /// "" removes it. Broker may create the section (that's how MQTT is enabled).</summary>
+    private sealed record AdminMqttSettings(int? StatsInterval, string? Broker = null, int? Port = null,
+        bool? Tls = null, string? Username = null, string? Password = null, string? ClientId = null,
+        string? BaseTopic = null, bool? Discovery = null, string? DiscoveryPrefix = null,
+        int? KeepAlive = null, int? MaxPacketBytes = null);
+    /// <summary>PushPorts and TrustHours arrive as the text the user typed ("443, 53",
+    /// "72"); parsed strictly, and empty text removes the key.</summary>
+    private sealed record AdminWakeHintSettings(int? SyslogPort, string? PushPorts, string? Bind,
+        string? TrustHours = null);
+    private sealed record AdminConfigRequest(string? Bind, int? BindPort, int? WebPort, string? WebBind,
+        bool? WebUi, AdminUiSettings? Ui, AdminRecordingSettings? Recording, bool? RemoveRecording,
+        AdminMqttSettings? Mqtt = null, AdminWakeHintSettings? WakeHints = null);
+
+    public static async Task RunAsync(WebApiOptions o, CancellationToken ct)
+    {
+        var bindAddr = o.BindAddr;
+        var port = o.Port;
+        var webUi = o.WebUi;
+        var cameras = o.Cameras;
+        var users = o.Users;
+        var rtspPort = o.RtspPort;
+        var events = o.Events;
+        var recordingSettings = o.RecordingSettings;
+        var userStore = o.UserStore;
+        // Sign-in protection (opt-in): reads its live settings from the store, so
+        // an admin's save applies to the very next attempt with no restart.
+        var loginGuard = new LoginGuard(userStore.GetSecurity);
+        var resetAdminPassword = o.ResetAdminPassword;
+        var trickleSpeed = o.TrickleSpeed;
+        var serverLanguage = new Neolink.WebClient.Localization.ServerLanguage
+        {
+            Code = userStore.DefaultLanguage ?? o.ConfigLanguage ?? Neolink.WebClient.Localization.Lang.Default,
+        };
+
+        var builder = WebApplication.CreateBuilder(new WebApplicationOptions
+        {
+            ContentRootPath = AppContext.BaseDirectory,
+        });
+        builder.Logging.ClearProviders();
+        builder.WebHost.UseUrls($"http://{bindAddr}:{port}");
+        if (webUi)
+        {
+            // Load the static web asset manifest (serves the UI's _content/* files when
+            // running from the build output; published output has them physically in wwwroot).
+            builder.WebHost.UseStaticWebAssets();
+            builder.Services.AddRazorComponents().AddInteractiveServerComponents(o =>
+                o.DetailedErrors = Environment.GetEnvironmentVariable("NEOLINK_CIRCUIT_ERRORS") == "1");
+            // The UI's camera-list fetches run server-side (Blazor Server circuits).
+            // 100s is a CAP, not the working budget: call sites bound themselves
+            // with per-request tokens (settings 30s, SD-card file search 95s).
+            // The old blanket 15s sat BELOW legitimate handler times — an SD file
+            // search or a slow feature sweep got cancelled client-side and the UI
+            // showed "Cannot reach http://127.0.0.1:8655" for its own server.
+            builder.Services.AddSingleton(_ => new HttpClient { Timeout = TimeSpan.FromSeconds(100) });
+            // Circuits must talk to THIS server via loopback, never back out through
+            // a reverse proxy's public URL (TLS/hairpin failures behind HAProxy etc.).
+            builder.Services.AddSingleton(new Neolink.WebClient.LocalApiInfo(LoopbackBase(bindAddr, port)));
+            // The UI language: one live singleton for the server default (so
+            // changing it never needs a restart) and one per-circuit translator,
+            // which is the granularity the setting actually has — one tab of one
+            // signed-in user.
+            builder.Services.AddSingleton(serverLanguage);
+            builder.Services.AddScoped<Neolink.WebClient.Localization.Translator>();
+            // The detection zones the object boxes obey: per circuit, because that
+            // is exactly how long the browser's own copy of them lives.
+            builder.Services.AddScoped<Neolink.WebClient.DetectZones>();
+        }
+        var app = builder.Build();
+
+        // Permissive CORS: this is a LAN streaming API, the web client may be served from anywhere.
+        app.Use(async (ctx, next) =>
+        {
+            ctx.Response.Headers["Access-Control-Allow-Origin"] = "*";
+            ctx.Response.Headers["Access-Control-Allow-Headers"] = "*";
+            if (ctx.Request.Method == "OPTIONS")
+            {
+                ctx.Response.StatusCode = 204;
+                return;
+            }
+            await next();
+        });
+
+        app.UseWebSockets(new WebSocketOptions { KeepAliveInterval = TimeSpan.FromSeconds(20) });
+
+        // ------------------------------------------------------------ web-UI accounts
+
+        // The session token travels as a Bearer header, or as ?token= for the
+        // places headers can't go (video/img elements, the stream WebSocket).
+        UserRecord? SessionUser(HttpContext ctx)
+        {
+            string? token = null;
+            var header = ctx.Request.Headers.Authorization.ToString();
+            if (header.StartsWith("Bearer ", StringComparison.OrdinalIgnoreCase))
+                token = header["Bearer ".Length..].Trim();
+            token ??= ctx.Request.Query["token"];
+            return string.IsNullOrEmpty(token) ? null : userStore.ValidateToken(token);
+        }
+
+        // Once any account exists, every /api call (except the auth handshake
+        // itself) requires a valid session. The Blazor UI shell stays public so
+        // the login screen can render. Exception: FOOTAGE urls — snapshots and an
+        // event's media (thumbnail, clip, preview) — may instead carry RTSP Basic
+        // credentials: they serve what the rtsp:// stream URLs already serve, to
+        // the same kind of client (HA generic camera, notification templates,
+        // scripts) that already holds those credentials; the endpoints validate
+        // them themselves (per-camera permissions included). The JSON endpoints
+        // stay session-only.
+        app.Use(async (ctx, next) =>
+        {
+            if (userStore.Enabled
+                && ctx.Request.Path.StartsWithSegments("/api")
+                && !ctx.Request.Path.StartsWithSegments("/api/auth"))
+            {
+                var user = SessionUser(ctx);
+                if (user == null)
+                {
+                    bool footage = IsSnapshotPath(ctx.Request.Path) || IsEventMediaPath(ctx.Request.Path);
+                    if (footage
+                        && ctx.Request.Headers.Authorization.ToString()
+                            .StartsWith("Basic ", StringComparison.OrdinalIgnoreCase))
+                    {
+                        await next(); // the footage handler checks the Basic credentials
+                        return;
+                    }
+                    if (footage)
+                        ChallengeBasic(ctx);
+                    ctx.Response.StatusCode = 401;
+                    await ctx.Response.WriteAsJsonAsync(new { error = "authentication required" });
+                    return;
+                }
+                ctx.Items["authUser"] = user;
+            }
+            await next();
+        });
+
+        bool IsAdmin(HttpContext ctx) => ctx.Items["authUser"] is UserRecord { Admin: true };
+        string? SessionName(HttpContext ctx) => (ctx.Items["authUser"] as UserRecord)?.Name;
+
+        app.MapGet("/api/auth/status", (HttpContext ctx) =>
+        {
+            var user = userStore.Enabled ? SessionUser(ctx) : null;
+            return Results.Json(new
+            {
+                enabled = userStore.Enabled,
+                setupRequired = !userStore.Enabled && !o.Demo,
+                resetAvailable = resetAdminPassword && userStore.Enabled,
+                user = user?.Name,
+                admin = user?.Admin ?? false,
+                // The account's own language (null = follows the default) and the
+                // default itself, so the UI can show both without a second call.
+                language = user?.Lang,
+                defaultLanguage = serverLanguage.Code,
+            });
+        });
+
+        // First account = the admin; creating it is what turns authentication on.
+        app.MapPost("/api/auth/setup", (CredentialsRequest req) =>
+        {
+            // On a shared demo, whoever creates the admin account owns the server
+            // for everyone — and unlocks the whole AdminOnly surface (config,
+            // camera test's outbound connects, SMTP). Keeping accounts impossible
+            // keeps that entire surface locked by its existing gate.
+            if (o.Demo)
+                return Results.Json(new { error = "this is a shared demo — accounts are disabled" }, statusCode: 403);
+            if (userStore.Enabled)
+                return Results.Json(new { error = "already set up" }, statusCode: 409);
+            if (string.IsNullOrWhiteSpace(req.Username) || string.IsNullOrEmpty(req.Password))
+                return Results.Json(new { error = "provide username and password" }, statusCode: 400);
+            try
+            {
+                // The language chosen on the first-run form is both the admin's own
+                // and the server default — it is the only language question a fresh
+                // install asks, so it has to answer for the sign-in screen too.
+                var language = Neolink.WebClient.Localization.Lang.IsSupported(req.Language)
+                    ? Neolink.WebClient.Localization.Lang.Normalize(req.Language)
+                    : null;
+                var admin = userStore.Add(req.Username.Trim(), req.Password, admin: true, language);
+                if (language != null)
+                {
+                    userStore.SetDefaultLanguage(language);
+                    serverLanguage.Code = language;
+                }
+                Log.Warn($"Web UI authentication ENABLED: admin account '{admin.Name}' created");
+                return Results.Json(new { token = userStore.IssueToken(admin), user = admin.Name, admin = true });
+            }
+            catch (ArgumentException ex)
+            {
+                return Results.Json(new { error = ex.Message }, statusCode: 400);
+            }
+        });
+
+        // ------------------------------------------------------------ UI language
+
+        // The list of languages needs no endpoint: the UI renders in this very
+        // process, so it reads Lang.All directly. What it cannot know on its own
+        // is who picked what — that rides on /api/auth/status above.
+
+        // The signed-in user's own language. Null clears it, i.e. follow the default.
+        app.MapPut("/api/me/language", (LanguageRequest req, HttpContext ctx) =>
+        {
+            var name = SessionName(ctx);
+            if (name == null)
+                return Results.Json(new { error = "sign in first" }, statusCode: 401);
+            if (req.Language != null && !Neolink.WebClient.Localization.Lang.IsSupported(req.Language))
+                return Results.Json(new { error = "unsupported language" }, statusCode: 400);
+            var language = req.Language == null
+                ? null
+                : Neolink.WebClient.Localization.Lang.Normalize(req.Language);
+            return userStore.SetLanguage(name, language)
+                ? Results.Json(new { ok = true, language })
+                : Results.Json(new { error = "unknown user" }, statusCode: 404);
+        });
+
+        // The server default, for everyone who has not chosen: admin only, and
+        // live — the singleton every new render reads is updated in the same
+        // breath, so nothing has to be restarted for it to take hold.
+        app.MapPut("/api/admin/language", (LanguageRequest req, HttpContext ctx) =>
+        {
+            if (AdminOnly(ctx) is { } denied) return denied;
+            if (!Neolink.WebClient.Localization.Lang.IsSupported(req.Language))
+                return Results.Json(new { error = "unsupported language" }, statusCode: 400);
+            var language = Neolink.WebClient.Localization.Lang.Normalize(req.Language);
+            userStore.SetDefaultLanguage(language);
+            serverLanguage.Code = language;
+            Log.Info($"Default web UI language set to '{language}'");
+            return Results.Json(new { ok = true, language });
+        });
+
+        app.MapPost("/api/auth/login", async (CredentialsRequest req, HttpContext ctx) =>
+        {
+            var submitted = req.Username?.Trim() ?? "";
+            // Only the sanitized name may reach the guard's maps or the log;
+            // Verify still sees the original, which a sanitized name cannot match.
+            var name = LoginGuard.TrackKey(submitted);
+            var address = LoginGuard.ClientAddress(ctx.Connection.RemoteIpAddress,
+                ctx.Request.Headers["X-Forwarded-For"]);
+            // Before the password, so a locked-out caller learns nothing from the
+            // answer and costs no PBKDF2 work.
+            if (loginGuard.Blocked(name, address, out var retryAfter))
+            {
+                ctx.Response.Headers.RetryAfter = retryAfter.ToString();
+                await Task.Delay(Random.Shared.Next(250, 500));
+                return Results.Json(new { error = "too many failed sign-ins — try again later" }, statusCode: 429);
+            }
+            var user = req.Username == null || req.Password == null
+                ? null
+                : userStore.Verify(submitted, req.Password);
+            if (user == null)
+            {
+                Log.Info($"Failed web sign-in for '{name}'" + (address == null ? "" : $" from {address}"));
+                loginGuard.RecordFailure(name, address);
+                await Task.Delay(Random.Shared.Next(250, 500)); // blunt brute-force pacing
+                return Results.Json(new { error = "wrong username or password" }, statusCode: 401);
+            }
+            loginGuard.RecordSuccess(user.Name);
+            return Results.Json(new { token = userStore.IssueToken(user), user = user.Name, admin = user.Admin });
+        });
+
+        // ---- sign-in protection: admin settings + live lock state -------------
+
+        object ShapeSecurity()
+        {
+            var s = userStore.GetSecurity();
+            return new
+            {
+                enabled = s.Enabled,
+                maxAttempts = s.MaxAttempts,
+                lockMinutes = s.LockMinutes,
+                locked = loginGuard.LockedAccounts()
+                    .Select(l => new { name = l.Name, minutesLeft = l.MinutesLeft }),
+                blockedAddresses = loginGuard.BlockedAddressCount(),
+            };
+        }
+
+        app.MapGet("/api/admin/security", (HttpContext ctx) =>
+            AdminOnly(ctx) ?? Results.Json(ShapeSecurity()));
+
+        app.MapPut("/api/admin/security", (SecuritySettingsRequest req, HttpContext ctx) =>
+        {
+            if (AdminOnly(ctx) is { } denied) return denied;
+            var cur = userStore.GetSecurity();
+            userStore.SetSecurity(new LoginGuardSettings
+            {
+                Enabled = req.Enabled ?? cur.Enabled,
+                MaxAttempts = req.MaxAttempts ?? cur.MaxAttempts,
+                LockMinutes = req.LockMinutes ?? cur.LockMinutes,
+            });
+            var s = userStore.GetSecurity();
+            Log.Info($"Sign-in protection {(s.Enabled ? "ON" : "off")}: " +
+                     $"{s.MaxAttempts} attempts, {s.LockMinutes} min lock");
+            return Results.Json(ShapeSecurity());
+        });
+
+        app.MapPost("/api/admin/security/unlock", (HttpContext ctx) =>
+        {
+            if (AdminOnly(ctx) is { } denied) return denied;
+            loginGuard.UnlockAll();
+            return Results.Json(ShapeSecurity());
+        });
+
+        // Recovery: only while reset_admin_password=true in the config.
+        app.MapPost("/api/auth/reset-admin", (PasswordRequest req) =>
+        {
+            if (!resetAdminPassword || !userStore.Enabled)
+                return Results.Json(new { error = "reset not enabled" }, statusCode: 404);
+            var admin = userStore.AdminUser();
+            if (admin == null || string.IsNullOrEmpty(req.Password))
+                return Results.Json(new { error = "provide password" }, statusCode: 400);
+            try
+            {
+                userStore.SetPassword(admin.Name, req.Password);
+            }
+            catch (ArgumentException ex)
+            {
+                return Results.Json(new { error = ex.Message }, statusCode: 400);
+            }
+            Log.Warn($"Admin password for '{admin.Name}' was RESET via reset_admin_password — " +
+                     "set the flag back to false now");
+            return Results.Json(new { ok = true, user = admin.Name });
+        });
+
+        // Account management (admin only). Normal users are added by the admin.
+        app.MapGet("/api/users", (HttpContext ctx) =>
+            !IsAdmin(ctx)
+                ? Results.Json(new { error = "admin only" }, statusCode: 403)
+                : Results.Json(userStore.List().Select(u => new { name = u.Name, admin = u.Admin })));
+
+        app.MapPost("/api/users", (CredentialsRequest req, HttpContext ctx) =>
+        {
+            if (!IsAdmin(ctx))
+                return Results.Json(new { error = "admin only" }, statusCode: 403);
+            if (string.IsNullOrWhiteSpace(req.Username) || string.IsNullOrEmpty(req.Password))
+                return Results.Json(new { error = "provide username and password" }, statusCode: 400);
+            try
+            {
+                userStore.Add(req.Username.Trim(), req.Password, admin: false);
+                return Results.Json(new { ok = true });
+            }
+            catch (ArgumentException ex)
+            {
+                return Results.Json(new { error = ex.Message }, statusCode: 400);
+            }
+        });
+
+        app.MapPut("/api/users/{name}", (string name, PasswordRequest req, HttpContext ctx) =>
+        {
+            if (!IsAdmin(ctx))
+                return Results.Json(new { error = "admin only" }, statusCode: 403);
+            if (string.IsNullOrEmpty(req.Password))
+                return Results.Json(new { error = "provide password" }, statusCode: 400);
+            try
+            {
+                return userStore.SetPassword(name, req.Password)
+                    ? Results.Json(new { ok = true })
+                    : Results.Json(new { error = "unknown user" }, statusCode: 404);
+            }
+            catch (ArgumentException ex)
+            {
+                return Results.Json(new { error = ex.Message }, statusCode: 400);
+            }
+        });
+
+        app.MapDelete("/api/users/{name}", (string name, HttpContext ctx) =>
+        {
+            if (!IsAdmin(ctx))
+                return Results.Json(new { error = "admin only" }, statusCode: 403);
+            return userStore.Delete(name)
+                ? Results.Json(new { ok = true })
+                : Results.Json(new { error = "unknown user (the admin cannot be deleted)" }, statusCode: 400);
+        });
+
+        // ------------------------------------------------------------ admin: server settings + restart
+
+        IResult? AdminOnly(HttpContext ctx) => IsAdmin(ctx)
+            ? null
+            : Results.Json(new
+            {
+                error = userStore.Enabled ? "admin only" : "create the admin account first (server settings need one)",
+            }, statusCode: 403);
+
+        app.MapGet("/api/admin/config", (HttpContext ctx) =>
+        {
+            if (AdminOnly(ctx) is { } denied) return denied;
+            try
+            {
+                // Which encryption key the RUNNING server uses (source + one-way
+                // fingerprint, never the key), and whether the key file sits on
+                // the same disk as the footage it protects — the admin must be
+                // able to see both without shell access.
+                object? enc = null;
+                if (o.Secrets is { } sec)
+                {
+                    bool onFootageDisk = sec.KeyFile is { } kf
+                        && o.Storage != null && o.Storage.SharesVolumeWith(kf, out _);
+                    enc = new
+                    {
+                        enabled = Recording.FootageVault.EncryptingNew,
+                        source = sec.KeySource,
+                        fingerprint = sec.Fingerprint,
+                        file = sec.KeyFile,
+                        onFootageDisk,
+                    };
+                }
+                return Results.Json(ConfigEditor.Describe(o.ConfigPath, enc));
+            }
+            catch (Exception ex)
+            {
+                return Results.Json(new { error = ex.Message }, statusCode: 500);
+            }
+        });
+
+        app.MapPut("/api/admin/config", (AdminConfigRequest req, HttpContext ctx) =>
+        {
+            if (AdminOnly(ctx) is { } denied) return denied;
+            try
+            {
+                // Checks the loader can't make (it must keep accepting historic
+                // configs) but the editor should: they only bite what the UI writes.
+                if (req.Bind is { } b && !System.Net.IPAddress.TryParse(b, out _))
+                    throw new FormatException($"bind must be an IP address (e.g. 0.0.0.0), not \"{b}\"");
+                if (req.WebBind is { Length: > 0 } wb && wb is not ("localhost" or "*" or "+")
+                    && !System.Net.IPAddress.TryParse(wb, out _))
+                    throw new FormatException($"web bind must be an IP address, localhost, * or +, not \"{wb}\"");
+                if (req.BindPort is { } bp && bp is < 1 or > 65535)
+                    throw new FormatException("RTSP port must be 1-65535");
+                // 0 legally disables the web API — but never from the web UI,
+                // which would saw off the branch it sits on.
+                if (req.WebPort is { } wp && wp is < 1 or > 65535)
+                    throw new FormatException("web port must be 1-65535 (disable the web API in the file, not from the UI it serves)");
+                var current = NeolinkConfig.Load(o.ConfigPath);
+                if ((req.BindPort ?? current.BindPort) == (req.WebPort ?? current.WebPort))
+                    throw new FormatException("RTSP port and web port must differ");
+                // The loader only reports an unusable path at the next start, by
+                // which time nobody is watching: reject it while the admin is here.
+                if (req.Recording?.Path is { Length: > 0 } recPath)
+                {
+                    try
+                    {
+                        var full = Path.GetFullPath(recPath);
+                        Directory.CreateDirectory(full);
+                        var probe = Path.Combine(full, ".neolink-write-test");
+                        File.WriteAllBytes(probe, Array.Empty<byte>());
+                        File.Delete(probe);
+                    }
+                    catch (Exception ex)
+                    {
+                        throw new FormatException($"storage path '{recPath}' cannot be written: {ex.Message}");
+                    }
+                }
+
+                ConfigEditor.Apply(o.ConfigPath, root =>
+                {
+                    if (req.Bind != null) ConfigEditor.Set(root, "bind", req.Bind);
+                    if (req.BindPort != null) ConfigEditor.Set(root, "bind_port", req.BindPort);
+                    if (req.WebPort != null) ConfigEditor.Set(root, "web_port", req.WebPort);
+                    if (req.WebBind != null)
+                        ConfigEditor.Set(root, "web_bind", req.WebBind.Length == 0 ? null : req.WebBind);
+                    if (req.WebUi != null) ConfigEditor.Set(root, "webui", req.WebUi);
+
+                    if (req.Ui is { } u)
+                    {
+                        var ui = ConfigEditor.Section(root, "ui");
+                        if (u.TrickleSpeed != null) ConfigEditor.Set(ui, "trickle_speed", u.TrickleSpeed);
+                        if (u.Talk != null) ConfigEditor.Set(ui, "talk", u.Talk);
+                        if (u.ShowBackgroundTasks != null) ConfigEditor.Set(ui, "show_background_tasks", u.ShowBackgroundTasks);
+                        if (u.StateDir != null)
+                            ConfigEditor.Set(ui, "state_dir", u.StateDir.Length == 0 ? null : u.StateDir);
+                        if (u.ResetAdminPassword != null)
+                        {
+                            ConfigEditor.Set(ui, "reset_admin_password", u.ResetAdminPassword);
+                            ConfigEditor.Set(root, "reset_admin_password", null); // retire the legacy spelling
+                        }
+                    }
+
+                    if (req.RemoveRecording == true)
+                    {
+                        // Stash, never delete: the section moves aside under a key every
+                        // loader ignores, so retention, rolls and tiers survive the off
+                        // period. Section PRESENCE stays the only on/off signal any
+                        // version ever shipped reads.
+                        var off = ConfigEditor.TryGetSection(root, "recording");
+                        ConfigEditor.Set(root, "recording", null);
+                        if (off != null)
+                            ConfigEditor.Set(root, "recording_disabled", off);
+                    }
+                    else if (req.Recording is { } r)
+                    {
+                        // Enabling after a disable restores the stashed section first,
+                        // so this request's fields land on top of the settings the
+                        // admin had before switching off.
+                        if (ConfigEditor.TryGetSection(root, "recording") == null
+                            && ConfigEditor.TryGetSection(root, "recording_disabled") is { } stash)
+                        {
+                            ConfigEditor.Set(root, "recording_disabled", null);
+                            ConfigEditor.Set(root, "recording", stash);
+                        }
+                        var rec = ConfigEditor.Section(root, "recording");
+                        if (r.Path != null) ConfigEditor.Set(rec, "path", r.Path);
+                        if (r.RetentionDays != null) ConfigEditor.Set(rec, "retention_days", r.RetentionDays);
+                        if (r.PreSeconds != null) ConfigEditor.Set(rec, "pre_seconds", r.PreSeconds);
+                        if (r.PostSeconds != null) ConfigEditor.Set(rec, "post_seconds", r.PostSeconds);
+                        if (r.MaxClipSeconds != null) ConfigEditor.Set(rec, "max_clip_seconds", r.MaxClipSeconds);
+                        if (r.Stream != null) ConfigEditor.Set(rec, "stream", r.Stream);
+                        if (r.SegmentMinutes != null) ConfigEditor.Set(rec, "segment_minutes", r.SegmentMinutes);
+                        if (r.MaxSegmentSizeMb != null) ConfigEditor.Set(rec, "max_segment_size_mb", r.MaxSegmentSizeMb);
+                        if (r.ContinuousRetentionDays != null)
+                            ConfigEditor.Set(rec, "continuous_retention_days", r.ContinuousRetentionDays);
+                        // Optional tiers: blank means "no such tier" — drop the key
+                        // rather than storing an empty string.
+                        if (r.ClipsPath != null)
+                            ConfigEditor.Set(rec, "clips_path", r.ClipsPath.Length == 0 ? null : r.ClipsPath);
+                        if (r.ArchivePath != null)
+                            ConfigEditor.Set(rec, "archive_path", r.ArchivePath.Length == 0 ? null : r.ArchivePath);
+                        if (r.Encrypt != null) ConfigEditor.Set(rec, "encrypt", r.Encrypt);
+                    }
+
+                    if (req.Mqtt is { } m)
+                    {
+                        // Never conjure a broker-less mqtt section — but a broker
+                        // arriving IS how MQTT gets enabled from the UI.
+                        var mq = ConfigEditor.TryGetSection(root, "mqtt");
+                        if (mq == null)
+                        {
+                            if (string.IsNullOrWhiteSpace(m.Broker))
+                                throw new FormatException(
+                                    "mqtt is not configured — enter a broker to enable it");
+                            mq = ConfigEditor.Section(root, "mqtt");
+                        }
+                        if (m.Broker != null) ConfigEditor.Set(mq, "broker", m.Broker);
+                        if (m.Port != null) ConfigEditor.Set(mq, "port", m.Port);
+                        if (m.Tls != null) ConfigEditor.Set(mq, "tls", m.Tls);
+                        if (m.Username != null)
+                            ConfigEditor.Set(mq, "username", m.Username.Length == 0 ? null : m.Username);
+                        // Write-only: null keeps, "" removes, a value replaces.
+                        if (m.Password != null)
+                            ConfigEditor.Set(mq, "password", m.Password.Length == 0 ? null : m.Password);
+                        if (m.ClientId != null) ConfigEditor.Set(mq, "client_id", m.ClientId);
+                        if (m.BaseTopic != null) ConfigEditor.Set(mq, "base_topic", m.BaseTopic);
+                        if (m.Discovery != null) ConfigEditor.Set(mq, "discovery", m.Discovery);
+                        if (m.DiscoveryPrefix != null) ConfigEditor.Set(mq, "discovery_prefix", m.DiscoveryPrefix);
+                        if (m.KeepAlive != null) ConfigEditor.Set(mq, "keepalive", m.KeepAlive);
+                        if (m.MaxPacketBytes != null) ConfigEditor.Set(mq, "max_packet_size", m.MaxPacketBytes);
+                        if (m.StatsInterval != null) ConfigEditor.Set(mq, "stats_interval", m.StatsInterval);
+                    }
+
+                    if (req.WakeHints is { } w)
+                        ConfigEditor.ApplyWakeHintEdit(root, w.SyslogPort, w.PushPorts, w.Bind, w.TrustHours);
+                });
+                Log.Warn($"config.json updated via the web UI by '{SessionName(ctx)}' — restart to apply");
+                return Results.Json(new { ok = true, requiresRestart = true });
+            }
+            catch (FormatException ex)
+            {
+                return Results.Json(new { error = ex.Message }, statusCode: 400);
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                return Results.Json(new { error = $"config.json is not writable: {ex.Message}" }, statusCode: 409);
+            }
+        });
+
+        // -------------------------------------------------- admin: camera editing
+        // Add/edit/delete cameras in config.json from the UI. Passwords are
+        // write-only (never returned; blank keeps the stored one), every candidate
+        // file is validated through the normal loader before it replaces the
+        // config, and changes apply on the next restart.
+
+        app.MapGet("/api/admin/cameras", (HttpContext ctx) =>
+        {
+            if (AdminOnly(ctx) is { } denied) return denied;
+            try
+            {
+                var cfg = NeolinkConfig.Load(o.ConfigPath);
+                return Results.Json(new
+                {
+                    writable = ConfigEditor.IsWritable(o.ConfigPath),
+                    // What the editor needs to check a PTZ port before saving (the loader has the last word).
+                    ptz = new
+                    {
+                        sharedPort = cfg.PtzPort,
+                        rtspPort = cfg.BindPort,
+                        webPort = cfg.WebPort,
+                        loopback = System.Net.IPAddress.TryParse(cfg.PtzBind ?? cfg.BindAddr, out var ptzBind)
+                                   && System.Net.IPAddress.IsLoopback(ptzBind),
+                        users = cfg.Users.Count > 0,
+                    },
+                    cameras = cfg.Cameras.Select(c => new
+                    {
+                        name = c.Name,
+                        type = c.IsGenericRtsp ? "rtsp" : "reolink",
+                        address = c.IsGenericRtsp ? null
+                            : c.Port == 9000 ? c.Host : $"{c.Host}:{c.Port}",
+                        username = c.IsGenericRtsp ? null : c.Username,
+                        hasPassword = !string.IsNullOrEmpty(c.Password),
+                        channelId = (int)c.ChannelId,
+                        httpAddress = c.HttpAddress,
+                        rtspMain = ConfigEditor.MaskRtspPassword(c.RtspMain),
+                        rtspSub = ConfigEditor.MaskRtspPassword(c.RtspSub),
+                        // Optional per-camera settings the editor can now round-trip.
+                        // The UID is NOT secret (it's on the camera's sticker) but it
+                        // identifies the device, so it only ever goes to an admin.
+                        uid = c.Uid,
+                        alwaysOn = c.AlwaysOn == null ? "auto" : c.AlwaysOn.Value ? "true" : "false",
+                        stream = c.Stream,
+                        // May carry its own "user:pass@" now, so it is masked like
+                        // the stream URLs: the browser never sees a stored password.
+                        onvifAddress = ConfigEditor.MaskRtspPassword(c.OnvifAddress),
+                        record = c.Record,
+                        udp = c.Udp,
+                        udpProbe = c.UdpProbe,
+                        wakeCapture = c.WakeCapture,
+                        keepAliveHours = c.KeepAliveHours,
+                        ptzMode = c.PtzMode,
+                        ptzPort = c.PtzMode == "own" ? c.PtzPort : null,
+                        ptzOff = c.PtzOff, // why the loader turned it off, shown beside the field
+                        ptzOpen = cfg.PermittedUsersFor(c) == null, // no login applies to this camera
+                    }).ToList(),
+                });
+            }
+            catch (Exception ex)
+            {
+                return Results.Json(new { error = ex.Message }, statusCode: 500);
+            }
+        });
+
+        app.MapPost("/api/admin/cameras", (AdminCameraRequest req, HttpContext ctx) =>
+        {
+            if (AdminOnly(ctx) is { } denied) return denied;
+
+            var name = (req.Name ?? "").Trim();
+            if (name.Length is 0 or > 64)
+                return Results.Json(new { error = "name is required (max 64 characters)" }, statusCode: 400);
+            // The name becomes RTSP mount paths and recording directories.
+            if (name.Any(ch => char.IsControl(ch) || "/\\:*?\"<>|".Contains(ch)))
+                return Results.Json(new { error = "name must not contain / \\ : * ? \" < > |" }, statusCode: 400);
+            bool isRtsp = req.Type == "rtsp";
+            if (!isRtsp && req.Type != "reolink")
+                return Results.Json(new { error = "type must be reolink or rtsp" }, statusCode: 400);
+            if (!isRtsp)
+            {
+                // Address is optional only for a UID-only UDP camera: broadcast
+                // discovery finds it by UID. Everything else needs a host.
+                bool uidOnly = string.IsNullOrWhiteSpace(req.Address)
+                    && !string.IsNullOrWhiteSpace(req.Uid) && req.Udp == true;
+                if (!uidOnly
+                    && (req.Address is not { } addr || ConfigEditor.HostPortError(addr) is { } addrErr))
+                    return Results.Json(new { error = ConfigEditor.HostPortError(req.Address ?? "") }, statusCode: 400);
+                if (string.IsNullOrWhiteSpace(req.Username))
+                    return Results.Json(new { error = "username is required for a Reolink camera" }, statusCode: 400);
+                if (req.ChannelId is { } cid && cid is < 0 or > 255)
+                    return Results.Json(new { error = "channel id must be 0-255" }, statusCode: 400);
+                if (req.HttpAddress is { Length: > 0 } ha && ha.Any(char.IsWhiteSpace))
+                    return Results.Json(new { error = "HTTP address must not contain spaces" }, statusCode: 400);
+                if (req.OnvifAddress is { Length: > 0 } oa && oa.Any(char.IsWhiteSpace))
+                    return Results.Json(new { error = "ONVIF address must not contain spaces" }, statusCode: 400);
+                if (req.Stream is { Length: > 0 } st && !NeolinkConfig.ValidCameraStreams.Contains(st))
+                    return Results.Json(new
+                    {
+                        error = $"stream must be one of: {string.Join(", ", NeolinkConfig.ValidCameraStreams)}",
+                    }, statusCode: 400);
+                if (req.AlwaysOn is { Length: > 0 } ao && ao is not ("auto" or "true" or "false"))
+                    return Results.Json(new { error = "always_on must be auto, true or false" }, statusCode: 400);
+                // Both UDP options are keyed on the camera's UID — without one the
+                // discovery probe has nothing to address, so it would fail at runtime.
+                bool wantsUdp = req.Udp == true || req.UdpProbe == true;
+                if (wantsUdp && string.IsNullOrWhiteSpace(req.Uid))
+                    return Results.Json(new
+                    {
+                        error = "the UDP options need the camera's UID (Reolink app → device info, or the sticker)",
+                    }, statusCode: 400);
+                if (req.Uid is { Length: > 0 } uid && uid.Any(char.IsWhiteSpace))
+                    return Results.Json(new { error = "UID must not contain spaces" }, statusCode: 400);
+                // Clashes, the shared port and the login rule are the loader's (ValidatePtz), run on save.
+                if (req.PtzMode is { Length: > 0 } pm && pm is not ("off" or "shared" or "own"))
+                    return Results.Json(new { error = "PTZ for Frigate must be off, shared or own" }, statusCode: 400);
+                if (req.PtzMode == "own" && req.PtzPort is not (>= 1 and <= 65535))
+                    return Results.Json(new { error = "the camera's own PTZ port must be 1-65535" }, statusCode: 400);
+            }
+            else
+            {
+                foreach (var url in new[] { req.RtspMain, req.RtspSub })
+                {
+                    // A masked URL is checked too: the mask is a valid password, and an edit around it is saved.
+                    // The login is split off first, as the puller does: System.Uri rejects a raw '@' or '#' in it.
+                    if (url is { Length: > 0 }
+                        && (!url.StartsWith("rtsp://", StringComparison.OrdinalIgnoreCase)
+                            || !Uri.TryCreate(OnvifClient.SplitCredentials(url).Address, UriKind.Absolute, out _)))
+                        return Results.Json(new { error = $"\"{ConfigEditor.MaskRtspPassword(url)}\" is not a valid rtsp:// URL" },
+                            statusCode: 400);
+                }
+                if (req.OriginalName == null
+                    && string.IsNullOrWhiteSpace(req.RtspMain) && string.IsNullOrWhiteSpace(req.RtspSub))
+                    return Results.Json(new { error = "provide at least one rtsp:// URL (main and/or sub)" }, statusCode: 400);
+            }
+
+            try
+            {
+                ConfigEditor.Apply(o.ConfigPath, root =>
+                {
+                    var cams = ConfigEditor.Cameras(root);
+                    var existing = req.OriginalName == null ? null
+                        : ConfigEditor.FindCamera(cams, req.OriginalName)
+                          ?? throw new FormatException($"unknown camera \"{req.OriginalName}\"");
+                    // Friendlier than the loader's duplicate error after the fact.
+                    if (ConfigEditor.FindCamera(cams, name) is { } clash && !ReferenceEquals(clash, existing))
+                        throw new FormatException($"a camera named \"{name}\" already exists");
+
+                    var cam = existing;
+                    if (cam == null)
+                    {
+                        cam = new JsonObject();
+                        cams.Add(cam);
+                    }
+                    ConfigEditor.Set(cam, "name", name);
+                    // A URL-shaped value is READ BACK MASKED (its password replaced
+                    // with ****), so writing it verbatim would store the mask and
+                    // destroy the real credential. Masked = the admin did not touch
+                    // it = keep the file's value; null = keep; "" = remove.
+                    void SetUrl(string key, string? url)
+                    {
+                        if (url == null) return;
+                        // Edited around its masked password (a new host or path): put
+                        // the stored password back in place of the mask. Nothing to
+                        // restore it from = leave the stored value exactly as it was.
+                        var stored = cam[key] is System.Text.Json.Nodes.JsonValue v
+                                     && v.TryGetValue<string>(out var s) ? s : null;
+                        if (ConfigEditor.UnmaskPassword(url, stored) is not { } real) return;
+                        ConfigEditor.Set(cam, key, real.Length == 0 ? null : real.Trim());
+                    }
+                    if (!isRtsp)
+                    {
+                        // Blank address only survives validation for a UID-only UDP
+                        // camera — there it must actually REMOVE the key.
+                        ConfigEditor.Set(cam, "address",
+                            string.IsNullOrWhiteSpace(req.Address) ? null : req.Address.Trim());
+                        ConfigEditor.Set(cam, "username", req.Username!.Trim());
+                        // Write-only password: null keeps whatever the file has.
+                        if (req.Password != null)
+                            ConfigEditor.Set(cam, "password", req.Password.Length == 0 ? null : req.Password);
+                        if (req.ChannelId is { } chan)
+                            ConfigEditor.Set(cam, "channel_id", chan == 0 ? null : chan);
+                        if (req.HttpAddress != null)
+                            ConfigEditor.Set(cam, "http_address",
+                                req.HttpAddress.Length == 0 ? null : req.HttpAddress.Trim());
+                        // Through SetUrl: onvif_address may carry a password, so the
+                        // admin API masks it on read and the mask must never be saved.
+                        SetUrl("onvif_address", req.OnvifAddress);
+                        if (req.Uid != null)
+                            ConfigEditor.Set(cam, "uid", req.Uid.Length == 0 ? null : req.Uid.Trim());
+                        // Defaults are written as ABSENT keys, so config.json keeps only
+                        // what actually differs from stock (same idea as channel_id 0).
+                        if (req.AlwaysOn is { Length: > 0 } alwaysOn)
+                            ConfigEditor.Set(cam, "always_on",
+                                alwaysOn == "auto" ? null : alwaysOn == "true");
+                        if (req.Stream is { Length: > 0 } stream)
+                            ConfigEditor.Set(cam, "stream", stream == "both" ? null : stream);
+                        if (req.Udp is { } udp)
+                            ConfigEditor.Set(cam, "udp", udp ? true : null);
+                        if (req.UdpProbe is { } udpProbe)
+                            ConfigEditor.Set(cam, "udp_probe", udpProbe ? true : null);
+                        if (req.WakeCapture is { } wakeCapture)
+                            ConfigEditor.Set(cam, "wake_capture", wakeCapture ? true : null);
+                        if (req.KeepAliveHours is { } keepAlive)
+                            ConfigEditor.Set(cam, "keep_alive_hours",
+                                keepAlive > 0 ? System.Text.Json.Nodes.JsonValue.Create(Math.Clamp(keepAlive, 0, 24)) : null);
+                        // One mode at a time: a profile on the shared port, or a port of the camera's own.
+                        if (req.PtzMode is { Length: > 0 } ptzMode)
+                        {
+                            ConfigEditor.Set(cam, "ptz_share", ptzMode == "shared" ? true : null);
+                            ConfigEditor.Set(cam, "ptz_port", ptzMode == "own" ? req.PtzPort : null);
+                        }
+                        // A type switch must not leave generic-RTSP keys behind.
+                        ConfigEditor.Set(cam, "rtsp_main", null);
+                        ConfigEditor.Set(cam, "rtsp_sub", null);
+                        ConfigEditor.Set(cam, "rtsp", null);
+                    }
+                    else
+                    {
+                        SetUrl("rtsp_main", req.RtspMain);
+                        SetUrl("rtsp_sub", req.RtspSub);
+                        ConfigEditor.Set(cam, "rtsp", null); // retire the legacy spelling
+                        ConfigEditor.Set(cam, "address", null);
+                        ConfigEditor.Set(cam, "username", null);
+                        ConfigEditor.Set(cam, "password", null);
+                        ConfigEditor.Set(cam, "channel_id", null);
+                        ConfigEditor.Set(cam, "http_address", null);
+                        // ONVIF is where a generic camera's settings come from, so
+                        // this one key survives the type switch (masked = unchanged,
+                        // since it may carry a password of its own).
+                        SetUrl("onvif_address", req.OnvifAddress);
+                        // Baichuan-only settings must not linger after a type switch.
+                        ConfigEditor.Set(cam, "uid", null);
+                        ConfigEditor.Set(cam, "always_on", null);
+                        ConfigEditor.Set(cam, "stream", null);
+                        ConfigEditor.Set(cam, "udp", null);
+                        ConfigEditor.Set(cam, "udp_probe", null);
+                        ConfigEditor.Set(cam, "wake_capture", null);
+                        ConfigEditor.Set(cam, "keep_alive_hours", null);
+                        // A generic camera has ONVIF of its own: Frigate goes to it directly.
+                        ConfigEditor.Set(cam, "ptz_share", null);
+                        ConfigEditor.Set(cam, "ptz_port", null);
+                    }
+                    // Event recording applies to both camera kinds, so it is set
+                    // outside the type branches (default true = key omitted).
+                    if (req.Record is { } record)
+                        ConfigEditor.Set(cam, "record", record ? null : false);
+                });
+                // The detection zone Neolink keeps is keyed by name, so it follows a rename (only the zone).
+                if (req.OriginalName is { Length: > 0 } was)
+                    o.CameraState?.Rename(was, name);
+                Log.Warn($"config.json cameras updated via the web UI by '{SessionName(ctx)}' " +
+                         $"({(req.OriginalName == null ? "added" : "edited")} \"{name}\") — restart to apply");
+                return Results.Json(new { ok = true, requiresRestart = true });
+            }
+            catch (FormatException ex)
+            {
+                return Results.Json(new { error = ex.Message }, statusCode: 400);
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                return Results.Json(new { error = $"config.json is not writable: {ex.Message}" }, statusCode: 409);
+            }
+        });
+
+        app.MapDelete("/api/admin/cameras/{name}", (string name, HttpContext ctx) =>
+        {
+            if (AdminOnly(ctx) is { } denied) return denied;
+            try
+            {
+                ConfigEditor.Apply(o.ConfigPath, root =>
+                {
+                    var cams = ConfigEditor.Cameras(root);
+                    var cam = ConfigEditor.FindCamera(cams, name)
+                        ?? throw new FormatException($"unknown camera \"{name}\"");
+                    cams.Remove(cam);
+                });
+                // Its stored detection zone goes too, so a new camera of the same name does not inherit it.
+                o.CameraState?.Forget(name);
+                Log.Warn($"config.json camera \"{name}\" deleted via the web UI by '{SessionName(ctx)}' — restart to apply");
+                return Results.Json(new { ok = true, requiresRestart = true });
+            }
+            catch (FormatException ex)
+            {
+                return Results.Json(new { error = ex.Message }, statusCode: 400);
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                return Results.Json(new { error = $"config.json is not writable: {ex.Message}" }, statusCode: 409);
+            }
+        });
+
+        // Connectivity test WITHOUT saving. Reolink: full Baichuan connect + login
+        // (blank password falls back to the stored one, so an existing camera can
+        // be tested without retyping it). Generic: an RTSP OPTIONS round-trip.
+        app.MapPost("/api/admin/cameras/test", async (AdminCameraTestRequest req, HttpContext ctx) =>
+        {
+            if (AdminOnly(ctx) is { } denied) return denied;
+            using var cts = CancellationTokenSource.CreateLinkedTokenSource(ctx.RequestAborted);
+            cts.CancelAfter(TimeSpan.FromSeconds(12));
+
+            // What a generic camera's settings panel will be able to show, said at
+            // the moment the camera is being added rather than discovered later as
+            // an empty tab. Never fails the test: ONVIF is optional, video is not.
+            static async Task<string> TestOnvifAsync(string? onvifAddress, string rtspUrl,
+                CancellationToken ct)
+            {
+                // Exactly as the running camera will be probed: same ports, same login.
+                using var probe = OnvifClient.ForGenericCamera(onvifAddress, rtspUrl, "camera test");
+                if (probe == null) return "";
+                var info = await probe.TryGetDeviceInfoAsync(ct).ConfigureAwait(false);
+                var name = info == null ? "" : string.Join(" ", new[] { info.Manufacturer, info.Model }
+                    .Where(s => !string.IsNullOrWhiteSpace(s)));
+                var who = name.Length > 0 ? $" — {name}" : "";
+                // Many firmwares answer device information without a login; the
+                // first call that needed one (the video source) is what found out.
+                if (probe.AuthRejected)
+                    return $"ONVIF answered{who} but rejected the login, so this camera will stream and record " +
+                           "but show no settings — check the ONVIF user and password (a full URL in the ONVIF " +
+                           "address above can carry its own, http://user:pass@host/onvif/device_service).";
+                if (info == null)
+                    return "ONVIF did not answer, so this camera will stream and record but show no settings — " +
+                           "enable ONVIF on the camera, or set its ONVIF address above." +
+                           (probe.LastError is { Length: > 0 } why ? $" ({why})" : "");
+                return $"ONVIF answered{who}, so its settings will be editable here.";
+            }
+
+            CameraConfig? stored = null;
+            if (req.Name is { Length: > 0 } storedName)
+            {
+                try
+                {
+                    stored = NeolinkConfig.Load(o.ConfigPath).Cameras
+                        .FirstOrDefault(c => string.Equals(c.Name, storedName, StringComparison.OrdinalIgnoreCase));
+                }
+                catch { /* config unreadable — test with what was sent */ }
+            }
+
+            // UDP transport: these models (Argus family) never listen on TCP, so
+            // dialling the TCP way always times out no matter how healthy they are.
+            // Test them the way the server will actually connect. Resolved out here
+            // so the timeout message below can name the right failure.
+            bool udp = req.Udp ?? stored?.Udp ?? false;
+            var uid = req.Uid is { Length: > 0 } ru ? ru.Trim() : stored?.Uid;
+
+            try
+            {
+                if (req.Type == "rtsp")
+                {
+                    // The URL as Save would store it: an edit around a masked password keeps
+                    // the stored one, so the test dials the host the admin typed.
+                    string? Sent(string? edited, string? storedUrl) =>
+                        edited is { Length: > 0 } ? ConfigEditor.UnmaskPassword(edited, storedUrl) ?? storedUrl : null;
+                    var url = Sent(req.RtspMain, stored?.RtspMain)
+                        ?? Sent(req.RtspSub, stored?.RtspSub)
+                        ?? stored?.RtspMain ?? stored?.RtspSub;
+                    if (url == null || !url.StartsWith("rtsp://", StringComparison.OrdinalIgnoreCase)
+                        || !Uri.TryCreate(url, UriKind.Absolute, out var uri))
+                        return Results.Json(new { ok = false, message = "provide a valid rtsp:// URL to test" });
+                    using var tcp = new System.Net.Sockets.TcpClient();
+                    await tcp.ConnectAsync(uri.Host, uri.Port > 0 ? uri.Port : 554, cts.Token);
+                    var stream = tcp.GetStream();
+                    var probe = System.Text.Encoding.ASCII.GetBytes($"OPTIONS {url} RTSP/1.0\r\nCSeq: 1\r\n\r\n");
+                    await stream.WriteAsync(probe, cts.Token);
+                    var buf = new byte[256];
+                    int n = await stream.ReadAsync(buf, cts.Token);
+                    var reply = System.Text.Encoding.ASCII.GetString(buf, 0, n);
+                    if (!reply.StartsWith("RTSP/", StringComparison.Ordinal))
+                        return Results.Json(new { ok = false, message = "the host answered, but not with RTSP — check the URL and port" });
+                    // The stream is what matters, so this never fails the test — but
+                    // ONVIF is where every setting for this camera comes from, and
+                    // saying so here is far cheaper than hunting an empty panel later.
+                    // On its OWN budget. The outer 12s belongs to the RTSP check,
+                    // which has already passed by now: letting the ONVIF probe spend
+                    // what is left of it turned a perfectly good camera into "timed
+                    // out — is the address reachable?".
+                    using var onvifCts = CancellationTokenSource.CreateLinkedTokenSource(ctx.RequestAborted);
+                    onvifCts.CancelAfter(TimeSpan.FromSeconds(8));
+                    string onvifNote;
+                    try
+                    {
+                        // Null (not sent) = the stored address; "" = none, derive it
+                        // from the stream host — the same reading Save gives it.
+                        onvifNote = await TestOnvifAsync(
+                            req.OnvifAddress == null ? stored?.OnvifAddress
+                                : req.OnvifAddress.Length == 0 ? null
+                                : ConfigEditor.UnmaskPassword(req.OnvifAddress, stored?.OnvifAddress) ?? stored?.OnvifAddress,
+                            url, onvifCts.Token);
+                    }
+                    catch (OperationCanceledException) when (!ctx.RequestAborted.IsCancellationRequested)
+                    {
+                        onvifNote = "ONVIF did not answer in time, so this camera may show no settings — " +
+                                    "enable ONVIF on the camera, or set its ONVIF address above.";
+                    }
+                    return Results.Json(new
+                    {
+                        ok = true,
+                        message = "RTSP endpoint answered (credentials are verified when streaming starts). " + onvifNote,
+                    });
+                }
+
+                var address = req.Address is { Length: > 0 } a ? a
+                    : stored != null && !stored.IsGenericRtsp && !string.IsNullOrWhiteSpace(stored.Host)
+                        ? (stored.Port == 9000 ? stored.Host : $"{stored.Host}:{stored.Port}")
+                        : null;
+                // An address is required for TCP; over UDP it is optional (discovery
+                // finds the camera by UID via broadcast), but must be valid if given.
+                if (ConfigEditor.HostPortError(address ?? "") is { } addrErr2 && (address != null || !udp))
+                    return Results.Json(new { ok = false, message = addrErr2 });
+                if (udp && string.IsNullOrWhiteSpace(uid))
+                    return Results.Json(new
+                    {
+                        ok = false,
+                        message = "a UDP camera needs its UID to test (Reolink app → device info, or the sticker)",
+                    });
+                var username = req.Username is { Length: > 0 } u ? u : stored?.Username;
+                if (string.IsNullOrWhiteSpace(username))
+                    return Results.Json(new { ok = false, message = "username is required to test" });
+                var password = req.Password is { Length: > 0 } p ? p : stored?.Password;
+
+                var (host, port) = ("", 9000);
+                if (address != null)
+                {
+                    int colon = address.LastIndexOf(':');
+                    (host, port) = colon > address.LastIndexOf(']')
+                        ? (address[..colon].Trim('[', ']'), int.Parse(address[(colon + 1)..]))
+                        : (address.Trim('[', ']'), 9000);
+                }
+                byte channel = (byte)Math.Clamp(req.ChannelId ?? stored?.ChannelId ?? 0, 0, 255);
+
+                await using var camera = udp
+                    ? await Protocol.BcCamera.ConnectUdpAsync(host, uid!, channel, cts.Token, tag: "test")
+                    : await Protocol.BcCamera.ConnectAsync(host, port, channel, cts.Token, tag: "test");
+                // The stored camera's login override applies here too, or "Test"
+                // would report a failure the running bridge does not actually have.
+                await camera.LoginAsync(username!, password, cts.Token,
+                    Protocol.BcLoginMode.From(stored?.MaxEncryption, stored?.LegacyLogin ?? false));
+                var di = camera.DeviceInfo;
+                return Results.Json(new
+                {
+                    ok = true,
+                    message = (udp ? "Connected over UDP and logged in" : "Connected and logged in") +
+                        (di is { Width: > 0 } ? $" — the camera reports {di.Width}x{di.Height}" : ""),
+                });
+            }
+            catch (OperationCanceledException) when (!ctx.RequestAborted.IsCancellationRequested)
+            {
+                return Results.Json(new
+                {
+                    ok = false,
+                    message = udp
+                        ? "timed out — the camera did not answer UDP discovery. It may be asleep, on another "
+                          + "subnet, or broadcast may be blocked (a Docker bridge network blocks it; use host networking)."
+                        : "timed out — is the address reachable from this server?",
+                });
+            }
+            catch (Exception ex)
+            {
+                return Results.Json(new { ok = false, message = Log.Flatten(ex) });
+            }
+        });
+
+        app.MapPost("/api/admin/restart", (HttpContext ctx) =>
+        {
+            if (AdminOnly(ctx) is { } denied) return denied;
+            Log.Warn($"Restart requested via the web UI by '{SessionName(ctx)}'");
+            _ = Task.Run(async () =>
+            {
+                await Task.Delay(700); // let this response reach the browser first
+                o.RestartRequested();
+            });
+            return Results.Json(new
+            {
+                ok = true,
+                note = "shutting down — the restart policy (docker / systemd / the HA add-on's Watchdog) brings the service back",
+            });
+        });
+
+        // Email notifications (admin only). The SMTP password is never returned —
+        // GET reports only whether one is stored; PUT takes it write-only.
+        if (o.Notifier is { } notifier)
+        {
+            object ShapeNotifications()
+            {
+                var s = notifier.Store.Snapshot();
+                return new
+                {
+                    enabled = s.Enabled,
+                    recipient = s.Recipient,
+                    smtpHost = s.SmtpHost,
+                    smtpPort = s.SmtpPort,
+                    security = s.Security.ToString().ToLowerInvariant(),
+                    username = s.Username,
+                    hasPassword = notifier.Store.HasPassword,
+                    from = s.From,
+                    fromName = s.FromName,
+                    alertStorage = s.AlertStorage,
+                    alertOverload = s.AlertOverload,
+                    alertCameraOffline = s.AlertCameraOffline,
+                    alertWriteFailure = s.AlertWriteFailure,
+                    offlineThresholdMinutes = s.OfflineThresholdMinutes,
+                    offlineAttachSnapshots = s.OfflineAttachSnapshots,
+                    offlineSnapshotCount = s.OfflineSnapshotCount,
+                    offlineSnapshotLookbackMinutes = s.OfflineSnapshotLookbackMinutes,
+                    cameraOfflineOverrides = s.CameraOfflineOverrides,
+                    eventSnapshots = s.EventSnapshots,
+                    eventCooldownMinutes = s.EventCooldownMinutes,
+                    eventEmailDelaySeconds = s.EventEmailDelaySeconds,
+                    eventSnapshotMode = s.EventSnapshotMode,
+                    webhookEnabled = s.WebhookEnabled,
+                    webhookUrl = s.WebhookUrl,
+                    webhookInsecureTls = s.WebhookInsecureTls,
+                    hasWebhookToken = notifier.Store.HasWebhookToken,
+                    webhookMethod = s.WebhookMethod,
+                    webhookBodyMode = s.WebhookBodyMode,
+                    webhookBodyTemplate = s.WebhookBodyTemplate,
+                    webhookHeaders = s.WebhookHeaders,
+                    webhookPreset = s.WebhookPreset,
+                    webhookServerAlerts = s.WebhookServerAlerts,
+                    publicUrl = s.PublicUrl,
+                    cameras = cameras.Select(c => c.Name).ToList(),
+                };
+            }
+
+            static Neolink.Notifications.SmtpSecurity ParseSecurity(string? v, Neolink.Notifications.SmtpSecurity fallback) =>
+                v?.ToLowerInvariant() switch
+                {
+                    "starttls" => Neolink.Notifications.SmtpSecurity.StartTls,
+                    "ssl" => Neolink.Notifications.SmtpSecurity.Ssl,
+                    "none" => Neolink.Notifications.SmtpSecurity.None,
+                    _ => fallback,
+                };
+
+            // Free-text fields are bounded here — notifications.json is echoed
+            // on every GET and nothing legitimate approaches these sizes.
+            static string Cap(string v, int max) => v.Length > max ? v[..max] : v;
+
+            Neolink.Notifications.NotificationSettings MergedFrom(NotificationRequest req)
+            {
+                var cur = notifier.Store.Snapshot();
+                return new Neolink.Notifications.NotificationSettings
+                {
+                    Enabled = req.Enabled ?? cur.Enabled,
+                    Recipient = Cap((req.Recipient ?? cur.Recipient).Trim(), 320),
+                    SmtpHost = Cap((req.SmtpHost ?? cur.SmtpHost).Trim(), 253),
+                    SmtpPort = Math.Clamp(req.SmtpPort ?? cur.SmtpPort, 1, 65535),
+                    Security = ParseSecurity(req.Security, cur.Security),
+                    Username = Cap(req.Username ?? cur.Username, 320),
+                    From = Cap((req.From ?? cur.From).Trim(), 320),
+                    FromName = Cap(req.FromName ?? cur.FromName, 200),
+                    AlertStorage = req.AlertStorage ?? cur.AlertStorage,
+                    AlertOverload = req.AlertOverload ?? cur.AlertOverload,
+                    AlertCameraOffline = req.AlertCameraOffline ?? cur.AlertCameraOffline,
+                    AlertWriteFailure = req.AlertWriteFailure ?? cur.AlertWriteFailure,
+                    OfflineThresholdMinutes = Math.Clamp(req.OfflineThresholdMinutes ?? cur.OfflineThresholdMinutes, 0, 1440),
+                    OfflineAttachSnapshots = req.OfflineAttachSnapshots ?? cur.OfflineAttachSnapshots,
+                    OfflineSnapshotCount = Math.Clamp(req.OfflineSnapshotCount ?? cur.OfflineSnapshotCount, 1, 10),
+                    OfflineSnapshotLookbackMinutes =
+                        Math.Clamp(req.OfflineSnapshotLookbackMinutes ?? cur.OfflineSnapshotLookbackMinutes, 0, 10080),
+                    CameraOfflineOverrides = req.CameraOfflineOverrides != null
+                        ? new(req.CameraOfflineOverrides, StringComparer.OrdinalIgnoreCase)
+                        : cur.CameraOfflineOverrides,
+                    // 50 is the hard ceiling by design (the mail must stay a
+                    // notification, not become the recording); 0 cooldown = every event.
+                    EventSnapshots = Math.Clamp(req.EventSnapshots ?? cur.EventSnapshots, 1, 50),
+                    EventCooldownMinutes = Math.Clamp(req.EventCooldownMinutes ?? cur.EventCooldownMinutes, 0, 1440),
+                    EventEmailDelaySeconds = Math.Clamp(req.EventEmailDelaySeconds ?? cur.EventEmailDelaySeconds, 0, 300),
+                    EventSnapshotMode = req.EventSnapshotMode == null ? cur.EventSnapshotMode
+                        : req.EventSnapshotMode.Equals("memory", StringComparison.OrdinalIgnoreCase) ? "memory" : "clip",
+                    WebhookEnabled = req.WebhookEnabled ?? cur.WebhookEnabled,
+                    WebhookUrl = Cap((req.WebhookUrl ?? cur.WebhookUrl).Trim(), 2000),
+                    WebhookInsecureTls = req.WebhookInsecureTls ?? cur.WebhookInsecureTls,
+                    WebhookMethod = req.WebhookMethod == null ? cur.WebhookMethod
+                        : req.WebhookMethod.Equals("PUT", StringComparison.OrdinalIgnoreCase) ? "PUT" : "POST",
+                    WebhookBodyMode = req.WebhookBodyMode?.ToLowerInvariant() switch
+                    {
+                        null => cur.WebhookBodyMode,
+                        "text" => "text",
+                        "snapshot" => "snapshot",
+                        "multipart" => "multipart",
+                        _ => "json",
+                    },
+                    WebhookBodyTemplate = req.WebhookBodyTemplate == null ? cur.WebhookBodyTemplate
+                        : req.WebhookBodyTemplate.Length > 4000 ? req.WebhookBodyTemplate[..4000] : req.WebhookBodyTemplate,
+                    WebhookHeaders = req.WebhookHeaders == null ? new(cur.WebhookHeaders)
+                        : req.WebhookHeaders.Take(20).Select(h => h.Length > 500 ? h[..500] : h).ToList(),
+                    WebhookPreset = Cap(req.WebhookPreset ?? cur.WebhookPreset, 40),
+                    WebhookServerAlerts = req.WebhookServerAlerts ?? cur.WebhookServerAlerts,
+                    PublicUrl = Cap((req.PublicUrl ?? cur.PublicUrl).Trim(), 2000),
+                };
+            }
+
+            app.MapGet("/api/admin/notifications", (HttpContext ctx) =>
+                AdminOnly(ctx) ?? Results.Json(ShapeNotifications()));
+
+            app.MapPut("/api/admin/notifications", (NotificationRequest req, HttpContext ctx) =>
+            {
+                if (AdminOnly(ctx) is { } denied) return denied;
+                notifier.Store.Save(MergedFrom(req), req.Password, req.WebhookToken); // secrets write-only
+                return Results.Json(ShapeNotifications());
+            });
+
+            app.MapPost("/api/admin/notifications/test", async (NotificationRequest req, HttpContext ctx) =>
+            {
+                if (AdminOnly(ctx) is { } denied) return denied;
+                // Test with the posted (possibly unsaved) settings so the user can
+                // verify before saving; password null = use the stored one.
+                var error = await notifier.SendTestAsync(MergedFrom(req), req.Password, ctx.RequestAborted);
+                return error == null
+                    ? Results.Json(new { ok = true })
+                    : Results.Json(new { error }, statusCode: 502);
+            });
+
+            app.MapPost("/api/admin/notifications/webhook-test", async (NotificationRequest req, HttpContext ctx) =>
+            {
+                if (AdminOnly(ctx) is { } denied) return denied;
+                var error = await notifier.SendTestWebhookAsync(MergedFrom(req), req.WebhookToken, ctx.RequestAborted);
+                return error == null
+                    ? Results.Json(new { ok = true })
+                    : Results.Json(new { error }, statusCode: 502);
+            });
+        }
+
+        // AI event descriptions (admin only) — same contract as notifications:
+        // the API key is never returned, GET reports only whether one is stored.
+        if (o.Ai is { } aiStore)
+        {
+            object ShapeAi()
+            {
+                var s = aiStore.Snapshot();
+                return new
+                {
+                    enabled = s.Enabled,
+                    provider = s.Provider,
+                    endpoint = s.Endpoint,
+                    model = s.Model,
+                    hasApiKey = aiStore.HasApiKey,
+                    ollamaEndpoint = s.OllamaEndpoint,
+                    ollamaModel = s.OllamaModel,
+                    anthropicEndpoint = s.AnthropicEndpoint,
+                    anthropicModel = s.AnthropicModel,
+                    hasAnthropicKey = aiStore.HasAnthropicKey,
+                    prompt = s.Prompt,
+                    defaultPrompt = Neolink.Ai.AiSettings.DefaultPrompt,
+                    noThink = s.NoThink,
+                    sampleEverySeconds = s.SampleEverySeconds,
+                    maxFrames = s.MaxFrames,
+                    timeoutSeconds = s.TimeoutSeconds,
+                    // Lets the settings UI say whether stream sampling / pre-roll /
+                    // downscaling are live on this install, instead of guessing.
+                    ffmpeg = Neolink.Ai.AiPreroll.FfmpegPath != null,
+                };
+            }
+
+            Neolink.Ai.AiSettings MergedAi(AiSettingsRequest req)
+            {
+                var cur = aiStore.Snapshot();
+                return new Neolink.Ai.AiSettings
+                {
+                    Enabled = req.Enabled ?? cur.Enabled,
+                    Provider = (req.Provider ?? cur.Provider).ToLowerInvariant() switch
+                    {
+                        "ollama" => "ollama",
+                        "anthropic" => "anthropic",
+                        _ => "openai",
+                    },
+                    Endpoint = (req.Endpoint ?? cur.Endpoint).Trim(),
+                    Model = (req.Model ?? cur.Model).Trim(),
+                    OllamaEndpoint = (req.OllamaEndpoint ?? cur.OllamaEndpoint).Trim(),
+                    OllamaModel = (req.OllamaModel ?? cur.OllamaModel).Trim(),
+                    AnthropicEndpoint = (req.AnthropicEndpoint ?? cur.AnthropicEndpoint).Trim(),
+                    AnthropicModel = (req.AnthropicModel ?? cur.AnthropicModel).Trim(),
+                    Prompt = req.Prompt ?? cur.Prompt,
+                    NoThink = req.NoThink ?? cur.NoThink,
+                    SampleEverySeconds = Math.Clamp(req.SampleEverySeconds ?? cur.SampleEverySeconds, 1, 600),
+                    MaxFrames = Math.Max(1, req.MaxFrames ?? cur.MaxFrames),
+                    TimeoutSeconds = Math.Clamp(req.TimeoutSeconds ?? cur.TimeoutSeconds, 5, 600),
+                };
+            }
+
+            app.MapGet("/api/admin/ai", (HttpContext ctx) =>
+                AdminOnly(ctx) ?? Results.Json(ShapeAi()));
+
+            app.MapPut("/api/admin/ai", (AiSettingsRequest req, HttpContext ctx) =>
+            {
+                if (AdminOnly(ctx) is { } denied) return denied;
+                var merged = MergedAi(req);
+                if (merged.Enabled && merged.ActiveUrl() == null)
+                    return Results.Json(new
+                    {
+                        error = merged.UsesOllama
+                            ? "the Ollama endpoint must be an http(s) URL, e.g. http://127.0.0.1:11434"
+                            : "endpoint must be an http(s) URL, e.g. http://127.0.0.1:1234/v1",
+                    }, statusCode: 400);
+                if (merged.Enabled && merged.UsesOllama && merged.OllamaModel.Length == 0)
+                    return Results.Json(new
+                    {
+                        error = "Ollama needs a vision-capable model name (it has no loaded-model default)",
+                    }, statusCode: 400);
+                if (merged.Enabled && merged.UsesAnthropic && merged.AnthropicModel.Length == 0)
+                    return Results.Json(new
+                    {
+                        error = "the Anthropic backend needs a vision-capable model name",
+                    }, statusCode: 400);
+                aiStore.Save(merged, req.ApiKey, req.AnthropicApiKey); // keys write-only
+                return Results.Json(ShapeAi());
+            });
+
+            app.MapPost("/api/admin/ai/test", async (AiSettingsRequest req, HttpContext ctx) =>
+            {
+                if (AdminOnly(ctx) is { } denied) return denied;
+                // Test with the posted (possibly unsaved) settings so the user can
+                // verify before saving; key null = use the stored one — whichever
+                // key belongs to the backend being tested.
+                var mergedForTest = MergedAi(req);
+                var testKey = mergedForTest.UsesAnthropic
+                    ? req.AnthropicApiKey ?? aiStore.AnthropicApiKey()
+                    : req.ApiKey ?? aiStore.ApiKey();
+                var (error, detail) = await Neolink.Ai.AiDescriber.TestAsync(mergedForTest,
+                    testKey, ctx.RequestAborted);
+                return error == null
+                    ? Results.Json(new { ok = true, detail })
+                    : Results.Json(new { error }, statusCode: 502);
+            });
+        }
+
+        // ------------------------------------------------------------ emergency mode (beta)
+
+        if (o.Emergency is { } emergency)
+        {
+            object ShapeEmergency()
+            {
+                var e = emergency.Snapshot();
+                var ns = o.Notifier?.Store.Snapshot();
+                return new
+                {
+                    enabled = e.Enabled,
+                    email = e.Email,
+                    webhook = e.Webhook,
+                    siren = e.Siren,
+                    lights = e.Lights,
+                    armedUtc = e.ArmedUtc,
+                    cameras = cameras.Select(c => c.Name).ToList(),
+                    // Which channels can actually fire, so the UI can send the user
+                    // to set one up instead of offering a switch that does nothing.
+                    emailAvailable = ns != null && Neolink.Notifications.Notifier.EmailReady(ns),
+                    webhookAvailable = ns != null && Neolink.Notifications.Notifier.WebhookReady(ns),
+                    // Detections come from the event recorder; without one there is
+                    // nothing for emergency mode to forward.
+                    detectionsAvailable = events != null,
+                    // Cameras whose siren/light could not be set — an armed siren
+                    // that never sounded must not read as success.
+                    issues = emergency.Issues.Select(i => new { camera = i.Camera, reason = i.Reason }).ToList(),
+                    overrides = e.Cameras.ToDictionary(kv => kv.Key, kv => new
+                    {
+                        email = kv.Value.Email,
+                        webhook = kv.Value.Webhook,
+                        siren = kv.Value.Siren,
+                        lights = kv.Value.Lights,
+                    }),
+                };
+            }
+
+            app.MapGet("/api/admin/emergency", (HttpContext ctx) =>
+                AdminOnly(ctx) ?? Results.Json(ShapeEmergency()));
+
+            app.MapPut("/api/admin/emergency", async (EmergencyRequest req, HttpContext ctx) =>
+            {
+                if (AdminOnly(ctx) is { } denied) return denied;
+                // Merged under the service's own lock, so a concurrent HA toggle
+                // cannot overwrite these options with its older snapshot. Arming
+                // reaches out to every camera (siren, light): never on the request
+                // thread's cancellation, or a closed tab could half-arm it.
+                await emergency.ApplyAsync(next =>
+                {
+                    next.Enabled = req.Enabled ?? next.Enabled;
+                    next.Email = req.Email ?? next.Email;
+                    next.Webhook = req.Webhook ?? next.Webhook;
+                    next.Siren = req.Siren ?? next.Siren;
+                    next.Lights = req.Lights ?? next.Lights;
+                    if (req.Cameras == null) return next;
+                    // Only known cameras, and an all-null entry is a cleared
+                    // override. Keyed case-insensitively like the store, so two
+                    // spellings of one camera must not throw a duplicate key.
+                    var map = new Dictionary<string, Neolink.Notifications.EmergencyCameraOptions>(
+                        StringComparer.OrdinalIgnoreCase);
+                    foreach (var (key, v) in req.Cameras)
+                    {
+                        if (v == null || (v.Email ?? v.Webhook ?? v.Siren ?? v.Lights) == null) continue;
+                        if (cameras.FirstOrDefault(c =>
+                                string.Equals(c.Name, key, StringComparison.OrdinalIgnoreCase)) is not { } cam)
+                            continue;
+                        map[cam.Name] = new Neolink.Notifications.EmergencyCameraOptions
+                        {
+                            Email = v.Email,
+                            Webhook = v.Webhook,
+                            Siren = v.Siren,
+                            Lights = v.Lights,
+                        };
+                    }
+                    next.Cameras = map;
+                    return next;
+                }, CancellationToken.None);
+                return Results.Json(ShapeEmergency());
+            });
+        }
+
+        // ------------------------------------------------------- live object boxes (preview)
+
+        if (o.Detect is { } detect)
+        {
+            object ShapeDetect()
+            {
+                var s = detect.Store.Snapshot();
+                var status = detect.Assets.Current();
+                var extra = detect.Assets.DetailedStatus();
+                return new
+                {
+                    enabled = s.Enabled,
+                    minConfidence = s.MinConfidence,
+                    fps = s.Fps,
+                    groups = s.EffectiveGroups,
+                    knownGroups = Neolink.Detect.DetectSettings.KnownGroups,
+                    detailed = s.Detailed,
+                    assets = new
+                    {
+                        state = status.State, percent = status.Percent, error = status.Error,
+                        bytes = Neolink.Detect.DetectAssets.TotalBytes,
+                    },
+                    detailedAssets = new
+                    {
+                        state = extra.State, percent = extra.Percent, error = extra.Error,
+                        bytes = Neolink.Detect.DetectAssets.Detailed.Bytes,
+                    },
+                };
+            }
+
+            // Readable by any signed-in user: the wall has to know whether to load a
+            // detector at all. Only admins can change it.
+            app.MapGet("/api/detect", () => Results.Json(ShapeDetect()));
+
+            app.MapPut("/api/admin/detect", (DetectRequest req, HttpContext ctx) =>
+            {
+                if (AdminOnly(ctx) is { } denied) return denied;
+                var next = detect.Store.Snapshot();
+                next.Enabled = req.Enabled ?? next.Enabled;
+                next.MinConfidence = req.MinConfidence ?? next.MinConfidence;
+                next.Fps = req.Fps ?? next.Fps;
+                next.Detailed = req.Detailed ?? next.Detailed;
+                if (req.Groups != null) next.Groups = req.Groups;
+                detect.Store.Save(next);
+                // Switching it on is what pays for the download: 35 MB fetched once,
+                // in the background, so the first camera view already has it. The
+                // detailed model is another 29 MB, and only when it is asked for.
+                if (next.Enabled) _ = detect.Assets.EnsureAsync(next.Detailed);
+                return Results.Json(ShapeDetect());
+            });
+
+            // Deliberately NOT under /api: the page loads these with <script> and the
+            // runtime fetches its own .wasm, neither of which can carry a session
+            // token. They are fixed public files — the pinned ONNX Runtime build and
+            // the published model — so they hold nothing a session would protect.
+            app.MapGet("/detect/asset/{file}", (string file, HttpContext ctx) =>
+            {
+                if (detect.Assets.Locate(file) is not { } path)
+                    return Results.NotFound();
+                var type = Path.GetExtension(file) switch
+                {
+                    ".js" or ".mjs" => "text/javascript",
+                    ".wasm" => "application/wasm",
+                    _ => "application/octet-stream",
+                };
+                // Pinned by checksum, so these bytes can never change under this
+                // name: without this the 35 MB would be re-validated on every page
+                // load, over whatever link the phone is on.
+                ctx.Response.Headers.CacheControl = "public, max-age=31536000, immutable";
+                return Results.File(path, type, enableRangeProcessing: true);
+            });
+
+            // An install that was already using it gets its files back after a state
+            // dir is moved or cleared, without waiting for someone to open Settings.
+            if (detect.Store.Snapshot() is { Enabled: true } boot) _ = detect.Assets.EnsureAsync(boot.Detailed);
+        }
+
+        // Per-user UI settings: an opaque JSON blob the client owns.
+        app.MapGet("/api/me/settings", (HttpContext ctx) =>
+            SessionName(ctx) is { } me
+                ? Results.Content(userStore.GetSettings(me), "application/json")
+                : Results.Json(new { error = "authentication disabled" }, statusCode: 404));
+
+        app.MapPut("/api/me/settings", async (HttpContext ctx) =>
+        {
+            if (SessionName(ctx) is not { } me)
+                return Results.Json(new { error = "authentication disabled" }, statusCode: 404);
+            using var reader = new StreamReader(ctx.Request.Body);
+            var json = await reader.ReadToEndAsync();
+            try
+            {
+                userStore.SetSettings(me, json);
+                return Results.Json(new { ok = true });
+            }
+            catch (Exception ex) when (ex is ArgumentException or JsonException)
+            {
+                return Results.Json(new { error = "invalid settings payload" }, statusCode: 400);
+            }
+        });
+
+        // Per-page variant: each page keeps its own blob (e.g. "timeline"), so
+        // pages never read-modify-write — and thus never clobber — each other.
+        static bool ValidPageKey(string page) =>
+            page.Length is > 0 and <= 32 && page.All(c => char.IsAsciiLetterLower(c) || c == '-');
+
+        app.MapGet("/api/me/settings/{page}", (string page, HttpContext ctx) =>
+            !ValidPageKey(page)
+                ? Results.Json(new { error = "invalid page key" }, statusCode: 400)
+                : SessionName(ctx) is { } me
+                    ? Results.Content(userStore.GetPageSettings(me, page), "application/json")
+                    : Results.Json(new { error = "authentication disabled" }, statusCode: 404));
+
+        app.MapPut("/api/me/settings/{page}", async (string page, HttpContext ctx) =>
+        {
+            if (!ValidPageKey(page))
+                return Results.Json(new { error = "invalid page key" }, statusCode: 400);
+            if (SessionName(ctx) is not { } me)
+                return Results.Json(new { error = "authentication disabled" }, statusCode: 404);
+            using var reader = new StreamReader(ctx.Request.Body);
+            var json = await reader.ReadToEndAsync();
+            try
+            {
+                userStore.SetPageSettings(me, page, json);
+                return Results.Json(new { ok = true });
+            }
+            catch (Exception ex) when (ex is ArgumentException or JsonException)
+            {
+                return Results.Json(new { error = "invalid settings payload" }, statusCode: 400);
+            }
+        });
+
+        // Storage shape cached briefly: every open dashboard polls features every
+        // 10 s, and a fresh sample stats every tier's volume — a network round
+        // trip per tier on NAS mounts. Capacity moves far slower than that.
+        // Locked because concurrent polls race the stamp, and a torn DateTime
+        // read (32-bit hosts) could otherwise wedge the cache stale.
+        var storageShapeGate = new object();
+        object? storageShape = null;
+        var storageShapeAt = DateTime.MinValue;
+
+        // Feature discovery, so clients can hide UI for what this server won't do.
+        app.MapGet("/api/features", () =>
+        {
+            // Every page load reads this endpoint, so it doubles as the "check
+            // for updates now" moment (throttled inside — see UpdateChecker.Nudge).
+            o.Updates?.Nudge();
+            object? storage;
+            lock (storageShapeGate)
+            {
+                if (DateTime.UtcNow - storageShapeAt > TimeSpan.FromSeconds(5))
+                {
+                    storageShape = ShapeStorage(o.Storage);
+                    storageShapeAt = DateTime.UtcNow;
+                }
+                storage = storageShape;
+            }
+            return Results.Json(new
+            {
+            events = events != null,
+            continuous = events != null && RecordingConfig.ContinuousEnabled,
+            trickleSpeed,
+            talk = o.TalkEnabled, // beta, opt-in via ui.talk
+            showBackgroundTasks = o.ShowBackgroundTasks,
+
+            version = o.Version,
+            latestVersion = o.Updates?.Latest,
+            repoUrl = UpdateChecker.RepoUrl,
+            // Footage encryption active on this server — the UI swaps the brand
+            // dot for a padlock so anyone signed in can see recordings are
+            // protected at rest.
+            encrypted = Recording.FootageVault.EncryptingNew,
+            // Worst storage tier state, for the live view's banner: "warn" when
+            // any tier is >= 90% used, "full" when one is out of space (recording
+            // to it has halted). Rides this endpoint so the wall needs no extra poll.
+            storage,
+            // Server-condition signals for the dashboard's browser alerts (the
+            // in-app twin of the email alerts): sustained high CPU, and recent
+            // recording write failures. The client fires a notification on the
+            // false->true edge. Same sources the email AlertMonitor uses.
+            overload = o.Monitor?.Overloaded() ?? false,
+            writeFailure = o.RecordingHealth?.CamerasWithRecentErrors(TimeSpan.FromMinutes(2)).Count > 0,
+            });
+        });
+
+        // Background jobs the admin should know about (footage archiving, ...),
+        // with progress — feeds the web UI's background-process strip. Admin only
+        // once accounts exist; open on a no-auth server, like the other admin
+        // surfaces there.
+        app.MapGet("/api/background", (HttpContext ctx) =>
+            userStore.Enabled && !IsAdmin(ctx)
+                ? Results.Json(new { error = "admin only" }, statusCode: 403)
+                : Results.Json(BackgroundTasks.Active().Select(t => new
+                {
+                    id = t.Id,
+                    name = t.Name,
+                    detail = t.Detail,
+                    percent = t.Percent is double p ? Math.Round(p, 1) : (double?)null,
+                    startedUtc = t.StartedUtc,
+                })));
+
+        // Every configured storage location and its capacity (monitor page).
+        app.MapGet("/api/storage", () =>
+            o.Storage == null
+                ? Results.Json(new { error = "recording is not configured" }, statusCode: 404)
+                : Results.Json(o.Storage.Sample().Select(s =>
+                {
+                    // "When does it fill?" from the persisted free-space trend:
+                    // measuring (no verdict yet) / steady (retention keeping up) /
+                    // filling with the projected days remaining.
+                    var (state, days) = o.Forecast?.Forecast(s.Path) ?? ("measuring", null);
+                    return new
+                    {
+                        role = s.Role.ToString().ToLowerInvariant(),
+                        label = s.Label,
+                        path = s.Path,
+                        totalBytes = s.TotalBytes,
+                        freeBytes = s.FreeBytes,
+                        usedPercent = Math.Round(s.UsedPercent, 1),
+                        online = s.Online,
+                        warn = s.Warn,
+                        full = s.Full,
+                        forecastState = state,
+                        forecastDays = days is { } d ? Math.Round(d, 1) : (double?)null,
+                    };
+                })));
+
+        app.MapGet("/api/cameras", () =>
+        {
+            // How this camera is attached to the network, for the sidebar icon:
+            // { kind: "wifi", level 0-4, label } or { kind: "wired" }. Null only when
+            // the camera has said nothing either way — a blank space is honest there,
+            // but a Wi-Fi-capable camera sitting on a cable must NOT read as "no
+            // signal", which is what showing nothing implied before.
+            //
+            // The Wi-Fi reading is the actively refreshed value (HTTP API, else the
+            // Baichuan query), with the camera's unsolicited NetInfo push as fallback
+            // — one order for every consumer, so the sidebar and the camera page
+            // cannot disagree. Suppressed while the camera is unreachable: a reading
+            // from a camera that hasn't answered in hours is worse than none. A
+            // dozing battery camera keeps its last one (asleep on purpose, not lost).
+            static object? LinkJson(WebCameraInfo c)
+            {
+                if (!c.Control.Online && !(c.Asleep?.Invoke() ?? false))
+                {
+                    c.Control.ForgetWifiSignal();
+                    return null;
+                }
+                var w = c.Control.CachedWifiSignal
+                        ?? (c.WifiSignal?.Invoke() is { } dbm ? WifiReading.FromDbm(dbm) : null);
+                if (w != null) return new { kind = "wifi", level = w.Level, label = w.Label };
+                // No reading: the camera may simply be on a cable. Its own answer
+                // (GetLocalLink) wins; the Baichuan net_type push stands in for
+                // cameras without the HTTP API.
+                bool wired = c.Control.CachedWired
+                             ?? CameraControl.LinkKindOf(c.NetType?.Invoke()) == 1;
+                return wired ? new { kind = "wired", level = 0, label = "Wired (Ethernet)" } : null;
+            }
+
+            var payload = cameras.Select(c => new
+            {
+                name = c.Name,
+                online = c.Control.Online,
+                // The configured host (for the settings identity strip) — already
+                // known to anyone who can reach this API; not sensitive on a LAN.
+                address = c.Address,
+                // Baichuan-over-UDP transport (beta) — the UI badges these cameras.
+                udp = c.Udp,
+                // 24/7 footage being written right now (drives the UI's REC badge)
+                recording = c.ContinuousActive?.Invoke() ?? false,
+                // Battery cameras: intentionally disconnected (dozing) vs offline,
+                // plus the latest battery reading when the camera reports one.
+                asleep = c.Asleep?.Invoke() ?? false,
+                // Camera dark on purpose (privacy mode) — set from this UI OR the
+                // Reolink app; the pushes keep it current either way.
+                privacy = c.PrivacyOn?.Invoke() ?? false,
+                // Suspended in Neolink (beta): no connection held, so it can't be
+                // viewed or recorded here. Distinct from offline-because-unreachable.
+                suspended = c.Suspended?.Invoke() ?? false,
+                canSuspend = c.SetSuspended != null,
+                // Battery camera Neolink lets doze: the wall bounds how long its
+                // tile streams and offers a keep-awake override, because every
+                // second of video costs this camera charge.
+                sleeps = c.SleepFriendly?.Invoke() ?? false,
+                // Network link: { kind, level, label } — see LinkJson above.
+                wifiSignal = LinkJson(c),
+                battery = c.Battery?.Invoke() is { } b
+                    ? new { percent = b.Percent, charging = b.Charging }
+                    : null,
+                // On-demand clip capture (record button / HA switch). Null when the
+                // camera has no event recorder or its events switch is off — the
+                // UI hides the button entirely in that case.
+                onDemand = c.EventRecorder is { } rec && rec.OnDemandAvailable
+                    ? new
+                    {
+                        active = rec.OnDemand != null,
+                        remainingSeconds = rec.OnDemand?.RemainingSeconds ?? 0,
+                        maxSeconds = rec.OnDemandMaxSeconds,
+                    }
+                    : null,
+                streams = c.Streams.Select(s => new
+                {
+                    kind = s.Kind,
+                    path = s.Path,
+                    ready = s.Hub.VideoReady,
+                    codec = s.Hub.Codec?.ToString(),
+                    width = s.Hub.Width,
+                    height = s.Hub.Height,
+                    rtspPort,
+                }),
+            });
+            // Kick a throttled, non-blocking Wi-Fi refresh per camera so the cached
+            // values the list just read stay current without the poll ever doing I/O.
+            foreach (var c in cameras)
+                _ = c.Control.WarmWifiSignalAsync(CancellationToken.None);
+            return Results.Json(payload);
+        });
+
+        // ------------------------------------------------------------ camera control
+
+        // Denies a mutating request unless it carries valid Basic credentials of a
+        // permitted user. Mirrors the RTSP rules: no configured users = open access.
+        // When web-UI accounts exist, the session (already checked by the auth
+        // middleware) supersedes the RTSP Basic mapping entirely.
+        IResult? CheckAuth(HttpContext ctx, WebCameraInfo cam)
+        {
+            if (userStore.Enabled)
+                return ctx.Items.ContainsKey("authUser")
+                    ? null
+                    : Results.Json(new { error = "authentication required" }, statusCode: 401);
+            var creds = NetUtil.DecodeBasicAuth(ctx.Request.Headers.Authorization);
+            if (NetUtil.Permits(users, cam.PermittedUsers, creds?.User, creds?.Pass))
+                return null;
+            ChallengeBasic(ctx);
+            return Results.Json(new { error = "authentication required" }, statusCode: 401);
+        }
+
+        async Task<IResult> ExecAsync(string name, HttpContext ctx, bool mutating,
+            Func<ICameraControl, CancellationToken, Task<IResult>> action)
+        {
+            var cam = cameras.FirstOrDefault(c => string.Equals(c.Name, name, StringComparison.OrdinalIgnoreCase));
+            if (cam == null)
+                return Results.Json(new { error = $"unknown camera '{name}'" }, statusCode: 404);
+            if (mutating && CheckAuth(ctx, cam) is { } denied)
+                return denied;
+            try
+            {
+                return await action(cam.Control, ctx.RequestAborted);
+            }
+            catch (OperationCanceledException) when (ctx.RequestAborted.IsCancellationRequested)
+            {
+                // The client gave up (panel closed, page navigated, HTTP timeout) —
+                // nobody is listening for this response. Swallowing it here keeps
+                // an aborted request from surfacing as an unhandled exception.
+                return Results.StatusCode(499); // nginx's "client closed request"
+            }
+            catch (CameraOfflineException)
+            {
+                return Results.Json(new { error = "camera offline (reconnecting)" }, statusCode: 503);
+            }
+            catch (NotSupportedException ex)
+            {
+                return Results.Json(new { error = ex.Message }, statusCode: 404);
+            }
+            catch (ArgumentException ex)
+            {
+                return Results.Json(new { error = ex.Message }, statusCode: 400);
+            }
+            catch (CameraCommandException ex)
+            {
+                return Results.Json(new { error = ex.Message }, statusCode: 502);
+            }
+            catch (InvalidOperationException ex)
+            {
+                // The camera answered but didn't do what was asked (e.g. a service
+                // enable that still reads disabled on the verify re-read).
+                return Results.Json(new { error = ex.Message }, statusCode: 502);
+            }
+            catch (ReolinkApiException ex)
+            {
+                // Also logged: HTTP-API rejections (wrong payload shape, unsupported
+                // command) must be diagnosable from the server log, not only from
+                // the panel's transient error banner.
+                Log.Warn($"{name}: camera HTTP API rejected the request — {ex.Message}");
+                return Results.Json(new { error = ex.Message }, statusCode: 502);
+            }
+            catch (TimeoutException)
+            {
+                return Results.Json(new { error = "camera did not reply" }, statusCode: 504);
+            }
+            catch (Exception ex) when (ex is IOException or System.Net.Sockets.SocketException)
+            {
+                return Results.Json(new { error = $"camera connection error: {ex.Message}" }, statusCode: 502);
+            }
+        }
+
+        // Once a web-UI/API change has actually applied to a camera setting, nudge the
+        // Home Assistant bridge to re-publish that camera's state right away
+        // (fire-and-forget) — otherwise HA only catches up on its ~20s periodic
+        // refresh, and an automation could act on a stale switch in the meantime.
+        // No-op when MQTT isn't configured; a failed publish heals on the next refresh.
+        void NudgeHa(string cameraName) => _ = o.OnCameraChanged?.Invoke(cameraName);
+
+        app.MapGet("/api/cameras/{name}/capabilities", (string name, HttpContext ctx) =>
+            ExecAsync(name, ctx, mutating: false, async (control, reqCt) =>
+            {
+                if (!control.Online)
+                    return Results.Json(new { online = false });
+                var caps = await control.GetCapabilitiesAsync(reqCt);
+                // A non-Reolink camera answers provisionally until its ONVIF probe lands: wait a little
+                // for the real answer, unless the probe has already failed (no ONVIF).
+                for (int i = 0; caps.Provisional && control is GenericCameraControl { ProbePending: true, DiscoveryFailed: false }
+                                && i < 16; i++)
+                {
+                    await Task.Delay(500, reqCt);
+                    caps = await control.GetCapabilitiesAsync(reqCt);
+                }
+                // Refresh the cached capability signals the recording tab filters
+                // its event-type chips with (only a change touches the disk).
+                o.CameraState?.SetDetectionCaps(name, doorbell: caps.Features.Doorbell);
+                return Results.Json(new
+                {
+                    online = true,
+                    version = caps.Version == null ? null : new
+                    {
+                        name = caps.Version.Name,
+                        model = caps.Version.Model,
+                        serial = caps.Version.SerialNumber,
+                        firmware = caps.Version.FirmwareVersion,
+                        hardware = caps.Version.HardwareVersion,
+                        build = caps.Version.BuildDay,
+                    },
+                    features = new
+                    {
+                        ptz = caps.Features.Ptz,
+                        led = caps.Features.Led,
+                        pir = caps.Features.Pir,
+                        battery = caps.Features.Battery,
+                        // Gated on the server-wide beta switch: with ui.talk off,
+                        // the UI never shows a mic button even on capable cameras.
+                        talk = o.TalkEnabled && caps.Features.Talk,
+                        zoom = caps.Features.Zoom,
+                        siren = caps.Features.Siren,
+                        floodlight = caps.Features.Floodlight,
+                        whiteLed = caps.Features.WhiteLed,
+                        spotlight = caps.Features.Spotlight,
+                        doorbell = caps.Features.Doorbell,
+                        privacy = caps.Features.Privacy,
+                        streamSettings = control.CanSetStreamSettings,
+                        // Picture settings reachable over ONVIF when the camera has no
+                        // Reolink HTTP CGI API — lets the panel fetch httpfeatures even
+                        // without http_address, so the sliders show for a Lumus.
+                        imaging = control.HasImagingFallback,
+                        // A non-Reolink camera reboots over ONVIF, or not at all.
+                        reboot = control.CanReboot,
+                        // Every setting on this camera came from ONVIF: the panel
+                        // leaves out what the standard cannot do, and says so.
+                        onvif = control.OnvifOnly,
+                        // The camera knowably keeps no detection zone of its own, so Neolink keeps one
+                        // and the panel offers the editor. A Reolink with an unreachable HTTP API is not that.
+                        localZone = CameraStateStore.ZoneIsLocal(control.CameraHoldsZone, "md", control.ZoneTypes().Count),
+                    },
+                    support = caps.Support == null ? null : XmlToJson(caps.Support),
+                });
+            }));
+
+        app.MapGet("/api/cameras/{name}/streaminfo", (string name, HttpContext ctx) =>
+            ExecAsync(name, ctx, mutating: false, async (control, reqCt) =>
+            {
+                var info = await control.GetStreamInfoAsync(reqCt);
+                var profiles = info?.StreamInfos
+                    .SelectMany(si => si.EncodeTables.Select(t => new
+                    {
+                        type = t.Type,
+                        width = t.Width,
+                        height = t.Height,
+                        defaultFramerate = t.DefaultFramerate,
+                        defaultBitrate = t.DefaultBitrate,
+                        framerates = ParseNumberTable(t.FramerateTable),
+                        bitrates = ParseNumberTable(t.BitrateTable),
+                    }))
+                    .ToList();
+                return Results.Json(new { profiles = (object?)profiles ?? Array.Empty<object>() });
+            }));
+
+        // Stream encode settings ride the Reolink HTTP API (http_address; Baichuan has no
+        // verified setter), or ONVIF on a non-Reolink camera. The stream restarts to apply.
+        Task<IResult> SetStreamSettings(string name, StreamSettingsRequest req, HttpContext ctx) =>
+            ExecAsync(name, ctx, mutating: true, async (control, reqCt) =>
+            {
+                string[] streams = { "mainStream", "subStream", "externStream" };
+                if (req.Stream == null || !streams.Contains(req.Stream))
+                    return Results.Json(new { error = "provide stream: mainStream|subStream|externStream" }, statusCode: 400);
+                if ((req.Width == null) != (req.Height == null))
+                    return Results.Json(new { error = "width and height must be given together" }, statusCode: 400);
+                if (req.Width == null && req.Framerate == null && req.Bitrate == null)
+                    return Results.Json(new { error = "provide width+height, framerate and/or bitrate" }, statusCode: 400);
+                await control.SetStreamSettingsAsync(req.Stream, req.Width, req.Height,
+                    req.Framerate, req.Bitrate, reqCt);
+                return Results.Json(new { ok = true, note = "the camera restarts its stream to apply the change" });
+            });
+        app.MapPost("/api/cameras/{name}/settings/stream", SetStreamSettings);
+        app.MapPut("/api/cameras/{name}/settings/stream", SetStreamSettings);
+
+        // The CURRENT encode selection per stream (what the Reolink app shows) —
+        // lets the UI preselect the real fps/bitrate, not the table defaults.
+        app.MapGet("/api/cameras/{name}/settings/stream", (string name, HttpContext ctx) =>
+            ExecAsync(name, ctx, mutating: false, async (control, reqCt) =>
+            {
+                var enc = await control.GetStreamSettingsAsync(reqCt);
+                return enc == null
+                    ? Results.Json(new
+                    {
+                        error = control.OnvifOnly
+                            ? "stream settings come from the camera's ONVIF media profiles, which could not be read"
+                            : "reading stream settings requires the camera's http_address",
+                    }, statusCode: 404)
+                    : Results.Json(enc.Select(s => new
+                    {
+                        stream = s.Stream,
+                        width = s.Width,
+                        height = s.Height,
+                        framerate = s.Framerate,
+                        bitrate = s.Bitrate,
+                    }));
+            }));
+
+        app.MapGet("/api/cameras/{name}/battery", (string name, HttpContext ctx) =>
+            ExecAsync(name, ctx, mutating: false, async (control, reqCt) =>
+            {
+                var battery = await control.GetBatteryInfoAsync(reqCt);
+                return battery == null
+                    ? Results.Json(new { error = "no battery info" }, statusCode: 404)
+                    : Results.Json(XmlToJson(battery));
+            }));
+
+        // A current still image, straight from the camera's own JPEG snapshot
+        // command — the NVR primitive notification thumbnails and dashboards poll.
+        // Served from a short per-camera cache (default 5 s, ?maxAge= overrides)
+        // with a single-flight gate, so a poll storm reaches the camera once; a
+        // sleeping battery camera is NEVER woken for a poll (control commands
+        // require the live connection), it serves the last frame marked stale.
+        var snapCache = new System.Collections.Concurrent.ConcurrentDictionary<
+            string, (byte[] Jpeg, DateTime AtUtc)>(StringComparer.OrdinalIgnoreCase);
+        var snapGates = new System.Collections.Concurrent.ConcurrentDictionary<
+            string, SemaphoreSlim>(StringComparer.OrdinalIgnoreCase);
+        // When the still came out of the STREAM rather than off the camera, it cost
+        // an ffmpeg decode, so it is not re-taken more often than this however small
+        // a maxAge the caller asks for. A camera poll is a cheap round trip; a
+        // process spawn per tile per poll is not. The frame is still served with its
+        // real age, so nobody is told it is fresher than it is.
+        var grabFloor = TimeSpan.FromSeconds(15);
+        var lastGrab = new System.Collections.Concurrent.ConcurrentDictionary<
+            string, DateTime>(StringComparer.OrdinalIgnoreCase);
+        // Snapshot auth: a web-UI session qualifies (the middleware validated it),
+        // and so do the RTSP user credentials over HTTP Basic — the snapshot is
+        // the still-image twin of the rtsp:// stream URLs: same users, same
+        // per-camera permissions, so a client that already plays
+        // rtsp://user:pass@host/cam can fetch http://user:pass@host/api/cameras/cam/snapshot.jpg.
+        IResult? SnapshotAuth(HttpContext ctx, WebCameraInfo cam)
+        {
+            if (ctx.Items.ContainsKey("authUser"))
+                return null;
+            var creds = NetUtil.DecodeBasicAuth(ctx.Request.Headers.Authorization);
+            if (creds != null
+                && users.TryGetValue(creds.Value.User, out var expected)
+                && NetUtil.FixedTimeEquals(expected, creds.Value.Pass)
+                && (cam.PermittedUsers == null || cam.PermittedUsers.Contains(creds.Value.User)))
+                return null;
+            // Nothing configured to authenticate against → open, like the streams.
+            if (!userStore.Enabled && (cam.PermittedUsers == null || users.Count == 0))
+                return null;
+            ChallengeBasic(ctx);
+            return Results.Json(new { error = "authentication required" }, statusCode: 401);
+        }
+
+        // A still taken from the stream is bounded in height: it backs dashboard
+        // tiles and the detection-zone canvas, neither of which gains anything
+        // from a 4K frame, and the decode is paid for per grab.
+        const int StillHeight = 720;
+
+        static bool IsJpeg(byte[]? b) => Neolink.Media.FrameGrab.IsJpeg(b);
+
+        // The stream to take a still from when the camera has no snapshot command:
+        // the sub-stream first (a small frame decodes in a fraction of the time),
+        // then whatever else is carrying video. A hub is only usable if it is
+        // holding a group of pictures RIGHT NOW — VideoReady stays true after a
+        // source stops, and picking such a hub would mean waiting out the timeout
+        // for a keyframe that is never coming.
+        static IStreamHub? StillHub(WebCameraInfo cam) =>
+            cam.Streams.FirstOrDefault(s => s.Kind == "subStream" && s.Hub.HasBufferedGop)?.Hub
+            ?? cam.Streams.FirstOrDefault(s => s.Hub.HasBufferedGop)?.Hub
+            // Live but with a group too big to buffer: the grab waits for its next keyframe.
+            ?? cam.Streams.FirstOrDefault(s => s.Hub.LiveVideo)?.Hub;
+
+        async Task<IResult> SnapshotAsync(string name, HttpContext ctx)
+        {
+            var cam = cameras.FirstOrDefault(c => string.Equals(c.Name, name, StringComparison.OrdinalIgnoreCase));
+            if (cam == null)
+                return Results.Json(new { error = $"unknown camera '{name}'" }, statusCode: 404);
+            if (SnapshotAuth(ctx, cam) is { } denied)
+                return denied;
+            // Both windows are bounded: past an hour a cached frame misinforms a
+            // dashboard rather than standing in for one.
+            const double MaxCacheWindow = 3600;
+            double maxAge = 5;
+            if (double.TryParse(ctx.Request.Query["maxAge"], System.Globalization.NumberStyles.Float,
+                    System.Globalization.CultureInfo.InvariantCulture, out var q) && q >= 0)
+                maxAge = Math.Min(q, MaxCacheWindow);
+            // How old the FALLBACK frame may be when the camera can't produce a fresh
+            // one. This used to be unbounded, which is how a dashboard tile ended up
+            // painting an hours-old scene: the poster is fetched exactly when a
+            // parked/on-demand camera can't answer, so the fallback is the common
+            // path, not the exception. Past this bound an old frame misleads more
+            // than a black tile informs, so we 503 and the caller shows nothing.
+            double maxStale = 300;
+            if (double.TryParse(ctx.Request.Query["maxStale"], System.Globalization.NumberStyles.Float,
+                    System.Globalization.CultureInfo.InvariantCulture, out var qs) && qs >= 0)
+                maxStale = Math.Min(qs, MaxCacheWindow);
+
+            IResult? Cached(bool allowStale)
+            {
+                if (!snapCache.TryGetValue(cam.Name, out var c))
+                    return null;
+                var age = DateTime.UtcNow - c.AtUtc;
+                if (age.TotalSeconds > (allowStale ? maxStale : maxAge))
+                    return null;
+                ctx.Response.Headers["X-Snapshot-Age"] = ((long)age.TotalSeconds).ToString();
+                if (age.TotalSeconds > maxAge)
+                    ctx.Response.Headers["X-Snapshot-Stale"] = "true";
+                // The server-side cache is the only cache: a browser/HA re-fetch
+                // must reach it, not a stored copy with the same URL.
+                ctx.Response.Headers.CacheControl = "no-store";
+                return Results.Bytes(c.Jpeg, "image/jpeg");
+            }
+
+            if (Cached(allowStale: false) is { } fresh)
+                return fresh;
+            var gate = snapGates.GetOrAdd(cam.Name, _ => new SemaphoreSlim(1, 1));
+            await gate.WaitAsync(ctx.RequestAborted);
+            try
+            {
+                if (Cached(allowStale: false) is { } won)
+                    return won; // refreshed by the request we queued behind
+                byte[]? jpeg = null;
+                string? unavailable = null;
+                try
+                {
+                    jpeg = await cam.Control.SnapshotAsync(ctx.RequestAborted);
+                }
+                catch (OperationCanceledException) when (ctx.RequestAborted.IsCancellationRequested)
+                {
+                    return Results.StatusCode(499);
+                }
+                catch (CameraOfflineException)
+                {
+                    unavailable = cam.Asleep?.Invoke() == true
+                        ? "camera is asleep (battery) — a snapshot poll does not wake it"
+                        : "camera offline (reconnecting)";
+                }
+                catch (TimeoutException) { unavailable = "camera did not reply"; }
+                catch (CameraCommandException ex) { unavailable = ex.Message; }
+                if (jpeg != null && !IsJpeg(jpeg))
+                    unavailable ??= "camera returned an invalid snapshot";
+                // A generic camera whose ONVIF snapshot is missing or failed gets its still out of the
+                // stream; a Reolink's failed snapshot is not something an ffmpeg decode per poll would fix.
+                if (!IsJpeg(jpeg) && (!cam.Control.HasSnapshot || cam.Control.OnvifOnly)
+                    && StillHub(cam) is { } hub)
+                {
+                    // The floor is checked BEFORE the attempt and applies whether or
+                    // not a frame came of it — a grab that yields nothing is the
+                    // expensive case, so throttling only the successes would throttle
+                    // exactly the wrong half.
+                    if (lastGrab.TryGetValue(cam.Name, out var at) && DateTime.UtcNow - at < grabFloor)
+                        return Cached(allowStale: true)
+                               ?? Results.Json(new { error = "no frame could be taken from the camera's stream" },
+                                   statusCode: 503);
+                    lastGrab[cam.Name] = DateTime.UtcNow;
+                    try
+                    {
+                        jpeg = await Neolink.Media.FrameGrab.FromHubAsync(hub, StillHeight, ctx.RequestAborted)
+                            .ConfigureAwait(false);
+                    }
+                    catch (OperationCanceledException) when (ctx.RequestAborted.IsCancellationRequested)
+                    {
+                        // The CLIENT gave up, not the camera: this attempt told us
+                        // nothing, so it must not hold off the next one for 15s.
+                        lastGrab.TryRemove(cam.Name, out _);
+                        return Results.StatusCode(499);
+                    }
+                    if (IsJpeg(jpeg)) unavailable = null;
+                    else unavailable ??= "no frame could be taken from the camera's stream";
+                }
+                else if (!IsJpeg(jpeg) && cam.Control.OnvifOnly && !cam.Control.HasSnapshot)
+                {
+                    // No stream is carrying video right now (reconnecting): a passing state,
+                    // so the last frame stands in rather than "does not support".
+                    unavailable ??= "no live video to take a still from (the stream is reconnecting)";
+                }
+                if (IsJpeg(jpeg))
+                {
+                    snapCache[cam.Name] = (jpeg!, DateTime.UtcNow);
+                    ctx.Response.Headers["X-Snapshot-Age"] = "0";
+                    ctx.Response.Headers.CacheControl = "no-store";
+                    return Results.Bytes(jpeg!, "image/jpeg");
+                }
+                // A non-Reolink camera that HAS a snapshot but returned nothing this
+                // time is a camera that failed, not one without the feature: say so,
+                // which also lets the last good frame stand in below.
+                if (unavailable == null && cam.Control.OnvifOnly && cam.Control.HasSnapshot)
+                    unavailable = "the camera did not return a snapshot";
+                if (unavailable == null)
+                    return Results.Json(new { error = "this camera does not support snapshots" }, statusCode: 404);
+                // An old frame beats no frame for a dashboard tile — serve the last
+                // one we have, honestly labelled (X-Snapshot-Age / X-Snapshot-Stale).
+                if (Cached(allowStale: true) is { } stale)
+                    return stale;
+                return Results.Json(new { error = unavailable }, statusCode: 503);
+            }
+            finally
+            {
+                gate.Release();
+            }
+        }
+        app.MapGet("/api/cameras/{name}/snapshot.jpg", SnapshotAsync);
+        app.MapGet("/api/cameras/{name}/snapshot", SnapshotAsync);
+
+        app.MapGet("/api/cameras/{name}/led", (string name, HttpContext ctx) =>
+            ExecAsync(name, ctx, mutating: false, async (control, reqCt) =>
+            {
+                var led = await control.GetLedStateAsync(reqCt);
+                return led == null
+                    ? Results.Json(new { error = "no LED state" }, statusCode: 404)
+                    : Results.Json(XmlToJson(led));
+            }));
+
+        app.MapPost("/api/cameras/{name}/led", (string name, LedRequest req, HttpContext ctx) =>
+            ExecAsync(name, ctx, mutating: true, async (control, reqCt) =>
+            {
+                string[] allowed = { "open", "close", "auto" };
+                if (req.State == null && req.LightState == null
+                    && req.DoorbellLightState == null && req.IrBrightness == null)
+                    return Results.Json(new { error = "provide state, lightState, doorbellLightState and/or irBrightness" }, statusCode: 400);
+                if ((req.State != null && !allowed.Contains(req.State)) ||
+                    (req.LightState != null && !allowed.Contains(req.LightState)) ||
+                    (req.DoorbellLightState != null && !allowed.Contains(req.DoorbellLightState)))
+                    return Results.Json(new { error = "values must be open, close or auto" }, statusCode: 400);
+                if (req.IrBrightness is { } irb && irb is < 0 or > 100)
+                    return Results.Json(new { error = "irBrightness must be 0-100" }, statusCode: 400);
+                await control.SetLedStateAsync(req.State, req.LightState,
+                    req.DoorbellLightState, req.IrBrightness, reqCt);
+                NudgeHa(name);
+                return Results.Json(new { ok = true });
+            }));
+
+        app.MapGet("/api/cameras/{name}/pir", (string name, HttpContext ctx) =>
+            ExecAsync(name, ctx, mutating: false, async (control, reqCt) =>
+            {
+                var pir = await control.GetPirStateAsync(reqCt);
+                return pir == null
+                    ? Results.Json(new { error = "no PIR settings" }, statusCode: 404)
+                    : Results.Json(XmlToJson(pir));
+            }));
+
+        app.MapPost("/api/cameras/{name}/pir", (string name, PirRequest req, HttpContext ctx) =>
+            ExecAsync(name, ctx, mutating: true, async (control, reqCt) =>
+            {
+                if (req.Enabled == null)
+                    return Results.Json(new { error = "provide enabled: true|false" }, statusCode: 400);
+                await control.SetPirEnabledAsync(req.Enabled.Value, reqCt);
+                NudgeHa(name);
+                return Results.Json(new { ok = true });
+            }));
+
+        app.MapPost("/api/cameras/{name}/ptz", (string name, PtzRequest req, HttpContext ctx) =>
+            ExecAsync(name, ctx, mutating: true, async (control, reqCt) =>
+            {
+                if (string.IsNullOrEmpty(req.Command))
+                    return Results.Json(new { error = "provide command: up|down|left|right|stop" }, statusCode: 400);
+                float speed = Math.Clamp(req.Speed ?? 32f, 1f, 64f);
+                await control.PtzAsync(req.Command, speed, reqCt);
+                return Results.Json(new { ok = true });
+            }));
+
+        app.MapPost("/api/cameras/{name}/reboot", (string name, HttpContext ctx) =>
+            ExecAsync(name, ctx, mutating: true, async (control, reqCt) =>
+            {
+                await control.RebootAsync(reqCt);
+                return Results.Json(new { ok = true });
+            }));
+
+        // The camera's own service-port table (Baichuan msg 37). Queried LIVE on
+        // every request — the answer is the camera's actual state right now,
+        // never a stored value, which is the whole point of the PORTS tab.
+        // ADMIN ONLY, read included: the table is the camera's network surface.
+        static IEnumerable<object> ShapeServices(IReadOnlyList<ServicePortState> ports) =>
+            ports.Select(object (s) => new
+            {
+                service = s.Service,
+                port = s.Port,
+                enabled = s.Enabled,          // null = firmware exposes no toggle
+                canToggle = s.Enabled != null && s.Service != "server",
+            });
+
+        app.MapGet("/api/cameras/{name}/services", (string name, HttpContext ctx) =>
+            AdminOnly(ctx) is { } denied ? Task.FromResult(denied)
+            : ExecAsync(name, ctx, mutating: true, async (control, reqCt) =>
+            {
+                var ports = await control.GetServicePortsAsync(reqCt);
+                if (ports == null)
+                    return Results.Json(new { error = "the camera did not answer the service query " +
+                        "(older firmware, or no Baichuan channel)" }, statusCode: 404);
+                return Results.Json(new { services = ShapeServices(ports) });
+            }));
+
+        // Turns one service on or off on the camera itself (msg 36,
+        // read-modify-write — what the app's Port Settings screen does). Explicit
+        // admin action only; the Baichuan port is refused outright, and the reply
+        // carries the fresh table so the UI reflects what the camera now reports.
+        app.MapPost("/api/cameras/{name}/services/{service}/{action}", (string name, string service, string action, HttpContext ctx) =>
+            AdminOnly(ctx) is { } denied ? Task.FromResult(denied)
+            : ExecAsync(name, ctx, mutating: true, async (control, reqCt) =>
+            {
+                service = service.ToLowerInvariant();
+                if (service is not ("http" or "https" or "onvif" or "rtsp" or "rtmp"))
+                    return Results.Json(new { error = "service must be http, https, onvif, rtsp or rtmp" },
+                        statusCode: 400);
+                if (action is not ("enable" or "disable"))
+                    return Results.Json(new { error = "action must be enable or disable" }, statusCode: 400);
+                await control.SetServicePortEnabledAsync(service, action == "enable", reqCt);
+                var ports = await control.GetServicePortsAsync(reqCt);
+                return Results.Json(new
+                {
+                    ok = true,
+                    services = ports == null ? null : ShapeServices(ports),
+                });
+            }));
+
+        // Optical zoom & focus (zoom-lens cameras): absolute positions with ranges.
+        app.MapGet("/api/cameras/{name}/zoomfocus", (string name, HttpContext ctx) =>
+            ExecAsync(name, ctx, mutating: false, async (control, reqCt) =>
+            {
+                var zf = await control.GetZoomFocusAsync(reqCt);
+                if (zf == null)
+                    return Results.Json(new { error = "no zoom/focus on this camera" }, statusCode: 404);
+                static object? Pos(XElement? el) => el == null ? null : new
+                {
+                    cur = (long?)el.Element("curPos") ?? 0,
+                    min = (long?)el.Element("minPos") ?? 0,
+                    max = (long?)el.Element("maxPos") ?? 0,
+                };
+                return Results.Json(new { zoom = Pos(zf.Element("zoom")), focus = Pos(zf.Element("focus")) });
+            }));
+
+        app.MapPost("/api/cameras/{name}/zoomfocus", (string name, ZoomFocusRequest req, HttpContext ctx) =>
+            ExecAsync(name, ctx, mutating: true, async (control, reqCt) =>
+            {
+                if (req.Zoom == null && req.Focus == null)
+                    return Results.Json(new { error = "provide zoom and/or focus (absolute position)" }, statusCode: 400);
+                if (req.Zoom is { } z) await control.SetZoomFocusAsync("zoomPos", z, reqCt);
+                if (req.Focus is { } f) await control.SetZoomFocusAsync("focusPos", f, reqCt);
+                return Results.Json(new { ok = true });
+            }));
+
+        // Manual siren. POST {on:true} latches it until {on:false}; a body without
+        // "on" plays one burst. GET answers the last state the camera pushed.
+        app.MapGet("/api/cameras/{name}/siren", (string name, HttpContext ctx) =>
+        {
+            var cam = cameras.FirstOrDefault(c => string.Equals(c.Name, name, StringComparison.OrdinalIgnoreCase));
+            if (cam == null)
+                return Results.Json(new { error = $"unknown camera '{name}'" }, statusCode: 404);
+            if (CheckAuth(ctx, cam) is { } denied)
+                return denied;
+            return Results.Json(new { on = cam.SirenOn?.Invoke() });
+        });
+
+        app.MapPost("/api/cameras/{name}/siren", (string name, SirenRequest req, HttpContext ctx) =>
+            ExecAsync(name, ctx, mutating: true, async (control, reqCt) =>
+            {
+                await control.SirenAsync(req.On, reqCt);
+                NudgeHa(name);
+                return Results.Json(new { ok = true, on = req.On });
+            }));
+
+        // Privacy mode: the camera goes dark (no video, no detections) until
+        // switched back. Prefer the pushed state (what the tile shows): while the
+        // camera is dark it often stops answering the live sleep-state read, which
+        // would make the settings panel wrongly show "off". Fall back to a live read
+        // only when nothing has been pushed yet.
+        app.MapGet("/api/cameras/{name}/privacy", (string name, HttpContext ctx) =>
+            ExecAsync(name, ctx, mutating: false, async (control, reqCt) =>
+            {
+                var pushed = cameras
+                    .FirstOrDefault(c => string.Equals(c.Name, name, StringComparison.OrdinalIgnoreCase))
+                    ?.PrivacyOn?.Invoke();
+                var on = pushed ?? await control.GetPrivacyModeAsync(reqCt);
+                return on == null
+                    ? Results.Json(new { error = "privacy mode is not supported by this camera" }, statusCode: 404)
+                    : Results.Json(new { on });
+            }));
+
+        app.MapPost("/api/cameras/{name}/privacy", (string name, PrivacyRequest req, HttpContext ctx) =>
+            ExecAsync(name, ctx, mutating: true, async (control, reqCt) =>
+            {
+                if (req.On == null)
+                    return Results.Json(new { error = "provide on: true|false" }, statusCode: 400);
+                await control.SetPrivacyModeAsync(req.On.Value, reqCt);
+                NudgeHa(name);
+                return Results.Json(new { ok = true, on = req.On });
+            }));
+
+        // Suspend (beta): a Neolink-side "off" switch. Suspending drops Neolink's
+        // connection and holds it closed, so the camera can't be VIEWED or RECORDED
+        // here — without editing the config or restarting. The camera itself is
+        // untouched: its own SD-card/cloud recording and any other system pulling
+        // its stream directly keep working. Persisted across restarts. Reads are
+        // open; writing is admin-only once accounts exist (it's a server-side state
+        // change that stops recording, like the recording settings).
+        app.MapGet("/api/cameras/{name}/suspend", (string name, HttpContext ctx) =>
+        {
+            var cam = cameras.FirstOrDefault(c => string.Equals(c.Name, name, StringComparison.OrdinalIgnoreCase));
+            if (cam == null)
+                return Results.Json(new { error = $"unknown camera '{name}'" }, statusCode: 404);
+            if (CheckAuth(ctx, cam) is { } denied)
+                return denied;
+            return cam.Suspended == null
+                ? Results.Json(new { error = "suspend is not available for this camera" }, statusCode: 404)
+                : Results.Json(new { suspended = cam.Suspended() });
+        });
+
+        app.MapPost("/api/cameras/{name}/suspend", (string name, SuspendRequest req, HttpContext ctx) =>
+        {
+            var cam = cameras.FirstOrDefault(c => string.Equals(c.Name, name, StringComparison.OrdinalIgnoreCase));
+            if (cam == null)
+                return Results.Json(new { error = $"unknown camera '{name}'" }, statusCode: 404);
+            if (CheckAuth(ctx, cam) is { } denied)
+                return denied;
+            if (userStore.Enabled && !IsAdmin(ctx))
+                return Results.Json(new { error = "admin only — suspending stops recording, a server setting" }, statusCode: 403);
+            if (cam.SetSuspended == null)
+                return Results.Json(new { error = "suspend is not available for this camera" }, statusCode: 404);
+            if (req.Suspended is not { } s)
+                return Results.Json(new { error = "provide suspended: true|false" }, statusCode: 400);
+            cam.SetSuspended(s);
+            NudgeHa(name);
+            return Results.Json(new { ok = true, suspended = s });
+        });
+
+        // External wake hint: anything that knows the camera is up for an event
+        // RIGHT NOW (a Home Assistant automation, a router webhook, an external
+        // PIR) can tell the wake-capture scan to connect immediately instead of
+        // waiting for the ping pattern. Harmless when the camera isn't a parked
+        // wake-capture battery camera — the hint is simply ignored, so callers
+        // never need to check state first. The built-in syslog listener
+        // (wake_hints.syslog_port) feeds the same path.
+        app.MapPost("/api/cameras/{name}/wake-hint", (string name, HttpContext ctx) =>
+        {
+            var cam = cameras.FirstOrDefault(c => string.Equals(c.Name, name, StringComparison.OrdinalIgnoreCase));
+            if (cam == null)
+                return Results.Json(new { error = $"unknown camera '{name}'" }, statusCode: 404);
+            if (CheckAuth(ctx, cam) is { } denied)
+                return denied;
+            if (cam.WakeHint == null)
+                return Results.Json(new { error = "wake hints are not available for this camera" }, statusCode: 404);
+            cam.WakeHint($"wake-hint API ({ctx.Connection.RemoteIpAddress})");
+            return Results.Json(new { ok = true });
+        });
+
+        // Floodlight behavior (cameras with a spotlight): brightness and the
+        // "turn on with motion at night" switch. Read-modify-write of the
+        // camera's own FloodlightTask XML — unknown fields ride along verbatim.
+        app.MapGet("/api/cameras/{name}/floodlight", (string name, HttpContext ctx) =>
+            ExecAsync(name, ctx, mutating: false, async (control, reqCt) =>
+            {
+                var task = await control.GetFloodlightTasksAsync(reqCt);
+                return task == null
+                    ? Results.Json(new { error = "no floodlight tasks on this camera" }, statusCode: 404)
+                    : Results.Json(ShapeFloodlight(task));
+            }));
+
+        app.MapPost("/api/cameras/{name}/floodlight", (string name, FloodlightRequest req, HttpContext ctx) =>
+            ExecAsync(name, ctx, mutating: true, async (control, reqCt) =>
+            {
+                if (req.Brightness == null && req.Auto == null)
+                    return Results.Json(new { error = "provide brightness (percent) and/or auto (bool)" }, statusCode: 400);
+                var task = await control.GetFloodlightTasksAsync(reqCt);
+                if (task == null)
+                    return Results.Json(new { error = "no floodlight tasks on this camera" }, statusCode: 404);
+                if (req.Brightness is { } b)
+                {
+                    long min = (long?)task.Element("brightness_min") ?? 1;
+                    long max = (long?)task.Element("brightness_max") ?? 100;
+                    task.SetElementValue("brightness_cur", Math.Clamp(b, min, max));
+                }
+                if (req.Auto is { } auto)
+                    task.SetElementValue("enable", auto ? 1 : 0);
+                await control.SetFloodlightTasksAsync(task, reqCt);
+                NudgeHa(name);
+                return Results.Json(ShapeFloodlight(task));
+            }));
+
+        // White LED / spotlight (cameras that expose it over the HTTP API, e.g. the
+        // Lumus / Elite lines that answer no Baichuan FloodlightTask): brightness,
+        // on/off, and the auto mode. Read-modify-write preserves the schedule.
+        app.MapGet("/api/cameras/{name}/whiteled", (string name, HttpContext ctx) =>
+            ExecAsync(name, ctx, mutating: false, async (control, reqCt) =>
+            {
+                var wl = await control.GetWhiteLedAsync(reqCt);
+                return wl == null
+                    ? Results.Json(new { error = "no white LED on this camera (or its HTTP API is unreachable)" }, statusCode: 404)
+                    : Results.Json(new { bright = wl.Bright, on = wl.On, mode = wl.Mode });
+            }));
+
+        app.MapPost("/api/cameras/{name}/whiteled", (string name, WhiteLedRequest req, HttpContext ctx) =>
+            ExecAsync(name, ctx, mutating: true, async (control, reqCt) =>
+            {
+                if (req.Brightness == null && req.On == null && req.Mode == null)
+                    return Results.Json(new { error = "provide brightness (0-100), on (bool) and/or mode (int)" }, statusCode: 400);
+                await control.SetWhiteLedAsync(req.Brightness, req.On, req.Mode, reqCt);
+                NudgeHa(name);
+                var wl = await control.GetWhiteLedAsync(reqCt);
+                return wl == null
+                    ? Results.Json(new { ok = true })
+                    : Results.Json(new { bright = wl.Bright, on = wl.On, mode = wl.Mode });
+            }));
+
+        // ------------------------------------------------ HTTP-API extras (beta)
+
+        // One combined read: picture settings, speaker volume, Wi-Fi signal, PTZ
+        // presets, quick replies, auto-tracking and SD cards. 404 = the camera has
+        // no HTTP API; features the camera lacks come back null.
+        app.MapGet("/api/cameras/{name}/httpfeatures", (string name, HttpContext ctx) =>
+            ExecAsync(name, ctx, mutating: false, async (control, reqCt) =>
+            {
+                var f = await control.GetHttpFeaturesAsync(reqCt);
+                if (f == null)
+                    return Results.Json(new { error = "this camera has no HTTP API" }, statusCode: 404);
+                // Cache which AI types the per-type alarm probe answered for — the
+                // recording tab's chip filter reads it back before the next probe.
+                if (f.AiSensitivities is { Count: > 0 } ai)
+                    o.CameraState?.SetDetectionCaps(name, aiTypes: ai.Select(a => a.Type).ToList());
+                return Results.Json(new
+                {
+                    image = f.Image == null ? null : new
+                    {
+                        bright = f.Image.Bright,
+                        contrast = f.Image.Contrast,
+                        saturation = f.Image.Saturation,
+                        hue = f.Image.Hue,
+                        sharpen = f.Image.Sharpen,
+                        dayNight = f.Image.DayNight,
+                        antiFlicker = f.Image.AntiFlicker,
+                        flip = f.Image.Flip,
+                        mirror = f.Image.Mirror,
+                        hdr = f.Image.Hdr,
+                        hdrMax = f.Image.HdrMax,
+                    },
+                    volume = f.Volume,
+                    recordAudio = f.Audio?.RecordAudio,
+                    talkVolume = f.Audio?.TalkVolume,
+                    visitorVolume = f.Audio?.VisitorVolume,
+                    // Same { level, label } shape the camera list uses.
+                    wifiSignal = f.WifiSignal is { } fw ? new { level = fw.Level, label = fw.Label } : null,
+                    ptzPresets = f.PtzPresets?.Select(p => new { id = p.Id, name = p.Name, enabled = p.Enabled }),
+                    quickReplies = f.QuickReplies?.Select(q => new { id = q.Id, name = q.Name }),
+                    autoTrack = f.AutoTrack,
+                    sdCards = f.SdCards?.Select(s => new
+                    {
+                        id = s.Id,
+                        totalMb = s.TotalMb,
+                        freeMb = s.FreeMb,
+                        formatted = s.Formatted,
+                        mounted = s.Mounted,
+                    }),
+                    mdSensitivity = f.MdSensitivity,
+                    aiSensitivities = f.AiSensitivities?.Select(a => new
+                    {
+                        type = a.Type,
+                        sensitivity = a.Sensitivity,
+                        stayTime = a.StayTime,
+                    }),
+                    osd = f.Osd == null ? null : new
+                    {
+                        showName = f.Osd.ShowName,
+                        name = f.Osd.Name,
+                        namePos = f.Osd.NamePos,
+                        showTime = f.Osd.ShowTime,
+                        timePos = f.Osd.TimePos,
+                        watermark = f.Osd.Watermark,
+                        posOptions = f.Osd.PosOptions,
+                    },
+                });
+            }));
+
+        // Picture adjustments (0-255 sliders) + ISP config (day/night, anti-flicker,
+        // flip/mirror). Read-modify-write on the camera's own JSON.
+        app.MapPost("/api/cameras/{name}/image", (string name, ImageRequest req, HttpContext ctx) =>
+            ExecAsync(name, ctx, mutating: true, async (control, reqCt) =>
+            {
+                if (req.Bright == null && req.Contrast == null && req.Saturation == null
+                    && req.Hue == null && req.Sharpen == null && req.DayNight == null
+                    && req.AntiFlicker == null && req.Flip == null && req.Mirror == null)
+                    return Results.Json(new { error = "provide at least one picture setting" }, statusCode: 400);
+                string[] dayNights = { "Auto", "Color", "Black&White" };
+                if (req.DayNight != null && !dayNights.Contains(req.DayNight))
+                    return Results.Json(new { error = "dayNight must be Auto, Color or Black&White" }, statusCode: 400);
+                if (req.AntiFlicker != null && !Streaming.ImageSettings.AntiFlickerValues.Contains(req.AntiFlicker))
+                    return Results.Json(new { error = "antiFlicker must be Off, Outdoor, 50HZ or 60HZ" }, statusCode: 400);
+                await control.SetImageSettingsAsync(req.Bright, req.Contrast, req.Saturation,
+                    req.Hue, req.Sharpen, req.DayNight, req.AntiFlicker, req.Flip, req.Mirror, reqCt);
+                NudgeHa(name);
+                return Results.Json(new { ok = true });
+            }));
+
+        // Speaker volume (0-100) — also what two-way talk comes out at.
+        app.MapPost("/api/cameras/{name}/volume", (string name, VolumeRequest req, HttpContext ctx) =>
+            ExecAsync(name, ctx, mutating: true, async (control, reqCt) =>
+            {
+                if (req.Volume is not { } vol || vol is < 0 or > 100)
+                    return Results.Json(new { error = "provide volume: 0-100" }, statusCode: 400);
+                await control.SetVolumeAsync(vol, reqCt);
+                NudgeHa(name);
+                return Results.Json(new { ok = true, volume = vol });
+            }));
+
+        // Camera-side audio settings beyond the speaker volume: the record-audio
+        // switch (encode settings' audio flag) and the extra AudioCfg volumes some
+        // models expose. Which of them exist varies per camera — the GET features
+        // reply is the menu, and posting one the camera lacks earns the camera's
+        // own refusal.
+        app.MapPost("/api/cameras/{name}/audio", (string name, AudioRequest req, HttpContext ctx) =>
+            ExecAsync(name, ctx, mutating: true, async (control, reqCt) =>
+            {
+                if (req is { RecordAudio: null, TalkVolume: null, VisitorVolume: null })
+                    return Results.Json(new { error = "provide recordAudio, talkVolume and/or visitorVolume" }, statusCode: 400);
+                if (req.TalkVolume is < 0 or > 100 || req.VisitorVolume is < 0 or > 100)
+                    return Results.Json(new { error = "volumes are 0-100" }, statusCode: 400);
+                if (req.RecordAudio is { } rec)
+                    await control.SetRecordAudioAsync(rec, reqCt);
+                if (req.TalkVolume != null || req.VisitorVolume != null)
+                    await control.SetAudioVolumesAsync(req.TalkVolume, req.VisitorVolume, reqCt);
+                NudgeHa(name);
+                return Results.Json(new { ok = true });
+            }));
+
+        // PTZ presets: {id} recalls a saved position; {id, name, save:true} saves
+        // the camera's CURRENT position into that slot.
+        app.MapPost("/api/cameras/{name}/ptzpreset", (string name, PtzPresetRequest req, HttpContext ctx) =>
+            ExecAsync(name, ctx, mutating: true, async (control, reqCt) =>
+            {
+                // Reolink numbers its slots 0-63; an ONVIF camera's presets are
+                // numbered as listed, and a head may hold more.
+                var maxId = control.OnvifOnly ? GenericCameraControl.MaxPresetSlots : 63;
+                if (req.Id is not { } id || id < 0 || id > maxId)
+                    return Results.Json(new { error = $"provide id: 0-{maxId}" }, statusCode: 400);
+                if (req.Save == true)
+                {
+                    var presetName = (req.Name ?? "").Trim();
+                    if (presetName.Length is 0 or > 31)
+                        return Results.Json(new { error = "provide name: 1-31 characters" }, statusCode: 400);
+                    await control.SavePtzPresetAsync(id, presetName, reqCt);
+                }
+                else
+                {
+                    await control.PtzToPresetAsync(id, reqCt);
+                }
+                return Results.Json(new { ok = true });
+            }));
+
+        // Doorbell quick reply: plays a pre-recorded message through the speaker.
+        app.MapPost("/api/cameras/{name}/quickreply", (string name, QuickReplyRequest req, HttpContext ctx) =>
+            ExecAsync(name, ctx, mutating: true, async (control, reqCt) =>
+            {
+                if (req.Id is not { } id || id < 0)
+                    return Results.Json(new { error = "provide id (from httpfeatures.quickReplies)" }, statusCode: 400);
+                await control.PlayQuickReplyAsync(id, reqCt);
+                return Results.Json(new { ok = true });
+            }));
+
+        // Doorbell auto-reply: the default message played by itself when a ring
+        // goes unanswered. fileId -1 turns it off; timeout is the wait in seconds.
+        app.MapPost("/api/cameras/{name}/autoreply", (string name, AutoReplyRequest req, HttpContext ctx) =>
+            ExecAsync(name, ctx, mutating: true, async (control, reqCt) =>
+            {
+                if (req.FileId == null && req.Timeout == null)
+                    return Results.Json(new { error = "provide fileId (-1 = off) and/or timeout (seconds)" }, statusCode: 400);
+                if (req.FileId is { } fid && fid < -1)
+                    return Results.Json(new { error = "fileId must be -1 (off) or a quick-reply id" }, statusCode: 400);
+                if (req.Timeout is { } t && t is < 1 or > 60)
+                    return Results.Json(new { error = "timeout must be 1-60 seconds" }, statusCode: 400);
+                await control.SetAutoReplyAsync(req.FileId, req.Timeout, reqCt);
+                return Results.Json(new { ok = true });
+            }));
+
+        // AI auto-tracking (PTZ cameras that follow detected subjects).
+        app.MapPost("/api/cameras/{name}/autotrack", (string name, AutoTrackRequest req, HttpContext ctx) =>
+            ExecAsync(name, ctx, mutating: true, async (control, reqCt) =>
+            {
+                if (req.On == null)
+                    return Results.Json(new { error = "provide on: true|false" }, statusCode: 400);
+                await control.SetAutoTrackAsync(req.On.Value, reqCt);
+                NudgeHa(name);
+                return Results.Json(new { ok = true, on = req.On });
+            }));
+
+        // Motion-detection sensitivity, normalized to 1-50 (higher = more
+        // sensitive) across the two firmware dialects.
+        app.MapPost("/api/cameras/{name}/mdsensitivity", (string name, MdSensitivityRequest req, HttpContext ctx) =>
+            ExecAsync(name, ctx, mutating: true, async (control, reqCt) =>
+            {
+                if (req.Sensitivity is not { } sens || sens is < 1 or > 50)
+                    return Results.Json(new { error = "provide sensitivity: 1-50" }, statusCode: 400);
+                await control.SetMdSensitivityAsync(sens, reqCt);
+                NudgeHa(name);
+                return Results.Json(new { ok = true, sensitivity = sens });
+            }));
+
+        // Per-type AI detection sensitivity (0-100). Valid types are whatever
+        // httpfeatures.aiSensitivities listed for this camera.
+        app.MapPost("/api/cameras/{name}/aisensitivity", (string name, AiSensitivityRequest req, HttpContext ctx) =>
+            ExecAsync(name, ctx, mutating: true, async (control, reqCt) =>
+            {
+                if (req.Type == null || !CameraControl.AiAlarmTypes.Contains(req.Type))
+                    return Results.Json(new { error = $"provide type: {string.Join(", ", CameraControl.AiAlarmTypes)}" },
+                        statusCode: 400);
+                if (req.Sensitivity is not { } sens || sens is < 0 or > 100)
+                    return Results.Json(new { error = "provide sensitivity: 0-100" }, statusCode: 400);
+                await control.SetAiSensitivityAsync(req.Type, sens, reqCt);
+                NudgeHa(name);
+                return Results.Json(new { ok = true, type = req.Type, sensitivity = sens });
+            }));
+
+        // Detection zone: the grid of watched ('1') vs ignored ('0') cells, row by
+        // row from the top-left. ?type= is "md" (default) or an AI type.
+        //
+        // EVERY camera has a zone. A camera that keeps one itself — a Reolink with
+        // its HTTP API — owns it, at whatever dimensions its firmware reports, and
+        // the grid is read from and written to the camera exactly as before. A
+        // camera that keeps none (generic RTSP, or a Baichuan model whose firmware
+        // carries no grid) gets one stored HERE instead: it cannot shape what the
+        // camera itself alerts on, but it does shape what Neolink watches, which is
+        // what the live object boxes obey. "storage" says which of the two it is,
+        // so the editor can tell the user plainly.
+        //
+        // The distinction is only ever drawn when the camera has actually ANSWERED.
+        // A camera that could not be asked (asleep, or its HTTP API backing off)
+        // still gets 503 — quietly storing a zone on Neolink because the camera was
+        // briefly unreachable would silently detach it from the camera it belongs to.
+
+        // The grid to offer a camera that has none of its own, sized from whatever
+        // stream is carrying video. Only ever used until something is stored — a
+        // stored grid keeps its own dimensions for life, so a stream that changes
+        // shape cannot scramble a zone already drawn.
+        static (int Cols, int Rows) DefaultZoneGrid(WebCameraInfo? cam)
+        {
+            var hub = cam?.Streams.FirstOrDefault(s => s.Hub.VideoReady && s.Hub.Height > 0)?.Hub;
+            return CameraStateStore.DefaultZoneGrid(hub?.Width ?? 0, hub?.Height ?? 0);
+        }
+
+        // Whether a zone this camera did not answer for belongs to Neolink rather
+        // than being absent. Two things must BOTH hold. The camera must provably
+        // hold no zone of its own — a lasting fact (CameraHoldsZone), never "this
+        // read came back empty", because a Reolink whose HTTP API hiccups must not
+        // have its zone quietly moved onto the server. And only the shared "md"
+        // grid is ever kept here: a camera with per-type grids is answering about
+        // each type itself, and a local zone offered beside those would claim to
+        // govern what it cannot.
+        // The largest grid side Neolink will keep for a camera. Far past anything a
+        // person draws by hand (the default is 32x18, and a Reolink's own grid tops
+        // out around 120 across), and small enough that no product overflows.
+        const int MaxZoneSide = 256;
+
+        static bool LocalZoneFits(ICameraControl control, string type) =>
+            CameraStateStore.ZoneIsLocal(control.CameraHoldsZone, type, control.ZoneTypes().Count);
+
+        app.MapGet("/api/cameras/{name}/detectionzone", (string name, string? type, HttpContext ctx) =>
+            ExecAsync(name, ctx, mutating: false, async (control, reqCt) =>
+            {
+                var t = string.IsNullOrEmpty(type) ? "md" : type;
+                if (t != "md" && !CameraControl.AiAlarmTypes.Contains(t))
+                    return Results.Json(new { error = $"provide type: md, {string.Join(", ", CameraControl.AiAlarmTypes)}" },
+                        statusCode: 400);
+                // A camera that holds its own zone is asked for it, exactly as before.
+                // One that provably holds none is not asked at all — there is nothing
+                // to ask, and the round trip only costs it.
+                // A Reolink is asked on every read, exactly as it always was: whether
+                // its zone is Neolink's is only ever what its latest read said. An
+                // ONVIF camera that settled on a Neolink zone is not asked again here
+                // (its surface re-checks in the background).
+                var zone = LocalZoneFits(control, t) && control.OnvifOnly
+                    ? null
+                    : await control.GetDetectionZoneAsync(t, reqCt);
+                if (zone != null)
+                    return Results.Json(new
+                    {
+                        type = zone.Type,
+                        cols = zone.Cols,
+                        rows = zone.Rows,
+                        table = zone.Table,
+                        // The types with a grid of their own. One entry ("md") means
+                        // this camera keeps a single zone governing every type.
+                        zoneTypes = control.ZoneTypes(),
+                        storage = "camera",
+                    });
+                if (!LocalZoneFits(control, t))
+                    // "Has no zone" is a lasting answer; "couldn't ask" is not, and
+                    // reporting the second as the first is how a grid that was on
+                    // screen a moment ago reads back as a camera without zones.
+                    // An AI type with no grid of its own is a lasting "no" exactly as
+                    // it always was. Only the shared md grid on a camera whose
+                    // ownership is still UNKNOWN is held back as "ask again": that is
+                    // the one case where answering 404 would be claiming something
+                    // the camera has not said.
+                    // A Reolink answers exactly as before: 503 only while its API
+                    // cannot be asked, 404 otherwise.
+                    return control.HttpPaused || (t == "md" && control.OnvifOnly && control.CameraHoldsZone == null)
+                        ? Results.Json(new { error = "the camera could not be asked just now (it is asleep, or its HTTP API is backing off after a failure) — try again shortly" },
+                            statusCode: 503)
+                        : Results.Json(new { error = $"this camera reports no {t} detection zone" }, statusCode: 404);
+                if (o.CameraState == null)
+                    return Results.Json(new { error = $"this camera reports no {t} detection zone" }, statusCode: 404);
+                // Nothing stored yet: hand back an everywhere-watched grid rather
+                // than nothing, so the editor opens on the zone as it stands.
+                var cam = cameras.FirstOrDefault(c => string.Equals(c.Name, name, StringComparison.OrdinalIgnoreCase));
+                var stored = o.CameraState.Zone(name, t);
+                var (cols, rows) = stored == null
+                    ? DefaultZoneGrid(cam)
+                    : (stored.Cols, stored.Rows);
+                return Results.Json(new
+                {
+                    type = t,
+                    cols,
+                    rows,
+                    table = stored?.Table ?? new string('1', cols * rows),
+                    zoneTypes = new[] { "md" },
+                    storage = "neolink",
+                });
+            }));
+
+        app.MapPost("/api/cameras/{name}/detectionzone", (string name, DetectionZoneRequest req, HttpContext ctx) =>
+            ExecAsync(name, ctx, mutating: true, async (control, reqCt) =>
+            {
+                var t = string.IsNullOrEmpty(req.Type) ? "md" : req.Type;
+                if (t != "md" && !CameraControl.AiAlarmTypes.Contains(t))
+                    return Results.Json(new { error = $"provide type: md, {string.Join(", ", CameraControl.AiAlarmTypes)}" },
+                        statusCode: 400);
+                // Cell-level validation happens against the camera's own cols*rows
+                // inside the write; this only rejects the obviously malformed.
+                if (req.Table is not { Length: > 0 and <= 65536 } table
+                    || table.Any(ch => ch is not ('0' or '1')))
+                    return Results.Json(new { error = "provide table: the zone's cols*rows cells as '0'/'1'" },
+                        statusCode: 400);
+                // Which side owns this zone is a property of the camera, not of this
+                // request: anything but a provable "it holds none" goes to the camera,
+                // through exactly the call it always used. No extra read, so a write
+                // that worked before still works — including on the types whose grid
+                // only SetDetectionZoneAsync knows how to find.
+                var store = o.CameraState;
+                // A camera surface that has never been asked cannot be routed yet.
+                // ONVIF cameras are asked here (the editor always reads before it
+                // saves, but an API caller need not); a Reolink is not — its write
+                // has always gone straight to the camera, and an extra read before
+                // it is what used to arm the backoff.
+                if (control.OnvifOnly && t == "md" && control.CameraHoldsZone == null)
+                    await control.GetDetectionZoneAsync(t, reqCt);
+                var local = LocalZoneFits(control, t) && store != null;
+                // A Reolink's zone goes to the camera unless the editor asked for "Save to Neolink",
+                // and even then only for a camera that can hold none (a missed grid may come back).
+                if (local && !control.OnvifOnly && req.Storage != "neolink" && !control.ZoneNeverOnCamera)
+                    local = false;
+                // The editor says where it believed the zone lived. If that changed
+                // while it was open — a camera answering for the first time — the grid
+                // it drew is the wrong one for where the save would now go, so it is
+                // saved nowhere; the editor reloads. A caller that does not say
+                // (anything but the editor) is routed as always.
+                if (req.Storage is "camera" or "neolink" && (req.Storage == "neolink") != local)
+                    return Results.Json(new
+                    {
+                        error = "where this zone is kept changed while the editor was open — reopen it",
+                        storage = local ? "neolink" : "camera",
+                    }, statusCode: 409);
+                if (!local || store == null)
+                {
+                    await control.SetDetectionZoneAsync(t, table, reqCt);
+                    NudgeHa(name);
+                    return Results.Json(new { ok = true, type = t, storage = "camera" });
+                }
+                var cam = cameras.FirstOrDefault(c => string.Equals(c.Name, name, StringComparison.OrdinalIgnoreCase));
+                var stored = store.Zone(name, t);
+                // The grid's shape comes from the editor that drew it. Neolink is the
+                // only authority on a zone it keeps itself, so there is no camera-side
+                // grid for a stale editor to scramble — and deriving the shape here
+                // instead would reject the very first save whenever the stream became
+                // ready between opening the editor and pressing save.
+                // Bounded before it is multiplied: cols*rows in 32 bits wraps, and a
+                // wrapped product can equal the table length — 65536 x 65537 does —
+                // which would persist a grid no browser could draw.
+                var (cols, rows) = req.Cols is { } rc && req.Rows is { } rr
+                                   && rc is > 0 and <= MaxZoneSide && rr is > 0 and <= MaxZoneSide
+                    ? (rc, rr)
+                    : stored != null ? (stored.Cols, stored.Rows) : DefaultZoneGrid(cam);
+                if ((long)table.Length != (long)cols * rows)
+                    return Results.Json(new { error = $"table must be {cols}x{rows} = {cols * rows} cells of '0'/'1'" },
+                        statusCode: 400);
+                store.SetZone(name, t, cols, rows, table);
+                Log.Info($"{name}: {t} detection zone stored on Neolink " +
+                         $"({table.Count(ch => ch == '0')} of {table.Length} cells ignored)");
+                NudgeHa(name);
+                return Results.Json(new { ok = true, type = t, storage = "neolink" });
+            }));
+
+        // ISP HDR: 0 = off; the top value comes from httpfeatures.image.hdrMax
+        // (1 = plain on/off, 2 = off/low/high).
+        app.MapPost("/api/cameras/{name}/hdr", (string name, HdrRequest req, HttpContext ctx) =>
+            ExecAsync(name, ctx, mutating: true, async (control, reqCt) =>
+            {
+                if (req.Value is not { } value || value is < 0 or > 2)
+                    return Results.Json(new { error = "provide value: 0-2" }, statusCode: 400);
+                await control.SetHdrAsync(value, reqCt);
+                NudgeHa(name);
+                return Results.Json(new { ok = true, value });
+            }));
+
+        // On-screen display: camera-name / timestamp overlay visibility + position
+        // and the Reolink watermark. Positions from httpfeatures.osd.posOptions.
+        app.MapPost("/api/cameras/{name}/osd", (string name, OsdRequest req, HttpContext ctx) =>
+            ExecAsync(name, ctx, mutating: true, async (control, reqCt) =>
+            {
+                if (req.ShowName == null && req.NamePos == null && req.ShowTime == null
+                    && req.TimePos == null && req.Watermark == null)
+                    return Results.Json(new { error = "provide at least one OSD setting" }, statusCode: 400);
+                foreach (var pos in new[] { req.NamePos, req.TimePos })
+                    if (pos != null && (pos.Length is 0 or > 32 || pos.Any(char.IsControl)))
+                        return Results.Json(new { error = "positions must be one of osd.posOptions" }, statusCode: 400);
+                await control.SetOsdSettingsAsync(req.ShowName, req.NamePos, req.ShowTime, req.TimePos,
+                    req.Watermark, reqCt);
+                return Results.Json(new { ok = true });
+            }));
+
+        // Firmware-update check (read-only — nothing is ever installed from here).
+        // The camera itself asks Reolink's servers; the verdict is cached hours.
+        app.MapGet("/api/cameras/{name}/firmware", (string name, HttpContext ctx) =>
+            ExecAsync(name, ctx, mutating: false, async (control, reqCt) =>
+            {
+                var status = await control.CheckFirmwareAsync(reqCt);
+                if (status == null)
+                    return Results.Json(new { error = "this camera cannot check for firmware updates" }, statusCode: 404);
+                return Results.Json(new { updateAvailable = status.UpdateAvailable, newVersion = status.NewVersion });
+            }));
+
+        // ------------------------------------------------- camera SD-card recordings
+        // Footage the CAMERA recorded onto its own SD card — including anything from
+        // when neolink was down and battery-camera clips that never streamed.
+
+        // Which days of a month have recordings (the calendar of the day picker).
+        app.MapGet("/api/cameras/{name}/sdcard/days", (string name, int? year, int? month, HttpContext ctx) =>
+            ExecAsync(name, ctx, mutating: false, async (control, reqCt) =>
+            {
+                if (year is not { } y || y is < 2000 or > 2100 || month is not { } m || m is < 1 or > 12)
+                    return Results.Json(new { error = "provide year and month" }, statusCode: 400);
+                var days = await control.GetSdRecordingDaysAsync(y, m, reqCt);
+                if (days == null)
+                    return Results.Json(new { error = "this camera's SD card cannot be searched" }, statusCode: 404);
+                return Results.Json(new { year = y, month = m, days });
+            }));
+
+        // The recordings of one (camera-local) day.
+        app.MapGet("/api/cameras/{name}/sdcard/recordings", (string name, string? date, HttpContext ctx) =>
+            ExecAsync(name, ctx, mutating: false, async (control, reqCt) =>
+            {
+                if (!DateOnly.TryParseExact(date, "yyyy-MM-dd", out var day))
+                    return Results.Json(new { error = "provide date: yyyy-MM-dd" }, statusCode: 400);
+                var files = await control.GetSdRecordingsAsync(day, reqCt);
+                if (files == null)
+                    return Results.Json(new { error = "this camera's SD card cannot be searched" }, statusCode: 404);
+                return Results.Json(new
+                {
+                    date = day.ToString("yyyy-MM-dd"),
+                    recordings = files.Select(f => new
+                    {
+                        file = f.Name,
+                        start = f.Start,
+                        end = f.End,
+                        sizeBytes = f.SizeBytes,
+                        streamType = f.StreamType,
+                    }),
+                });
+            }));
+
+        // Streams one recording straight off the camera (no server-side copy).
+        // Inline for the <video> player; ?dl=1 turns it into a download. The
+        // camera serves the file sequentially, so there is no seeking/ranges.
+        // "dl" binds as a STRING on purpose: the UI sends ?dl=1, and ASP.NET's
+        // bool binding rejects "1" with an empty 400 BEFORE the handler runs —
+        // invisible in our logs (field report: every SD download failed 400).
+        app.MapGet("/api/cameras/{name}/sdcard/download", (string name, string? file, string? dl, HttpContext ctx) =>
+            ExecAsync(name, ctx, mutating: false, async (control, reqCt) =>
+            {
+                var fileName = (file ?? "").Trim();
+                if (fileName.Length is 0 or > 255 || fileName.Any(char.IsControl))
+                    return Results.Json(new { error = "provide file: a name from /sdcard/recordings" }, statusCode: 400);
+                bool asDownload = dl is "1" or "true" or "yes";
+                string contentType = fileName.EndsWith(".mp4", StringComparison.OrdinalIgnoreCase)
+                    ? "video/mp4" : "application/octet-stream";
+                var downloadName = asDownload ? Path.GetFileName(fileName) : null;
+
+                // Normal-size recordings spool to a server temp file and serve with
+                // RANGE support: the camera only streams sequentially and its MP4s
+                // keep the moov index at the END, so direct pass-through never
+                // played in a browser (see SdSpool). The browser's range probes all
+                // hit the same spooled file — one camera fetch per recording.
+                if (await SdSpool.TryGetAsync(name, fileName, reqCt) is { } cached)
+                    return Results.File(cached, contentType, fileDownloadName: downloadName,
+                        enableRangeProcessing: true);
+                var download = await control.OpenSdRecordingAsync(fileName, reqCt);
+                if (download.Length is { } len && len <= SdSpool.MaxBytes)
+                {
+                    var spooled = await SdSpool.SpoolAsync(name, fileName, download, reqCt);
+                    return Results.File(spooled, contentType, fileDownloadName: downloadName,
+                        enableRangeProcessing: true);
+                }
+                // Oversized (long continuous segments) or unknown length: stream
+                // straight through like before — playable only after download.
+                ctx.Response.RegisterForDispose(download);
+                return Results.Stream(download.Stream, contentType, fileDownloadName: downloadName);
+            }));
+
+        // On-demand clip capture: start records ONE clip capped at
+        // recording.max_clip_seconds (it stops by itself), stop ends it early.
+        // The same session backs the Home Assistant "Record" switch.
+        app.MapPost("/api/cameras/{name}/record", (string name, RecordOnDemandRequest req, HttpContext ctx) =>
+        {
+            var cam = cameras.FirstOrDefault(c => string.Equals(c.Name, name, StringComparison.OrdinalIgnoreCase));
+            if (cam == null)
+                return Results.Json(new { error = $"unknown camera '{name}'" }, statusCode: 404);
+            if (CheckAuth(ctx, cam) is { } denied)
+                return denied;
+            if (cam.EventRecorder is not { } rec)
+                return Results.Json(new { error = "event recording is not available for this camera" }, statusCode: 409);
+            if (req.Active && !rec.OnDemandAvailable)
+                return Results.Json(new { error = "event recording is switched off for this camera" }, statusCode: 409);
+            if (req.Active) rec.StartOnDemand();
+            else rec.StopOnDemand();
+            var od = rec.OnDemand; // idempotent: always answer with the session as it now stands
+            return Results.Json(new
+            {
+                active = od != null,
+                remainingSeconds = od?.RemainingSeconds ?? 0,
+                maxSeconds = rec.OnDemandMaxSeconds,
+            });
+        });
+
+        // ------------------------------------------------------------ recorded events
+
+        if (events != null)
+        {
+            object Shape(EventRecord r) => new
+            {
+                id = r.Id,
+                camera = r.Camera,
+                start = r.StartUtc,
+                end = r.EndUtc,
+                labels = r.Labels,
+                reviewed = r.Reviewed,
+                ongoing = r.Ongoing,
+                hasClip = r.HasClip,
+                hasThumb = r.HasThumb,
+                hasPreview = r.HasPreview,
+                aiDescription = r.AiDescription,
+                aiObjects = r.AiObjects,
+                aiLevel = r.AiLevel,
+                aiPending = r.AiDescription == null && o.AiPending?.Invoke(r.Id) == true,
+            };
+
+            // date alone is one day; date+to is an inclusive range; to alone is
+            // everything up to that day.
+            app.MapGet("/api/events", (string? camera, bool? reviewed, int? limit, string? date, string? to) =>
+            {
+                DateTime? day = null, until = null;
+                foreach (var (raw, name) in new[] { (date, "date"), (to, "to") })
+                {
+                    if (raw == null) continue;
+                    if (!DateTime.TryParseExact(raw, "yyyy-MM-dd", null,
+                            System.Globalization.DateTimeStyles.None, out var d))
+                        return Results.Json(new { error = $"{name} must be yyyy-MM-dd" }, statusCode: 400);
+                    if (name == "date") day = d; else until = d;
+                }
+                if (day is { } a && until is { } b && b < a)
+                    return Results.Json(new { error = "to must not be before date" }, statusCode: 400);
+                // Wake-only records never belong on the events list: tentative
+                // self-wake recordings (still unconfirmed) and wake events stored
+                // by older versions. Excluded inside the store, before the limit,
+                // so they cannot eat list slots on a busy day.
+                return Results.Json(events
+                    .List(camera, reviewed, limit ?? 200, day, excludeWakeOnly: true, localTo: until)
+                    .Select(Shape));
+            });
+
+            // Days that hold any footage (events or continuous) — the timeline's
+            // calendar highlights these. Literal "days" beats the {id} routes.
+            app.MapGet("/api/events/days", () => Results.Json(events.ListContentDays()));
+
+            // Natural-language search. Deterministic first (labels, camera names,
+            // date phrases parse locally; leftover words match the stored AI
+            // descriptions); only a query with leftovers spends ONE LLM call, and
+            // solely to translate the phrase into the same structured plan.
+            // Without q this reports AI availability (the search bar's icon).
+            app.MapGet("/api/events/search", async (string? q, int? limit, CancellationToken ct) =>
+            {
+                bool aiAvailable = o.Ai?.Enabled == true;
+                if (string.IsNullOrWhiteSpace(q))
+                    return Results.Json(new { aiAvailable });
+                try
+                {
+                int cap = Math.Clamp(limit ?? 200, 1, 1000);
+                var names = cameras.Select(c => c.Name).ToList();
+                var plan = Neolink.Recording.EventSearch.Parse(q, names, DateTime.Now);
+                bool usedAi = false;
+                if ((!plan.Structured || plan.StrayDigits) && aiAvailable)
+                {
+                    var raw = await Neolink.Ai.AiDescriber.CompleteTextAsync(o.Ai!,
+                        Neolink.Recording.EventSearch.TranslateSystemPrompt(names, DateTime.Now), q, ct);
+                    if (Neolink.Recording.EventSearch.ParseTranslated(raw, names, DateTime.Now) is { } tplan)
+                    {
+                        usedAi = true;
+                        plan = Neolink.Recording.EventSearch.Merge(plan, tplan);
+                    }
+                }
+                // Descriptive queries with AI: the model reads the candidates'
+                // actual descriptions and picks the matches — keyword scoring is
+                // only the fallback (no AI, or the model's reply was unusable).
+                List<Neolink.Recording.EventRecord>? hits = null;
+                bool kwMatched = true, kwPartial = false, judged = false;
+                if (plan.Keywords.Count > 0 && aiAvailable)
+                {
+                    var pool = Neolink.Recording.EventSearch.JudgePool(plan, events);
+                    if (pool.Count > 0)
+                    {
+                        // Bounded below the client's 90s budget: a slow model falls
+                        // back to keyword scoring instead of a dead request.
+                        using var judgeCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+                        judgeCts.CancelAfter(TimeSpan.FromSeconds(70));
+                        var picked = new List<Neolink.Recording.EventRecord>();
+                        bool allReplies = true;
+                        foreach (var chunk in pool.Chunk(30))
+                        {
+                            var reply = await Neolink.Ai.AiDescriber.CompleteTextAsync(o.Ai!,
+                                Neolink.Recording.EventSearch.JudgeSystemPrompt(),
+                                Neolink.Recording.EventSearch.JudgeUserPrompt(q, chunk), judgeCts.Token);
+                            var idx = Neolink.Recording.EventSearch.ParseJudge(reply, chunk.Length);
+                            // One failed or garbled chunk poisons the whole verdict:
+                            // partial judging silently hides matches, keyword scoring
+                            // does not.
+                            if (idx == null) { allReplies = false; break; }
+                            picked.AddRange(idx.Select(i => chunk[i - 1]));
+                        }
+                        if (allReplies)
+                        {
+                            judged = true;
+                            usedAi = true;
+                            kwMatched = picked.Count > 0;
+                            // Nothing fit: fall back to the structural hits so the
+                            // page is never silently empty — the note explains.
+                            hits = picked.Count > 0
+                                ? picked.OrderByDescending(e => e.StartUtc).Take(cap).ToList()
+                                : Neolink.Recording.EventSearch.Execute(plan.StructuralOnly(), events, cap);
+                        }
+                    }
+                }
+                hits ??= Neolink.Recording.EventSearch.Execute(plan, events, out kwMatched, out kwPartial, cap);
+                return Results.Json(new
+                {
+                    aiAvailable,
+                    ai = usedAi,
+                    judged,
+                    keywordsMatched = kwMatched,
+                    keywordsPartial = kwPartial,
+                    understood = new
+                    {
+                        labels = plan.Labels,
+                        notLabels = plan.NotLabels,
+                        cameras = plan.Cameras,
+                        from = plan.FromLocal?.ToString("yyyy-MM-dd HH:mm"),
+                        to = plan.ToLocal?.ToString("yyyy-MM-dd HH:mm"),
+                        keywords = plan.Keywords,
+                    },
+                    events = hits.Take(cap).Select(Shape),
+                });
+                }
+                catch (Exception ex)
+                {
+                    Log.Warn($"Event search failed: {Log.Flatten(ex)}");
+                    return Results.Json(new { error = "the query could not be searched" }, statusCode: 400);
+                }
+            });
+
+            // Single-event lookup: notification deep links (/events?event={id})
+            // resolve the exact event even after it ages out of the 24h list.
+            app.MapGet("/api/events/{id}", (string id) =>
+            {
+                var rec = events.Find(id);
+                return rec == null
+                    ? Results.Json(new { error = "unknown event" }, statusCode: 404)
+                    : Results.Json(Shape(rec));
+            });
+
+            // Event footage follows the snapshot rule: the RTSP users may fetch it
+            // over HTTP Basic — an HA notification shows an event's thumbnail with
+            // the credentials its camera entities already hold, no session token to
+            // mint or renew. permitted_users applies through the event's camera; an
+            // event whose camera left the config falls back to any valid RTSP user
+            // (same rule as the review endpoint). The JSON endpoints stay session-only.
+            IResult? EventMediaAuth(HttpContext ctx, string id)
+            {
+                if (!userStore.Enabled || ctx.Items.ContainsKey("authUser"))
+                    return null;
+                var creds = NetUtil.DecodeBasicAuth(ctx.Request.Headers.Authorization);
+                if (creds != null
+                    && users.TryGetValue(creds.Value.User, out var expected)
+                    && NetUtil.FixedTimeEquals(expected, creds.Value.Pass))
+                {
+                    var cam = cameras.FirstOrDefault(c =>
+                        string.Equals(c.Name, events.Find(id)?.Camera, StringComparison.OrdinalIgnoreCase));
+                    if (cam?.PermittedUsers == null || cam.PermittedUsers.Contains(creds.Value.User))
+                        return null;
+                }
+                ChallengeBasic(ctx);
+                return Results.Json(new { error = "authentication required" }, statusCode: 401);
+            }
+
+            app.MapGet("/api/events/{id}/clip", (string id, HttpContext ctx) =>
+            {
+                if (EventMediaAuth(ctx, id) is { } denied) return denied;
+                var path = events.ArtifactPath(id, "clip.mp4");
+                if (path == null)
+                    return Results.Json(new { error = "no clip for this event" }, statusCode: 404);
+                var rec = events.Find(id);
+                SetArtifactCaching(ctx, rec);
+                // ?dl=1: a save-as download instead of inline playback.
+                string? name = null;
+                if (ctx.Request.Query["dl"] == "1")
+                    name = rec != null
+                        ? $"{Neolink.Recording.EventStore.SafeName(rec.Camera)} {rec.StartUtc.ToLocalTime():yyyy-MM-dd HHmmss}.mp4"
+                        : $"{id}.mp4";
+                return ServeMp4(ctx, path, name);
+            });
+
+            app.MapGet("/api/events/{id}/thumb", (string id, HttpContext ctx) =>
+            {
+                if (EventMediaAuth(ctx, id) is { } denied) return denied;
+                var path = events.ArtifactPath(id, "thumb.jpg");
+                if (path == null)
+                    return Results.Json(new { error = "no thumbnail for this event" }, statusCode: 404);
+                SetArtifactCaching(ctx, events.Find(id));
+                return Results.Stream(FootageVault.OpenRead(path), "image/jpeg"); // decrypts when encrypted
+            });
+
+            // The clip's low-res sub-stream twin, used by the strip's ambient previews.
+            app.MapGet("/api/events/{id}/preview", (string id, HttpContext ctx) =>
+            {
+                if (EventMediaAuth(ctx, id) is { } denied) return denied;
+                var path = events.ArtifactPath(id, "preview.mp4");
+                if (path == null)
+                    return Results.Json(new { error = "no preview for this event" }, statusCode: 404);
+                SetArtifactCaching(ctx, events.Find(id));
+                return ServeMp4(ctx, path);
+            });
+
+            app.MapPost("/api/events/{id}/review", (string id, ReviewRequest req, HttpContext ctx) =>
+            {
+                var rec = events.Find(id);
+                if (rec == null)
+                    return Results.Json(new { error = "unknown event" }, statusCode: 404);
+                // Same rules as camera control: reviewing an event needs control rights
+                // on its camera. Web-UI sessions (validated by the middleware) always
+                // qualify; events of removed cameras fall back to any valid RTSP user.
+                var cam = cameras.FirstOrDefault(c => string.Equals(c.Name, rec.Camera, StringComparison.OrdinalIgnoreCase));
+                if (userStore.Enabled)
+                {
+                    // authenticated by the middleware — allowed
+                }
+                else if (cam != null)
+                {
+                    if (CheckAuth(ctx, cam) is { } denied) return denied;
+                }
+                else if (users.Count > 0)
+                {
+                    var creds = NetUtil.DecodeBasicAuth(ctx.Request.Headers.Authorization);
+                    if (creds == null || !users.TryGetValue(creds.Value.User, out var pw)
+                        || !NetUtil.FixedTimeEquals(pw, creds.Value.Pass))
+                    {
+                        ChallengeBasic(ctx);
+                        return Results.Json(new { error = "authentication required" }, statusCode: 401);
+                    }
+                }
+                events.SetReviewed(id, req.Reviewed ?? true);
+                return Results.Json(new { ok = true });
+            });
+
+            // Bulk delete: permanently removes the selected events and their files.
+            // Destructive, so it is admin-only once accounts exist (like the server
+            // settings and user management); with no accounts it needs a valid RTSP
+            // user, same as review. ?estimate answers "what would this delete?"
+            // (count, total size, per-camera and time span) so the UI can confirm
+            // with a real summary before anything is removed.
+            app.MapPost("/api/events/delete", (EventDeleteRequest req, HttpContext ctx) =>
+            {
+                if (userStore.Enabled)
+                {
+                    if (!IsAdmin(ctx)) return Results.Json(new { error = "admin only" }, statusCode: 403);
+                }
+                else if (users.Count > 0)
+                {
+                    var creds = NetUtil.DecodeBasicAuth(ctx.Request.Headers.Authorization);
+                    if (creds == null || !users.TryGetValue(creds.Value.User, out var pw)
+                        || !NetUtil.FixedTimeEquals(pw, creds.Value.Pass))
+                    {
+                        ChallengeBasic(ctx);
+                        return Results.Json(new { error = "authentication required" }, statusCode: 401);
+                    }
+                }
+
+                var ids = req.Ids?.Distinct().ToList() ?? new List<string>();
+                if (ids.Count == 0)
+                    return Results.Json(new { error = "no events selected" }, statusCode: 400);
+                if (ids.Count > 1000)
+                    return Results.Json(new { error = "too many events in one request (max 1000)" }, statusCode: 400);
+
+                // Resolve to real, deletable events (skip unknown and still-recording).
+                var found = ids.Select(events.Find).OfType<EventRecord>().ToList();
+                var deletable = found.Where(r => !r.Ongoing).ToList();
+                int ongoing = found.Count(r => r.Ongoing);
+                int unknown = ids.Count - found.Count;
+
+                if (req.Estimate == true)
+                {
+                    long bytes = deletable.Sum(r => events.EventSize(r.Id));
+                    var perCamera = deletable
+                        .GroupBy(r => r.Camera, StringComparer.OrdinalIgnoreCase)
+                        .Select(g => new { camera = g.Key, count = g.Count() })
+                        .OrderByDescending(x => x.count).ThenBy(x => x.camera)
+                        .ToList();
+                    return Results.Json(new
+                    {
+                        count = deletable.Count,
+                        bytes,
+                        cameras = perCamera,
+                        ongoing,
+                        unknown,
+                        earliest = deletable.Count > 0 ? deletable.Min(r => r.StartUtc) : (DateTime?)null,
+                        latest = deletable.Count > 0 ? deletable.Max(r => r.StartUtc) : (DateTime?)null,
+                    });
+                }
+
+                long freed = 0;
+                int deleted = 0, failed = 0;
+                foreach (var rec in deletable)
+                {
+                    long size = events.EventSize(rec.Id);
+                    if (events.DeleteEvent(rec.Id)) { deleted++; freed += size; }
+                    else failed++;
+                }
+                if (deleted > 0)
+                    Log.Info($"Events: deleted {deleted} event(s) on request ({FormatBytes(freed)} freed)");
+                return Results.Json(new { deleted, freed, failed, ongoing, unknown });
+            });
+
+            // ------------------------------------------------------------ timeline bookmarks
+            //
+            // Named stretches of a day's footage ("my son's first walk",
+            // 10:00–10:08), stored in bookmarks.json IN the recordings root so
+            // they travel with the footage. Shared by every user of the server,
+            // like the recordings themselves. Web-UI sessions are validated by
+            // the middleware; RTSP-user setups need Basic auth to write (reading
+            // is as open as the events list).
+            var bookmarks = new Neolink.Recording.BookmarkStore(events.Root);
+
+            object ShapeBookmark(Neolink.Recording.Bookmark b) =>
+                new { id = b.Id, date = b.Date, from = b.From, to = b.To, name = b.Name };
+
+            IResult? CheckBookmarkWriteAuth(HttpContext ctx)
+            {
+                if (userStore.Enabled) return null; // middleware already validated the session
+                if (users.Count == 0) return null;  // open server
+                var creds = NetUtil.DecodeBasicAuth(ctx.Request.Headers.Authorization);
+                if (creds != null && users.TryGetValue(creds.Value.User, out var pw)
+                    && NetUtil.FixedTimeEquals(pw, creds.Value.Pass))
+                    return null;
+                ChallengeBasic(ctx);
+                return Results.Json(new { error = "authentication required" }, statusCode: 401);
+            }
+
+            app.MapGet("/api/bookmarks", () =>
+                Results.Json(bookmarks.List().Select(ShapeBookmark)));
+
+            app.MapPost("/api/bookmarks", (BookmarkRequest req, HttpContext ctx) =>
+            {
+                if (CheckBookmarkWriteAuth(ctx) is { } denied) return denied;
+                try
+                {
+                    var b = bookmarks.Add(req.Date, req.From ?? double.NaN, req.To ?? double.NaN, req.Name);
+                    Log.Info($"Bookmark saved: \"{b.Name}\" ({b.Date})");
+                    return Results.Json(ShapeBookmark(b));
+                }
+                catch (FormatException ex)
+                {
+                    return Results.Json(new { error = ex.Message }, statusCode: 400);
+                }
+            });
+
+            app.MapDelete("/api/bookmarks/{id}", (string id, HttpContext ctx) =>
+            {
+                if (CheckBookmarkWriteAuth(ctx) is { } denied) return denied;
+                return bookmarks.Remove(id)
+                    ? Results.Json(new { ok = true })
+                    : Results.Json(new { error = "unknown bookmark" }, statusCode: 404);
+            });
+        }
+
+        // ------------------------------------------------------------ recording switches + footage
+
+        if (events != null && recordingSettings != null)
+        {
+            // The stream recording falls back to when no per-camera override is set:
+            // the config's recording.stream if this camera serves it, else main/first.
+            string DefaultRecordKind(WebCameraInfo cam)
+            {
+                var cfg = o.Recording?.Stream ?? "auto";
+                if (cfg != "auto" && cam.Streams.Any(s => s.Kind == cfg)) return cfg;
+                return (cam.Streams.FirstOrDefault(s => s.Kind == "mainStream")
+                        ?? cam.Streams.FirstOrDefault())?.Kind ?? "mainStream";
+            }
+
+            object ShapeSettings(WebCameraInfo cam, CameraRecordingSettings s)
+            {
+                var ns = o.Notifier?.Store.Snapshot();
+                return new
+                {
+                    events = s.Events,
+                    eventsAvailable = cam.EventsAvailableNow,
+                    // A battery camera Neolink lets doze (no always_on) never tapes
+                    // 24/7 — taping would hold it awake until the battery dies. The
+                    // panel shows the toggle disabled with this reason.
+                    continuous = RecordingConfig.ContinuousEnabled && s.Continuous
+                                 && cam.SleepFriendly?.Invoke() != true,
+                    continuousAvailable = RecordingConfig.ContinuousEnabled,
+                    continuousBlockedBySleep = cam.SleepFriendly?.Invoke() == true,
+                    // The passive wake tap that replaces 24/7 on those cameras —
+                    // self-wake footage lands on the timeline at zero battery cost.
+                    wakeTimeline = s.WakeTimeline,
+                    // Always the EFFECTIVE list (never null): unset means the default
+                    // set, which excludes the opt-in perimeter labels — the UI chips
+                    // must show those as off until the user ticks them.
+                    eventTypes = (IEnumerable<string>?)s.EventTypes ?? CameraRecordingSettings.DefaultLabels,
+                    knownTypes = CameraRecordingSettings.KnownLabels,
+                    // Cached capability signals from the last live probe (null = never
+                    // probed): the panel filters its event-type chips with these
+                    // IMMEDIATELY instead of showing everything and pruning once the
+                    // camera answers — the list only shifts on a firmware change.
+                    supportedAiTypes = o.CameraState?.DetectionCaps(cam.Name).AiTypes,
+                    supportedDoorbell = o.CameraState?.DetectionCaps(cam.Name).Doorbell,
+                    // Per-camera retention overrides (null = default) + the server defaults
+                    // so the UI can label what "default" currently means.
+                    eventRetentionDays = s.EventRetentionDays,
+                    continuousRetentionDays = s.ContinuousRetentionDays,
+                    defaultEventRetentionDays = o.Recording?.RetentionDays ?? 7,
+                    defaultContinuousRetentionDays = o.Recording?.EffectiveContinuousRetentionDays ?? 7,
+                    // Which stream gets taped: the override, the resolved default, and
+                    // what this camera actually serves (the UI's dropdown options).
+                    recordStream = s.RecordStream,
+                    defaultRecordStream = DefaultRecordKind(cam),
+                    availableStreams = cam.Streams.Select(x => x.Kind).ToList(),
+                    // Capture schedule, always in effective form: the day list is never
+                    // null (the UI chips render it directly) and "" means midnight.
+                    // It only takes effect while scheduleEnabled (opt-in).
+                    scheduleEnabled = s.ScheduleEnabled,
+                    scheduleDays = (IEnumerable<string>?)s.ScheduleDays ?? CameraRecordingSettings.WeekDays,
+                    scheduleStart = s.ScheduleStart ?? "",
+                    scheduleEnd = s.ScheduleEnd ?? "",
+                    // Archiving: available only when the server config maps an archive
+                    // tier; per camera AND per type (strict opt-in). Footage moves to
+                    // the archive when its normal retention above expires.
+                    archiveAvailable = o.ArchiveAvailable,
+                    archiveEvents = s.ArchiveEvents,
+                    archiveContinuous = s.ArchiveContinuous,
+                    archiveRetentionDays = s.ArchiveRetentionDays,
+                    // AI descriptions: the per-camera opt-in only shows (and only
+                    // acts) while the feature is enabled globally in Settings → AI.
+                    aiAvailable = o.Ai?.Enabled == true,
+                    aiDescribe = s.AiDescribe,
+                    aiContext = s.AiContext ?? "",
+                    // Event notifications: per-camera opt-in per channel; "available"
+                    // = that channel is configured, so the panel can say what to set
+                    // up instead of offering a dead switch.
+                    emailEvents = s.EmailEvents,
+                    emailAvailable = ns != null && Neolink.Notifications.Notifier.EmailReady(ns),
+                    webhookEvents = s.WebhookEvents,
+                    webhookAvailable = ns != null && Neolink.Notifications.Notifier.WebhookReady(ns),
+                };
+            }
+
+            app.MapGet("/api/cameras/{name}/recording", (string name, HttpContext ctx) =>
+            {
+                var cam = cameras.FirstOrDefault(c => string.Equals(c.Name, name, StringComparison.OrdinalIgnoreCase));
+                return cam == null
+                    ? Results.Json(new { error = $"unknown camera '{name}'" }, statusCode: 404)
+                    : Results.Json(ShapeSettings(cam, recordingSettings.Get(cam.Name)));
+            });
+
+            app.MapPost("/api/cameras/{name}/recording", (string name, RecordingSettingsRequest req, HttpContext ctx) =>
+            {
+                var cam = cameras.FirstOrDefault(c => string.Equals(c.Name, name, StringComparison.OrdinalIgnoreCase));
+                if (cam == null)
+                    return Results.Json(new { error = $"unknown camera '{name}'" }, statusCode: 404);
+                if (CheckAuth(ctx, cam) is { } denied)
+                    return denied;
+                // These persist SERVER-side (retention, schedules, archive routing,
+                // what gets recorded) — once accounts exist, changing them is admin
+                // work, like every other server setting.
+                if (userStore.Enabled && !IsAdmin(ctx))
+                    return Results.Json(new { error = "admin only — recording settings are server settings" }, statusCode: 403);
+                // The UI disables the 24/7 toggle for these cameras; this catches
+                // direct API callers with the same reason.
+                if (req.Continuous == true && cam.SleepFriendly?.Invoke() == true)
+                    return Results.Json(new
+                    {
+                        error = "24/7 recording is unavailable while this battery camera is allowed " +
+                                "to sleep — taping around the clock would hold it awake until the " +
+                                "battery dies; set always_on = true for this camera first"
+                    }, statusCode: 400);
+
+                List<string>? types = null;
+                if (req.EventTypes != null)
+                {
+                    types = req.EventTypes.Select(t => t.Trim().ToLowerInvariant())
+                        .Where(t => t.Length > 0).Distinct().ToList();
+                }
+                // The continuous switch is inert while the feature is disabled.
+                var continuous = RecordingConfig.ContinuousEnabled ? req.Continuous : null;
+                // Retention: negative = clear the override (use the server default).
+                // Capped at 100 years — beyond that is "forever", and unbounded values
+                // would overflow the cleanup pass's date arithmetic.
+                static int? Retention(int? v) => v switch
+                {
+                    null or < 0 => null,
+                    > 36500 => 36500,
+                    _ => v,
+                };
+                // Record stream: "" clears the override; a value must be served.
+                if (req.RecordStream is { Length: > 0 } rs && cam.Streams.All(s => s.Kind != rs))
+                    return Results.Json(new
+                    {
+                        error = $"recordStream must be one of: {string.Join(", ", cam.Streams.Select(s => s.Kind))}",
+                    }, statusCode: 400);
+                // Capture schedule: unknown day tokens are dropped; an empty or
+                // complete day list stores as null (= every day). Times must be
+                // HH:mm — anything else (including "") clears to midnight.
+                List<string>? schedDays = null;
+                if (req.ScheduleDays != null)
+                {
+                    schedDays = req.ScheduleDays.Select(d => d.Trim().ToLowerInvariant())
+                        .Where(CameraRecordingSettings.WeekDays.Contains).Distinct().ToList();
+                    if (schedDays.Count == 0 || schedDays.Count == CameraRecordingSettings.WeekDays.Length)
+                        schedDays = null;
+                }
+                static string? SchedTime(string? v) =>
+                    v != null && CameraRecordingSettings.ParseMinutes(v) is int m && m > 0 ? v : null;
+                // Archiving is inert without the server-side archive tier — the
+                // switches can't be turned on for a destination that doesn't exist.
+                var archiveEvents = o.ArchiveAvailable ? req.ArchiveEvents : null;
+                var archiveContinuous = o.ArchiveAvailable ? req.ArchiveContinuous : null;
+                if ((req.ArchiveEvents == true || req.ArchiveContinuous == true) && !o.ArchiveAvailable)
+                    return Results.Json(new
+                    {
+                        error = "archiving requires \"archive_path\" in the server recording config " +
+                                "(ideally a different drive — in Docker, map a second volume)",
+                    }, statusCode: 409);
+                // The camera opt-in can only be switched ON while the feature is
+                // globally enabled (an endpoint exists to send to). Switching OFF
+                // is always allowed; a stored ON goes quiet if the global switch
+                // later turns off.
+                if (req.AiDescribe == true && o.Ai?.Enabled != true)
+                    return Results.Json(new
+                    {
+                        error = "enable AI event descriptions globally first " +
+                                "(Settings → AI) — that's where the LLM endpoint lives",
+                    }, statusCode: 409);
+                // Same shape for event emails: turning the camera ON needs a
+                // configured, enabled mail setup to send through; OFF always works.
+                if (req.EmailEvents == true
+                    && (o.Notifier?.Store.Snapshot() is not { } mail
+                        || !Neolink.Notifications.Notifier.EmailReady(mail)))
+                    return Results.Json(new
+                    {
+                        error = "set up email notifications first (Server settings → " +
+                                "Notifications) — recipient and mail server live there",
+                    }, statusCode: 409);
+                if (req.WebhookEvents == true
+                    && (o.Notifier?.Store.Snapshot() is not { } hook
+                        || !Neolink.Notifications.Notifier.WebhookReady(hook)))
+                    return Results.Json(new
+                    {
+                        error = "set up the webhook first (Server settings → " +
+                                "Notifications) — URL and format live there",
+                    }, statusCode: 409);
+                var updated = recordingSettings.Update(cam.Name, req.Events, continuous,
+                    types, setEventTypes: req.EventTypes != null,
+                    eventRetentionDays: Retention(req.EventRetentionDays),
+                    setEventRetention: req.EventRetentionDays != null,
+                    continuousRetentionDays: Retention(req.ContinuousRetentionDays),
+                    setContinuousRetention: req.ContinuousRetentionDays != null,
+                    recordStream: req.RecordStream is { Length: > 0 } v ? v : null,
+                    setRecordStream: req.RecordStream != null,
+                    scheduleDays: schedDays, setScheduleDays: req.ScheduleDays != null,
+                    scheduleStart: SchedTime(req.ScheduleStart), setScheduleStart: req.ScheduleStart != null,
+                    scheduleEnd: SchedTime(req.ScheduleEnd), setScheduleEnd: req.ScheduleEnd != null,
+                    scheduleEnabled: req.ScheduleEnabled,
+                    archiveEvents: archiveEvents,
+                    archiveContinuous: archiveContinuous,
+                    archiveRetentionDays: Retention(req.ArchiveRetentionDays),
+                    setArchiveRetention: req.ArchiveRetentionDays != null,
+                    wakeTimeline: req.WakeTimeline,
+                    aiDescribe: req.AiDescribe,
+                    // Scene notes ride the prompt on every event — bound them so a
+                    // paste-happy admin can't balloon each request. "" clears.
+                    aiContext: req.AiContext is { } noteRaw
+                               && noteRaw.Trim() is { Length: > 0 } note
+                        ? (note.Length > 500 ? note[..500] : note) : null,
+                    setAiContext: req.AiContext != null,
+                    emailEvents: req.EmailEvents,
+                    webhookEvents: req.WebhookEvents);
+                NudgeHa(cam.Name);
+                return Results.Json(ShapeSettings(cam, updated));
+            });
+        }
+
+        if (events != null && RecordingConfig.ContinuousEnabled)
+        {
+            app.MapGet("/api/recordings/{camera}", (string camera) =>
+            {
+                var cam = cameras.FirstOrDefault(c => string.Equals(c.Name, camera, StringComparison.OrdinalIgnoreCase));
+                return cam == null
+                    ? Results.Json(new { error = $"unknown camera '{camera}'" }, statusCode: 404)
+                    : Results.Json(events.ListContinuousDays(cam.Name));
+            });
+
+            app.MapGet("/api/recordings/{camera}/{date}", (string camera, string date) =>
+            {
+                var cam = cameras.FirstOrDefault(c => string.Equals(c.Name, camera, StringComparison.OrdinalIgnoreCase));
+                if (cam == null)
+                    return Results.Json(new { error = $"unknown camera '{camera}'" }, statusCode: 404);
+                var segments = OverlayActiveSegment(
+                        events.ListSegments(cam.Name, date), cam.ActiveSegment?.Invoke(), date)
+                    .Select(s => new { file = s.File, size = s.Size, seconds = Math.Round(s.Seconds, 1), live = s.Live });
+                return Results.Json(segments);
+            });
+
+            app.MapGet("/api/recordings/{camera}/{date}/{file}", (string camera, string date, string file, HttpContext ctx) =>
+            {
+                var cam = cameras.FirstOrDefault(c => string.Equals(c.Name, camera, StringComparison.OrdinalIgnoreCase));
+                var path = cam == null ? null : events.SegmentPath(cam.Name, date, file);
+                return path == null
+                    ? Results.Json(new { error = "no such recording" }, statusCode: 404)
+                    : ServeMp4(ctx, path);
+            });
+
+            // Bulk export: every segment overlapping [from, to] of one day (so at
+            // most 24 h by construction), streamed as a STORED zip — video doesn't
+            // compress, and store-level means no CPU and no temp files. Segments
+            // ship as-is (lossless, each named by its start time and playable on
+            // its own); the one still being written is skipped — it would be an
+            // unfinalized, unplayable file. ?estimate=1 returns {files, bytes} so
+            // the UI can show the damage before the user commits to gigabytes.
+            app.MapGet("/api/recordings/{camera}/{date}/export", (string camera, string date,
+                string? from, string? to, string? estimate, string? format, HttpContext ctx) =>
+            {
+                var cam = cameras.FirstOrDefault(c => string.Equals(c.Name, camera, StringComparison.OrdinalIgnoreCase));
+                if (cam == null)
+                    return Results.Json(new { error = $"unknown camera '{camera}'" }, statusCode: 404);
+                if (!TimeSpan.TryParse(from, System.Globalization.CultureInfo.InvariantCulture, out var fromT)
+                    || !TimeSpan.TryParse(to, System.Globalization.CultureInfo.InvariantCulture, out var toT)
+                    || fromT < TimeSpan.Zero || toT > TimeSpan.FromDays(1) || toT <= fromT)
+                    return Results.Json(new { error = "invalid range — need from=HH:mm[:ss] < to=HH:mm[:ss] within the day" }, statusCode: 400);
+
+                var active = cam.ActiveSegment?.Invoke();
+                var picked = PickExportSegments(events.ListSegments(cam.Name, date),
+                    active is { } a && a.Date == date ? a.File : null,
+                    fromT.TotalSeconds, toT.TotalSeconds, out long bytes);
+                // The single-MP4 planner needs each file's start-of-day offset to
+                // trim the output to the requested range.
+                var inputs = picked
+                    .Select(f => (Path: events.SegmentPath(cam.Name, date, f), File: f))
+                    .Where(p => p.Path != null)
+                    .Select(p => (p.Path!,
+                        TimeSpan.TryParseExact(Path.GetFileNameWithoutExtension(p.File), @"hh\-mm\-ss", null, out var st)
+                            ? st.TotalSeconds : 0))
+                    .ToList();
+
+                if (estimate is "1" or "true")
+                {
+                    // Also answer "can this range become ONE file?" — the planner
+                    // reads only each segment's index, so this stays cheap.
+                    Mp4Export.Plan? est = null;
+                    string? mp4Reason = null;
+                    if (inputs.Count > 0)
+                    {
+                        try { est = Mp4Export.TryPlan(inputs, fromT.TotalSeconds, toT.TotalSeconds, out mp4Reason); }
+                        catch (Exception ex) { mp4Reason = ex.Message; }
+                    }
+                    return Results.Json(new
+                    {
+                        files = picked.Count,
+                        bytes,
+                        mp4Bytes = est?.TotalBytes,
+                        mp4DurationMs = est?.DurationMs,
+                        mp4Reason,
+                    });
+                }
+                if (picked.Count == 0)
+                    return Results.Json(new { error = "no footage in this range" }, statusCode: 404);
+                // One export at a time: bulk sequential reads compete with the
+                // recorders' writes for the same disk; a second stream doubles it.
+                if (!ExportGate.Wait(0))
+                    return Results.Json(new { error = "another export is already running — try again when it finishes" }, statusCode: 503);
+
+                var baseName = $"{cam.Name} {date} {fromT:hh\\-mm\\-ss}-{toT:hh\\-mm\\-ss}";
+                if (format == "mp4")
+                {
+                    // Single combined MP4: concatenated without re-encoding. The
+                    // plan is built before streaming starts, so failures are clean
+                    // errors and the response carries an exact Content-Length.
+                    Mp4Export.Plan? plan;
+                    string? reason;
+                    try { plan = Mp4Export.TryPlan(inputs, fromT.TotalSeconds, toT.TotalSeconds, out reason); }
+                    catch (Exception ex) { plan = null; reason = ex.Message; }
+                    if (plan == null)
+                    {
+                        ExportGate.Release();
+                        return Results.Json(new { error = $"cannot combine into one file: {reason} — export as zip instead" },
+                            statusCode: 409);
+                    }
+                    return Results.Stream(async body =>
+                    {
+                        try
+                        {
+                            ctx.Response.ContentLength = plan.TotalBytes; // real download progress
+                            await Mp4Export.WriteAsync(plan, body, ctx.RequestAborted).ConfigureAwait(false);
+                        }
+                        catch (OperationCanceledException) { /* download cancelled */ }
+                        catch (IOException) { /* client went away, or a segment was pruned mid-copy */ }
+                        finally { ExportGate.Release(); }
+                    }, "video/mp4", $"{baseName}.mp4");
+                }
+
+                return Results.Stream(async body =>
+                {
+                    try
+                    {
+                        // ZipArchive writes entry headers and the central directory
+                        // with SYNCHRONOUS stream writes, which Kestrel rejects by
+                        // default (aborting the download mid-stream). Allow them for
+                        // this response — the gate above caps it to one busy thread.
+                        if (ctx.Features.Get<Microsoft.AspNetCore.Http.Features.IHttpBodyControlFeature>() is { } bodyCtl)
+                            bodyCtl.AllowSynchronousIO = true;
+                        using var zip = new System.IO.Compression.ZipArchive(
+                            body, System.IO.Compression.ZipArchiveMode.Create, leaveOpen: true);
+                        foreach (var f in picked)
+                        {
+                            var path = events.SegmentPath(cam.Name, date, f);
+                            if (path == null) continue; // archived/pruned mid-export
+                            var entry = zip.CreateEntry(f, System.IO.Compression.CompressionLevel.NoCompression);
+                            try { entry.LastWriteTime = File.GetLastWriteTime(path); } catch { }
+                            await using var es = entry.Open();
+                            // Through the vault: an export is a plaintext download by
+                            // definition, so encrypted segments decrypt on the way out.
+                            await using var fs = FootageVault.OpenRead(path);
+                            await fs.CopyToAsync(es, ctx.RequestAborted).ConfigureAwait(false);
+                        }
+                    }
+                    catch (OperationCanceledException) { /* download cancelled */ }
+                    catch (IOException) { /* client went away mid-stream */ }
+                    finally { ExportGate.Release(); }
+                }, "application/zip", $"{baseName}.zip");
+            });
+        }
+
+        // ------------------------------------------------------------ resource monitor
+
+        if (o.Monitor is { } monitor)
+        {
+            // Incremental polling: ?after=<unix ms> returns only newer samples, so
+            // the 2s poll ships a couple hundred bytes, not the whole hour.
+            app.MapGet("/api/system/stats", (long? after) => Results.Json(new
+            {
+                info = monitor.Info(),
+                samples = monitor.Since(after ?? 0).Select(s => new
+                {
+                    t = s.UnixMs,
+                    cpu = s.CpuPercent,
+                    ws = s.WorkingSetBytes,
+                    heap = s.ManagedHeapBytes,
+                    alloc = s.AllocMbPerSec,
+                    thr = s.Threads,
+                    fd = s.Handles,
+                    dTot = s.DiskTotalBytes,
+                    dFree = s.DiskFreeBytes,
+                    rec = s.RecordingsBytes,
+                    view = s.Viewers,
+                    recCams = s.RecordingCameras,
+                    wMb = s.StorageMbPerSec,
+                    wFiles = s.StorageFiles,
+                }),
+                // Per-camera availability: run-length transitions are tiny (a
+                // healthy camera is one run), so ship the full picture each poll.
+                avail = monitor.Availability
+                    .Snapshots(DateTimeOffset.UtcNow.ToUnixTimeMilliseconds())
+                    .Select(a => new
+                    {
+                        cam = a.Camera,
+                        on = a.Online,
+                        pct = a.UptimePct,
+                        obs = a.ObservedMs,
+                        outs = a.Outages,
+                        longest = a.LongestOutageMs,
+                        since = a.CurrentSinceMs,
+                        runs = a.Runs,
+                    }),
+            }));
+        }
+
+        // Who is watching what: addresses and user names, so admin only.
+        app.MapGet("/api/system/viewers", (HttpContext ctx) => IsAdmin(ctx)
+            ? Results.Json(o.Viewers.Snapshot().Select(v => new
+            {
+                camera = v.Camera,
+                stream = v.Stream,
+                via = v.Via,
+                from = v.From,
+                user = v.User,
+                since = new DateTimeOffset(v.SinceUtc).ToUnixTimeMilliseconds(),
+            }))
+            : Results.Json(new { error = "admin only" }, statusCode: 403));
+
+        if (o.Logs is { } logBuffer)
+        {
+            // Live server log tail over WebSocket: the backlog as one JSON array,
+            // then one JSON entry per line. Logs reveal paths, camera names and
+            // usernames, so this is strictly admin — and with authentication off
+            // there IS no admin, matching the other admin-only endpoints.
+            app.Map("/api/system/logs", async ctx =>
+            {
+                if (!ctx.WebSockets.IsWebSocketRequest)
+                {
+                    ctx.Response.StatusCode = 400;
+                    await ctx.Response.WriteAsync("WebSocket endpoint");
+                    return;
+                }
+                if (!IsAdmin(ctx))
+                {
+                    ctx.Response.StatusCode = 403;
+                    await ctx.Response.WriteAsJsonAsync(new
+                    {
+                        error = userStore.Enabled
+                            ? "admin only"
+                            : "create the admin account first (live logs need one)",
+                    });
+                    return;
+                }
+                using var ws = await ctx.WebSockets.AcceptWebSocketAsync();
+                try
+                {
+                    await StreamLogsAsync(ws, logBuffer, ct).ConfigureAwait(false);
+                }
+                catch (Exception ex) when (ex is not OperationCanceledException)
+                {
+                    Log.Debug($"Log stream ended: {Log.Flatten(ex)}");
+                }
+            });
+        }
+
+        app.Map("/api/stream", async ctx =>
+        {
+            if (!ctx.WebSockets.IsWebSocketRequest)
+            {
+                ctx.Response.StatusCode = 400;
+                await ctx.Response.WriteAsync("WebSocket endpoint");
+                return;
+            }
+            string? path = ctx.Request.Query["path"];
+            var hub = FindHub(cameras, path);
+            if (hub == null)
+            {
+                ctx.Response.StatusCode = 404;
+                return;
+            }
+            var from = LoginGuard.ClientAddress(ctx.Connection.RemoteIpAddress, ctx.Request.Headers["X-Forwarded-For"]);
+            var user = SessionName(ctx);
+            using var ws = await ctx.WebSockets.AcceptWebSocketAsync();
+            try
+            {
+                await StreamToWebSocketAsync(ws, hub, ct, o.Viewers, from, user).ConfigureAwait(false);
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                Log.Debug($"{hub.Name}: web stream ended: {Log.Flatten(ex)}");
+            }
+        });
+
+        // Two-way talk: microphone PCM in over a WebSocket, camera speaker out.
+        // Auth rides the same session middleware as every other /api route.
+        app.Map("/api/talk", async ctx =>
+        {
+            if (!o.TalkEnabled)
+            {
+                ctx.Response.StatusCode = 403;
+                await ctx.Response.WriteAsJsonAsync(new
+                {
+                    error = "two-way talk is disabled — enable it in Server settings (ui.talk)",
+                });
+                return;
+            }
+            if (!ctx.WebSockets.IsWebSocketRequest)
+            {
+                ctx.Response.StatusCode = 400;
+                await ctx.Response.WriteAsync("WebSocket endpoint");
+                return;
+            }
+            string? name = ctx.Request.Query["camera"];
+            var cam = cameras.FirstOrDefault(c => string.Equals(c.Name, name, StringComparison.OrdinalIgnoreCase));
+            if (cam == null)
+            {
+                ctx.Response.StatusCode = 404;
+                return;
+            }
+            using var ws = await ctx.WebSockets.AcceptWebSocketAsync();
+            try
+            {
+                await TalkFromWebSocketAsync(ws, cam.Name, cam.Control, ct).ConfigureAwait(false);
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                Log.Debug($"{cam.Name}: talk session ended: {Log.Flatten(ex)}");
+            }
+        });
+
+        if (webUi)
+        {
+            // The PWA service worker ships as an RCL asset under _content/, but it
+            // must control the whole app ("/"). Browsers cap a worker's scope at
+            // its script's directory unless the response carries this header.
+            app.Use(async (ctx, next) =>
+            {
+                if (ctx.Request.Path.Equals("/_content/Neolink.WebClient/sw.js", StringComparison.OrdinalIgnoreCase))
+                    ctx.Response.Headers["Service-Worker-Allowed"] = "/";
+                await next();
+            });
+            app.UseStaticFiles();     // physical wwwroot (published layout)
+            app.UseAntiforgery();
+            app.MapStaticAssets();    // manifest assets incl. the framework's blazor.web.js
+            app.MapRazorComponents<Neolink.WebClient.Components.App>()
+                .AddInteractiveServerRenderMode();
+        }
+
+        var displayHost = NetUtil.DisplayHost(bindAddr);
+        if (webUi)
+            Log.Info($"  Web UI: http://{displayHost}:{port}/");
+        Log.Info($"  API:    http://{displayHost}:{port}/api/cameras" + (webUi ? "" : " (web UI disabled)"));
+        await using var reg = ct.Register(() => app.Lifetime.StopApplication());
+        await app.RunAsync().ConfigureAwait(false);
+    }
+
+    /// <summary>Serializes footage exports: bulk reads off the recordings disk
+    /// compete with the recorders' writes, so only one zip streams at a time.</summary>
+    private static readonly SemaphoreSlim ExportGate = new(1, 1);
+
+    /// <summary>Human-readable byte size for log lines (KB/MB/GB).</summary>
+    private static string FormatBytes(long bytes) => bytes switch
+    {
+        >= 1024L * 1024 * 1024 => $"{bytes / (1024.0 * 1024 * 1024):0.0} GB",
+        >= 1024L * 1024 => $"{bytes / (1024.0 * 1024):0.0} MB",
+        _ => $"{bytes / 1024.0:0} KB",
+    };
+
+    /// <summary>
+    /// The segment files a [from, to] seconds-of-day export should contain: every
+    /// file whose footage overlaps the range, oldest first, with the total byte
+    /// count for the pre-flight estimate. The file still being written is excluded
+    /// (it has no moov yet — an unplayable torso); it exports once it closes.
+    /// A file with an unknown duration (exotic filesystems) counts as at least a
+    /// second long so it is still caught when the range crosses its start.
+    /// </summary>
+    internal static List<string> PickExportSegments(
+        List<(string File, long Size, double Seconds)> listed, string? activeFile,
+        double fromSec, double toSec, out long bytes)
+    {
+        var picked = new List<(double Start, string File, long Size)>();
+        foreach (var s in listed)
+        {
+            if (activeFile != null && string.Equals(s.File, activeFile, StringComparison.OrdinalIgnoreCase))
+                continue;
+            if (!TimeSpan.TryParseExact(Path.GetFileNameWithoutExtension(s.File), @"hh\-mm\-ss", null, out var start))
+                continue;
+            double startSec = start.TotalSeconds;
+            double endSec = startSec + Math.Max(s.Seconds, 1);
+            if (startSec < toSec && endSec > fromSec)
+                picked.Add((startSec, s.File, s.Size));
+        }
+        picked.Sort((a, b) => a.Start.CompareTo(b.Start));
+        bytes = picked.Sum(p => p.Size);
+        return picked.Select(p => p.File).ToList();
+    }
+
+    /// <summary>
+    /// Overlays the recorder's in-memory truth for the segment being written right
+    /// now onto a filesystem day listing. While a file is held open its directory
+    /// mtime — the listing's duration source — can be minutes stale (NTFS updates
+    /// it lazily on close; FUSE and network mounts cache attributes), which made a
+    /// recording camera's lane trail "now" by up to a whole segment and look
+    /// stopped, worst on high-bitrate cameras whose big segments stay open longest.
+    /// The live file gets its real written duration and a live flag, and is
+    /// appended if enumeration missed it entirely.
+    /// </summary>
+    internal static List<(string File, long Size, double Seconds, bool Live)> OverlayActiveSegment(
+        List<(string File, long Size, double Seconds)> listed,
+        (string Date, string File, double Seconds)? active, string date)
+    {
+        var result = listed.Select(s => (s.File, s.Size, s.Seconds, Live: false)).ToList();
+        if (active is not { } a || !string.Equals(a.Date, date, StringComparison.Ordinal))
+            return result;
+        int i = result.FindIndex(s => string.Equals(s.File, a.File, StringComparison.OrdinalIgnoreCase));
+        if (i >= 0)
+            result[i] = (result[i].File, result[i].Size, Math.Max(result[i].Seconds, a.Seconds), true);
+        else
+        {
+            result.Add((a.File, 0, a.Seconds, true));
+            result.Sort((x, y) => string.CompareOrdinal(x.File, y.File));
+        }
+        return result;
+    }
+
+    /// <summary>The base URL the server's own Blazor circuits use to reach the API:
+    /// wildcard binds map to plain loopback, a concrete bind address is used as-is.</summary>
+    internal static string LoopbackBase(string bindAddr, int port)
+    {
+        var host = bindAddr is "0.0.0.0" or "::" or "[::]" or "*" ? "127.0.0.1" : bindAddr;
+        return $"http://{host}:{port}";
+    }
+
+    private static IStreamHub? FindHub(IReadOnlyList<WebCameraInfo> cameras, string? path)
+    {
+        if (string.IsNullOrEmpty(path)) return null;
+        path = path.TrimEnd('/');
+        foreach (var cam in cameras)
+            foreach (var s in cam.Streams)
+                if (string.Equals(s.Path, path, StringComparison.OrdinalIgnoreCase))
+                    return s.Hub;
+        return null;
+    }
+
+    /// <summary>True for /api/cameras/{name}/snapshot[.jpg] — the paths whose auth
+    /// additionally accepts RTSP Basic credentials (see the session middleware).</summary>
+    private static bool IsSnapshotPath(PathString path) =>
+        path.StartsWithSegments("/api/cameras")
+        && (path.Value!.EndsWith("/snapshot.jpg", StringComparison.OrdinalIgnoreCase)
+            || path.Value.EndsWith("/snapshot", StringComparison.OrdinalIgnoreCase));
+
+    /// <summary>True for /api/events/{id}/clip|thumb|preview — event footage, whose
+    /// auth (like snapshots') additionally accepts RTSP Basic credentials.</summary>
+    private static bool IsEventMediaPath(PathString path) =>
+        path.StartsWithSegments("/api/events")
+        && (path.Value!.EndsWith("/clip", StringComparison.OrdinalIgnoreCase)
+            || path.Value.EndsWith("/thumb", StringComparison.OrdinalIgnoreCase)
+            || path.Value.EndsWith("/preview", StringComparison.OrdinalIgnoreCase));
+
+    /// <summary>Offers the Basic challenge only where it helps: headerless clients
+    /// (HA, scripts) and address-bar navigations. A browser answering 401+Basic on
+    /// a page subresource (img, fetch) pops its native credential dialog over the
+    /// web UI's own login form. Such loads carry a non-navigate Sec-Fetch-Mode —
+    /// but only on https/localhost origins (browsers withhold Sec-Fetch elsewhere),
+    /// so on plain http the web UI's fingerprints stand in: its browser-made
+    /// requests authenticate via a token query parameter, and subresource loads
+    /// send a Referer. Neither appears on scripted clients or typed-in URLs.</summary>
+    private static void ChallengeBasic(HttpContext ctx)
+    {
+        var mode = ctx.Request.Headers["Sec-Fetch-Mode"].ToString();
+        if (mode.Length > 0)
+        {
+            if (mode.Equals("navigate", StringComparison.OrdinalIgnoreCase))
+                ctx.Response.Headers.WWWAuthenticate = "Basic realm=\"neolink\"";
+            return;
+        }
+        if (ctx.Request.Query.ContainsKey("token") || ctx.Request.Headers.Referer.Count > 0)
+            return;
+        ctx.Response.Headers.WWWAuthenticate = "Basic realm=\"neolink\"";
+    }
+
+    /// <summary>The worst storage-tier state for the wall banner: null when recording
+    /// is off or every tier is healthy, else the most urgent tier's summary.</summary>
+    private static object? ShapeStorage(StorageLocations? storage)
+    {
+        if (storage == null) return null;
+        var sample = storage.Sample();
+        var worst = sample.FirstOrDefault(s => s.Full) ?? sample.FirstOrDefault(s => s.Warn);
+        return worst == null ? null : new
+        {
+            label = worst.Label,
+            usedPercent = Math.Round(worst.UsedPercent, 1),
+            full = worst.Full,
+        };
+    }
+
+    /// <summary>The floodlight-task fields the UI binds to, out of the camera's
+    /// (much larger) FloodlightTask XML. Field names follow the wire format.</summary>
+    private static object ShapeFloodlight(XElement task) => new
+    {
+        brightness = (long?)task.Element("brightness_cur") ?? 0,
+        brightnessMin = (long?)task.Element("brightness_min") ?? 1,
+        brightnessMax = (long?)task.Element("brightness_max") ?? 100,
+        // "enable" arms the camera's own turn-on-with-motion-at-night behavior.
+        auto = ((long?)task.Element("enable") ?? 0) == 1,
+    };
+
+    private static object? XmlToJson(XElement el)
+    {
+        if (!el.HasElements)
+        {
+            var text = el.Value.Trim();
+            return long.TryParse(text, out var n) ? n : text;
+        }
+        var obj = new Dictionary<string, object?>();
+        foreach (var attr in el.Attributes())
+            obj["@" + attr.Name.LocalName] = attr.Value;
+        foreach (var group in el.Elements().GroupBy(e => e.Name.LocalName))
+        {
+            obj[group.Key] = group.Count() == 1
+                ? XmlToJson(group.First())
+                : group.Select(XmlToJson).ToList();
+        }
+        return obj;
+    }
+
+    /// <summary>Parses the camera's space-separated option tables ("30 25 20 15 ...").</summary>
+    private static List<uint> ParseNumberTable(string table) =>
+        table.Split(new[] { ' ', ',' }, StringSplitOptions.RemoveEmptyEntries)
+            .Select(s => uint.TryParse(s, out var v) ? v : 0u)
+            .Where(v => v > 0)
+            .ToList();
+
+    // ------------------------------------------------------------------ live logs over WebSocket
+
+    /// <summary>Sends the backlog as one JSON array, then one JSON object per new line.</summary>
+    private static async Task StreamLogsAsync(WebSocket ws, LogBuffer logs, CancellationToken appCt)
+    {
+        using var cts = CancellationTokenSource.CreateLinkedTokenSource(appCt);
+        var ct = cts.Token;
+
+        // Drain (and ignore) incoming messages so we notice the client closing.
+        var receiveTask = Task.Run(async () =>
+        {
+            var buf = new byte[512];
+            try
+            {
+                while (ws.State == WebSocketState.Open)
+                {
+                    var res = await ws.ReceiveAsync(buf, ct).ConfigureAwait(false);
+                    if (res.MessageType == WebSocketMessageType.Close) break;
+                }
+            }
+            catch { }
+            cts.Cancel();
+        }, CancellationToken.None);
+
+        object Shape(LogEntry e) => new { seq = e.Seq, t = e.UnixMs, lvl = e.Level, msg = e.Message };
+
+        async Task SendJsonAsync(object payload) =>
+            await ws.SendAsync(JsonSerializer.SerializeToUtf8Bytes(payload),
+                WebSocketMessageType.Text, true, ct).ConfigureAwait(false);
+
+        var (subId, reader) = logs.Subscribe();
+        try
+        {
+            // Subscribe BEFORE snapshotting so no line can fall between the two;
+            // the client dedupes the overlap by sequence number.
+            await SendJsonAsync(logs.Snapshot().Select(Shape).ToList()).ConfigureAwait(false);
+            await foreach (var entry in reader.ReadAllAsync(ct).ConfigureAwait(false))
+                await SendJsonAsync(Shape(entry)).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) { }
+        finally
+        {
+            logs.Unsubscribe(subId);
+            cts.Cancel();
+            await TryCloseAsync(ws, WebSocketCloseStatus.NormalClosure, "bye");
+            try { await receiveTask.ConfigureAwait(false); } catch { }
+        }
+    }
+
+    // ------------------------------------------------------------------ fMP4 over WebSocket
+
+    /// <summary>
+    /// Protocol: one JSON text message (mime/codec/size), then binary messages:
+    /// first the init segment, then one moof+mdat fragment per video frame.
+    /// </summary>
+    private static async Task StreamToWebSocketAsync(WebSocket ws, IStreamHub hub, CancellationToken appCt,
+        ViewerRegistry viewers, string? from, string? user)
+    {
+        using var cts = CancellationTokenSource.CreateLinkedTokenSource(appCt);
+        var ct = cts.Token;
+
+        // Drain (and ignore) incoming messages so we notice the client closing.
+        var receiveTask = Task.Run(async () =>
+        {
+            var buf = new byte[1024];
+            try
+            {
+                while (ws.State == WebSocketState.Open)
+                {
+                    var res = await ws.ReceiveAsync(buf, ct).ConfigureAwait(false);
+                    if (res.MessageType == WebSocketMessageType.Close) break;
+                }
+            }
+            catch { }
+            cts.Cancel();
+        }, CancellationToken.None);
+
+        if (!await hub.WaitForDescribeInfoAsync(TimeSpan.FromSeconds(15), ct).ConfigureAwait(false))
+        {
+            await TryCloseAsync(ws, WebSocketCloseStatus.EndpointUnavailable, "stream not ready");
+            return;
+        }
+
+        var codec = hub.Codec ?? VideoCodec.H264;
+        var sps = hub.Sps;
+        var pps = hub.Pps;
+        if (sps == null || pps == null)
+        {
+            await TryCloseAsync(ws, WebSocketCloseStatus.EndpointUnavailable, "no codec parameters");
+            return;
+        }
+
+        // AAC audio rides along as MP4 track 2. ADPCM cameras stay video-only in
+        // the browser (MSE can't play raw PCM) — their audio is RTSP-only.
+        var audio = hub.Audio is { IsAac: true, AudioSpecificConfig: not null } a ? a : null;
+
+        string codecString = FMp4.CodecString(codec, sps);
+        string mimeCodecs = audio != null
+            ? $"{codecString}, {FMp4.AacCodecString(audio.AudioSpecificConfig!)}"
+            : codecString;
+        var meta = JsonSerializer.Serialize(new
+        {
+            type = "init",
+            codec = codecString,
+            mime = $"video/mp4; codecs=\"{mimeCodecs}\"",
+            width = hub.Width,
+            height = hub.Height,
+            audio = audio != null,
+        });
+        await ws.SendAsync(Encoding.UTF8.GetBytes(meta), WebSocketMessageType.Text, true, ct).ConfigureAwait(false);
+
+        var init = FMp4.BuildInit(codec, sps, pps, hub.Vps, hub.Width, hub.Height,
+            audio?.AudioSpecificConfig, audio?.SampleRate ?? 0, audio?.Channels ?? 0);
+        await ws.SendAsync(init, WebSocketMessageType.Binary, true, ct).ConfigureAwait(false);
+
+        var watch = viewers.Add(hub, "Web", from, user);
+        var reader = watch.Reader;
+        try
+        {
+            // Cameras deliver video in buffers that may hold anything from a single frame
+            // to a whole multi-second GOP. MSE requires exactly one frame per MP4 sample,
+            // so each buffer is split into access units. A buffer's true time span is only
+            // known when the NEXT buffer arrives (its RTP delta), so hold one buffer back
+            // and spread the measured delta evenly across its frames. All fragments of a
+            // buffer go out as one WebSocket message.
+            const uint NominalFrame = 3000;  // ~1/30s @ 90 kHz
+            long lastIndex = -1;
+            bool waitKeyframe = true;
+            bool haveTs = false;
+            uint prevTs = 0;
+            ulong decodeTime = 0;
+            uint sequence = 1;
+            FMp4.AccessUnits? pending = null;
+
+            // Audio fragments accumulate here and ship inside the next video batch:
+            // sending each ~21ms AAC frame as its own WebSocket message would wreck
+            // the client's delivery-cadence measurement (its jitter buffer sizing).
+            var audioFrags = new List<byte[]>();
+            ulong audioDt = 0;
+            uint prevAudioTs = 0;
+            bool haveAudioTs = false;
+
+            // One growable batch buffer per connection, and the fragments are
+            // written into it straight from the hub's Annex-B bytes: no
+            // per-frame sample or fragment arrays, which for keyframes were
+            // large-object-heap allocations per viewer per GOP.
+            var batch = new Mp4Writer(64 * 1024);
+            async Task FlushPendingAsync(uint totalDuration)
+            {
+                if ((pending == null || pending.Count == 0) && audioFrags.Count == 0) { pending = null; return; }
+                batch.Reset();
+                if (pending is { Count: > 0 })
+                {
+                    uint per = Math.Clamp(totalDuration / (uint)pending.Count, 900u, 45_000u); // 10..500ms per frame
+                    foreach (var unit in pending.Units)
+                    {
+                        FMp4.WriteFragmentHeader(batch, sequence++, decodeTime, per, unit.SampleBytes, unit.Keyframe);
+                        FMp4.WriteSample(batch, pending, unit);
+                        decodeTime += per;
+                    }
+                }
+                pending = null;
+                foreach (var frag in audioFrags)
+                    batch.Bytes(frag);
+                audioFrags.Clear();
+                await ws.SendAsync(batch.Written, WebSocketMessageType.Binary, true, ct).ConfigureAwait(false);
+            }
+
+            await foreach (var packet in reader.ReadAllAsync(ct).ConfigureAwait(false))
+            {
+                // The hub index is global across video AND audio packets, so it must be
+                // tracked for every packet — otherwise interleaved audio makes every
+                // video packet look like a drop (which would discard all P-frames).
+                bool gap = lastIndex >= 0 && packet.Index != lastIndex + 1;
+                lastIndex = packet.Index;
+
+                // Audio: fixed 1024-sample AUs; the decode-time advance comes from the
+                // RTP delta so hub drops shift the timeline instead of desyncing it.
+                // Held until the first video keyframe so both tracks start together.
+                if (packet is HubAudioAac aac && audio != null)
+                {
+                    if (waitKeyframe) continue;
+                    if (haveAudioTs)
+                    {
+                        uint d = unchecked(aac.RtpTs - prevAudioTs);
+                        audioDt += (d > 0 && d < 30u * (uint)audio.SampleRate) ? d : FMp4.AacSamplesPerAu;
+                    }
+                    prevAudioTs = aac.RtpTs;
+                    haveAudioTs = true;
+                    audioFrags.Add(FMp4.BuildFragment(sequence++, audioDt, FMp4.AacSamplesPerAu, aac.Au,
+                        keyframe: true, trackId: FMp4.AudioTrackId));
+                    continue;
+                }
+
+                if (packet is not HubVideo v) continue;
+                if (gap)
+                {
+                    // Buffers were dropped: flush what we hold at a nominal rate and
+                    // restart timing at the next keyframe.
+                    waitKeyframe = true;
+                    await FlushPendingAsync((uint)(NominalFrame * (pending?.Count ?? 1))).ConfigureAwait(false);
+                    haveTs = false;
+                }
+                if (waitKeyframe)
+                {
+                    if (!v.Keyframe) continue;
+                    waitKeyframe = false;
+                }
+
+                if (haveTs && pending != null)
+                {
+                    uint delta = unchecked(v.RtpTs - prevTs);
+                    if (delta == 0 || delta > 30 * FMp4.Timescale)
+                        delta = (uint)(NominalFrame * pending.Count); // clock garbage: assume ~30fps
+                    await FlushPendingAsync(delta).ConfigureAwait(false);
+                }
+                prevTs = v.RtpTs;
+                haveTs = true;
+
+                var aus = FMp4.SplitAccessUnitsRaw(codec, v.AnnexB);
+                if (aus.Count > 0)
+                    pending = aus;
+            }
+        }
+        catch (OperationCanceledException) { }
+        finally
+        {
+            watch.Dispose();
+            cts.Cancel();
+            await TryCloseAsync(ws, WebSocketCloseStatus.NormalClosure, "bye");
+            try { await receiveTask.ConfigureAwait(false); } catch { }
+        }
+    }
+
+    // ------------------------------------------------------------------ two-way talk over WebSocket
+
+    /// <summary>
+    /// Talk session protocol: the client opens with one JSON text message
+    /// ({"sampleRate": 48000}) describing its microphone PCM, then sends raw
+    /// 16-bit LE mono PCM as binary messages until it closes the socket. Errors
+    /// are reported in the close reason ("talk busy", "talk unsupported", ...).
+    /// </summary>
+    private static async Task TalkFromWebSocketAsync(WebSocket ws, string name, ICameraControl control, CancellationToken appCt)
+    {
+        using var cts = CancellationTokenSource.CreateLinkedTokenSource(appCt);
+        var ct = cts.Token;
+        var buf = new byte[32 * 1024];
+
+        var first = await ws.ReceiveAsync(buf, ct).ConfigureAwait(false);
+        if (first.MessageType != WebSocketMessageType.Text)
+        {
+            await TryCloseAsync(ws, WebSocketCloseStatus.PolicyViolation, "expected a JSON hello first");
+            return;
+        }
+        int sampleRate = 16000;
+        try
+        {
+            using var doc = JsonDocument.Parse(Encoding.UTF8.GetString(buf, 0, first.Count));
+            if (doc.RootElement.TryGetProperty("sampleRate", out var sr))
+                sampleRate = sr.GetInt32();
+        }
+        catch { /* malformed hello: keep the default */ }
+
+        var pcm = System.Threading.Channels.Channel.CreateUnbounded<byte[]>(
+            new System.Threading.Channels.UnboundedChannelOptions { SingleReader = true, SingleWriter = true });
+        var talk = control.TalkAsync(sampleRate, pcm.Reader, ct);
+
+        var receive = Task.Run(async () =>
+        {
+            try
+            {
+                while (ws.State == WebSocketState.Open)
+                {
+                    var res = await ws.ReceiveAsync(buf, ct).ConfigureAwait(false);
+                    if (res.MessageType == WebSocketMessageType.Close) break;
+                    if (res.MessageType == WebSocketMessageType.Binary && res.Count > 0)
+                        pcm.Writer.TryWrite(buf.AsSpan(0, res.Count).ToArray());
+                }
+            }
+            finally
+            {
+                pcm.Writer.TryComplete();
+            }
+        }, CancellationToken.None);
+
+        var finished = await Task.WhenAny(talk, receive).ConfigureAwait(false);
+        if (finished == receive)
+        {
+            // Client hung up: give the tail a moment to flush and release the
+            // camera's talk channel, then force the session down.
+            await Task.WhenAny(talk, Task.Delay(TimeSpan.FromSeconds(5), CancellationToken.None)).ConfigureAwait(false);
+        }
+
+        var status = WebSocketCloseStatus.NormalClosure;
+        var reason = "bye";
+        if (talk.IsCompleted)
+        {
+            try { await talk.ConfigureAwait(false); }
+            catch (OperationCanceledException) { }
+            catch (TalkBusyException) { (status, reason) = (WebSocketCloseStatus.PolicyViolation, "talk busy"); }
+            catch (NotSupportedException) { (status, reason) = (WebSocketCloseStatus.PolicyViolation, "talk unsupported"); }
+            catch (CameraOfflineException) { (status, reason) = (WebSocketCloseStatus.EndpointUnavailable, "camera offline"); }
+            catch (Exception ex)
+            {
+                Log.Debug($"{name}: talk failed: {Log.Flatten(ex)}");
+                (status, reason) = (WebSocketCloseStatus.InternalServerError, "talk failed");
+            }
+        }
+
+        // Close gracefully BEFORE cancelling: cancelling a pending ReceiveAsync
+        // aborts the socket, and the client would see code 1006 with no reason
+        // instead of the message above.
+        await TryCloseAsync(ws, status, reason);
+        cts.Cancel();
+        try { await talk.ConfigureAwait(false); } catch { }
+        try { await receive.ConfigureAwait(false); } catch { }
+    }
+
+    private static async Task TryCloseAsync(WebSocket ws, WebSocketCloseStatus status, string reason)
+    {
+        try
+        {
+            if (ws.State is WebSocketState.Open or WebSocketState.CloseReceived)
+            {
+                using var closeCts = new CancellationTokenSource(TimeSpan.FromSeconds(2));
+                await ws.CloseAsync(status, reason, closeCts.Token).ConfigureAwait(false);
+            }
+        }
+        catch { }
+    }
+}

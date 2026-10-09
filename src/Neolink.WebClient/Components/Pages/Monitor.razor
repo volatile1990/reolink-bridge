@@ -1,0 +1,721 @@
+@page "/monitor"
+@using System.Diagnostics
+@using System.Globalization
+@using System.Text.Json
+@inject NavigationManager Nav
+@inject HttpClient Http
+@inject IJSRuntime JS
+@inject LocalApiInfo Local
+@inject Translator T
+@implements IAsyncDisposable
+
+@* Live resource monitor: the backend (Neolink.Server process + storage disk)
+   sampled server-side every 2s, and the frontend (this very browser tab —
+   JS heap, frame rate, circuit round-trip) sampled locally at the same beat. *@
+
+<PageTitle>@T["Neolink.NET — Monitor"]</PageTitle>
+
+<div class="mon-page">
+    <div class="toolbar mon-toolbar">
+        <a class="tool-btn" href="" title="@T["Back to live view"]">‹ @T["Live"]</a>
+        <span class="tool-label">@T["SYSTEM MONITOR"]</span>
+        <span class="mon-pulse @(_paused ? "paused" : "")" title="@(_paused ? T["Paused"] : T["Sampling every 2s"])"></span>
+        <span class="tool-sep"></span>
+        <span class="tool-label">@T["WINDOW"]</span>
+        @foreach (var (label, sec) in Windows)
+        {
+            <button class="chip @(_windowSec == sec ? "chip-active" : "chip-off")"
+                    @onclick="() => _windowSec = sec">@T[label]</button>
+        }
+        <span class="tool-sep"></span>
+        <button class="tool-btn @(_paused ? "active" : "")" title="@T["Freeze the charts (sampling continues server-side)"]"
+                @onclick="() => _paused = !_paused">
+            @(_paused ? "▶" : "❚❚") <span class="tool-name">@(_paused ? T["Resume"] : T["Pause"])</span>
+        </button>
+        @if (_admin)
+        {
+            <span class="tool-sep"></span>
+            <a class="tool-btn" href="logs" title="@T["Live server log tail (admin)"]">@UiIcon.Render("logs", 14) <span class="tool-name">@T["Logs"]</span></a>
+        }
+    </div>
+
+    @if (_error != null)
+    {
+        <div class="notice error">@_error</div>
+    }
+    else if (!_supported)
+    {
+        <div class="notice">@T["This server does not expose resource statistics — update the Neolink.NET server."]</div>
+    }
+    else
+    {
+        <div class="mon-scroll">
+            @* ---------------- backend ---------------- *@
+            <div class="mon-section">
+                <span class="mon-section-title">@T["BACKEND"]</span>
+                <span class="mon-section-sub">@T["Neolink.NET server process"]@(_info?.Os != null ? $" · {ShortOs(_info.Os)}" : "")@(_info != null ? " · " + T.F("{0} cores", _info.Processors) : "")</span>
+            </div>
+
+            <div class="mon-cards">
+                <div class="mon-card">
+                    <span class="mon-card-label">@T["CPU"]</span>
+                    <span class="mon-card-value" style="color:@CpuColor()">@(Last is { } s1 ? $"{s1.Cpu:0.#}%" : "—")</span>
+                    <span class="mon-card-sub">@T["of all cores"]</span>
+                </div>
+                <div class="mon-card">
+                    <span class="mon-card-label">@T["MEMORY"]</span>
+                    <span class="mon-card-value">@(Last is { } s2 ? Bytes(s2.Ws) : "—")</span>
+                    <span class="mon-card-sub">@T["working set"]@(_info is { MachineMemory: > 0 } ? " " + T.F("of {0}", Bytes(_info.MachineMemory)) : "")</span>
+                </div>
+                <div class="mon-card">
+                    <span class="mon-card-label">@T["DISK FREE"]</span>
+                    <span class="mon-card-value" style="color:@DiskColor()">@(Last is { DTot: > 0 } s3 ? Bytes(s3.DFree) : "—")</span>
+                    <span class="mon-card-sub">@(_info?.Disk ?? T["volume"])@(Last is { DTot: > 0 } su ? " · " + T.F("{0}% used", $"{(su.DTot - su.DFree) * 100.0 / su.DTot:0}") : "")@ForecastText(_storage.FirstOrDefault(l => l.Role == "main"))</span>
+                </div>
+                @if (Last is { Rec: >= 0 })
+                {
+                    <div class="mon-card">
+                        <span class="mon-card-label">@T["RECORDINGS"]</span>
+                        <span class="mon-card-value">@(Last is { } sr ? Bytes(sr.Rec) : "—")</span>
+                        <span class="mon-card-sub">@T["footage on disk"]@(Last is { DTot: > 0 } sp ? " · " + T.F("{0}% of the volume", $"{sp.Rec * 100.0 / sp.DTot:0.#}") : "")</span>
+                    </div>
+                }
+                @* Admins click through to who is watching what; for others the card is inert. *@
+                <div class="mon-card" role="@(_admin ? "button" : null)" tabindex="@(_admin ? "0" : null)"
+                     aria-expanded="@(_admin ? (_viewersOpen ? "true" : "false") : null)"
+                     title="@(!_admin ? null : _viewersOpen ? T["Hide who is watching"] : T["Show who is watching"])"
+                     style="@(!_admin ? null : "cursor:pointer" + (_viewersOpen ? "; border-color: var(--accent)" : ""))"
+                     @onclick="ToggleViewersAsync"
+                     @onkeydown="@(e => e.Key == "Enter" ? ToggleViewersAsync() : Task.CompletedTask)">
+                    <span class="mon-card-label">@T["VIEWERS"]@(_admin ? (_viewersOpen ? " ▾" : " ▸") : "")</span>
+                    <span class="mon-card-value">@(Last?.View.ToString() ?? "—")</span>
+                    <span class="mon-card-sub">@T["watching live (RTSP + web) — recorders not counted"]</span>
+                </div>
+                <div class="mon-card">
+                    <span class="mon-card-label">@T["RECORDING"]</span>
+                    <span class="mon-card-value" style="@(Last is { RecCams: > 0 } ? "color: var(--err)" : "")">@(Last?.RecCams.ToString() ?? "—")</span>
+                    <span class="mon-card-sub">@T["cameras taping 24/7 right now"]</span>
+                </div>
+                <div class="mon-card">
+                    <span class="mon-card-label">@T["STORAGE WRITES"]</span>
+                    <span class="mon-card-value">@(Last is { } sw ? $"{sw.WMb:0.#} MB/s" : "—")</span>
+                    <span class="mon-card-sub">@(Last is { } sf ? T.F("{0} files completed since start", sf.WFiles.ToString("n0")) : T["clips + previews + segments"])</span>
+                </div>
+                <div class="mon-card">
+                    <span class="mon-card-label">@T["UPTIME"]</span>
+                    <span class="mon-card-value">@Uptime()</span>
+                    <span class="mon-card-sub">@(_info?.Runtime ?? "")</span>
+                </div>
+            </div>
+
+            @if (_admin && _viewersOpen)
+            {
+                <div class="mon-section">
+                    <span class="mon-section-title">@T["VIEWERS"]</span>
+                    <span class="mon-section-sub">@T["who is watching live right now"]</span>
+                </div>
+                @if (_viewersUnsupported)
+                {
+                    <div class="mon-avail-sub" style="margin: 0 2px 18px">@T["This server does not list viewers — update the Neolink.NET server."]</div>
+                }
+                else if (_viewers == null)
+                {
+                    <div class="mon-avail-sub" style="margin: 0 2px 18px">—</div>
+                }
+                else if (_viewers.Count == 0)
+                {
+                    <div class="mon-avail-sub" style="margin: 0 2px 18px">@T["Nobody is watching right now."]</div>
+                }
+                else
+                {
+                    <div class="mon-avail-grid">
+                        @foreach (var v in _viewers)
+                        {
+                            <div class="mon-avail-card">
+                                <div class="mon-avail-head">
+                                    <span class="mon-avail-dot up"></span>
+                                    <span class="mon-avail-name" title="@v.Camera">@v.Camera</span>
+                                    <span class="mon-avail-grade good">@v.Via</span>
+                                    <span class="mon-avail-pct">@v.Stream</span>
+                                </div>
+                                <div class="mon-avail-sub">
+                                    <span>@(v.From ?? T["unknown address"])@(v.User != null ? " · " + v.User : "")</span>
+                                    <span>@T.F("watching for {0}", Dur(NowMs() - v.Since))</span>
+                                </div>
+                            </div>
+                        }
+                    </div>
+                }
+            }
+
+            <div class="mon-grid">
+                <MonChart Title="@T["CPU"]" Unit="%" FixedMax="100" WindowSec="_windowSec"
+                          Series="@(new() { new(T["process"], Blue, Pts(s => s.Cpu)) })" />
+                <MonChart Title="@T["Memory"]" Unit=" MB" WindowSec="_windowSec"
+                          Series="@(new()
+                                  {
+                                      new(T["working set"], Blue, Pts(s => s.Ws / Mb)),
+                                      new(T["managed heap"], Green, Pts(s => s.Heap / Mb)),
+                                  })" />
+                <MonChart Title="@T["Allocation rate"]" Unit=" MB/s" WindowSec="_windowSec"
+                          Series="@(new() { new(T["managed"], Purple, Pts(s => s.Alloc)) })" />
+                <MonChart Title="@T["Threads & handles"]" WindowSec="_windowSec"
+                          Series="@(new()
+                                  {
+                                      new(T["threads"], Blue, Pts(s => s.Thr)),
+                                      new(T["handles"], Amber, Pts(s => s.Fd)),
+                                  })" />
+                <MonChart Title="@T["Disk used"]" Unit="%" FixedMax="100" WindowSec="_windowSec"
+                          Series="@(new() { new(_info?.Disk ?? T["volume"], Amber,
+                                      Pts(s => s.DTot > 0 ? (s.DTot - s.DFree) * 100.0 / s.DTot : 0)) })" />
+                <MonChart Title="@T["Viewers & recording"]" WindowSec="_windowSec"
+                          Series="@(new()
+                                  {
+                                      new(T["viewers"], Green, Pts(s => s.View)),
+                                      new(T["rec cameras"], Red, Pts(s => s.RecCams)),
+                                  })" />
+                <MonChart Title="@T["Storage writes"]" Unit=" MB/s" WindowSec="_windowSec"
+                          Series="@(new() { new(T["to disk"], Amber, Pts(s => s.WMb)) })" />
+                @if (Last is { Rec: >= 0 })
+                {
+                    <MonChart Title="@T["Recordings size"]" Unit=" GB" WindowSec="_windowSec"
+                              Series="@(new() { new(T["footage"], Green,
+                                          _samples.Where(s => s.Rec >= 0).Select(s => (s.T, s.Rec / Gb)).ToList()) })" />
+                }
+            </div>
+
+            @* ---------------- storage tiers ---------------- *@
+            @* Only when split storage is configured — a single-volume install is
+               already covered by the DISK FREE card above. *@
+            @if (_storage.Count > 1)
+            {
+                <div class="mon-section">
+                    <span class="mon-section-title">@T["STORAGE"]</span>
+                    <span class="mon-section-sub">@T["configured recording locations"]</span>
+                </div>
+
+                <div class="mon-cards">
+                    @foreach (var loc in _storage)
+                    {
+                        <div class="mon-card">
+                            <span class="mon-card-label">@loc.Label.ToUpperInvariant()</span>
+                            <span class="mon-card-value" style="color:@StorageColor(loc)">
+                                @(loc.Online ? T.F("{0} free", Bytes(loc.FreeBytes)) : T["offline"])
+                            </span>
+                            <span class="mon-card-sub">@loc.Path@(loc.Online && loc.TotalBytes > 0 ? " · " + T.F("{0}% of {1} used", $"{loc.UsedPercent:0}", Bytes(loc.TotalBytes)) : "")@(loc.Full ? " · " + T["FULL — recording halted"] : loc.Warn ? " · " + T["getting full"] : "")@(loc.Full ? "" : ForecastText(loc))</span>
+                        </div>
+                    }
+                </div>
+            }
+
+            @* ---------------- cameras ---------------- *@
+            @if (_avail.Count > 0)
+            {
+                <div class="mon-section">
+                    <span class="mon-section-title">@T["CAMERAS"]</span>
+                    <span class="mon-section-sub">@T.F("availability as seen from this server · showing the selected {0} window", WindowLabel())</span>
+                </div>
+
+                <div class="mon-avail-grid">
+                    @foreach (var a in _avail)
+                    {
+                        var runs = WindowRuns(a);
+                        var st = WindowStats(a, runs);
+                        <div class="mon-avail-card">
+                            <div class="mon-avail-head">
+                                <span class="mon-avail-dot @(a.On ? "up" : "down")"></span>
+                                <span class="mon-avail-name" title="@a.Cam">@a.Cam</span>
+                                <span class="mon-avail-grade @GradeClass(st.Pct)"
+                                      title="@GradeHint(st.Pct)">@Grade(st.Pct)</span>
+                                <span class="mon-avail-pct" style="color:@PctColor(st.Pct)">@PctLabel(st.Pct)%</span>
+                            </div>
+                            <div class="mon-avail-ribbon" aria-label="@T["uptime timeline"]">
+                                @foreach (var seg in RibbonSegs(runs))
+                                {
+                                    <span class="mon-avail-seg @(seg.On ? "up" : "down")"
+                                          style="width:@seg.Width%" title="@seg.Title"></span>
+                                }
+                            </div>
+                            <div class="mon-avail-sub">
+                                <span>@T.F(a.On ? "online for {0}" : "offline for {0}", Dur(NowMs() - a.Since))</span>
+                                <span>@OutageLabel(st)</span>
+                            </div>
+                        </div>
+                    }
+                </div>
+            }
+
+            @* ---------------- frontend ---------------- *@
+            <div class="mon-section">
+                <span class="mon-section-title">@T["FRONTEND"]</span>
+                <span class="mon-section-sub">@T["this browser tab — sampled locally at the same beat"]</span>
+            </div>
+
+            <div class="mon-cards">
+                <div class="mon-card">
+                    <span class="mon-card-label">@T["JS HEAP"]</span>
+                    <span class="mon-card-value">@(_browser.Count > 0 && _browser[^1].HeapMb >= 0 ? $"{_browser[^1].HeapMb:0} MB" : T["n/a"])</span>
+                    <span class="mon-card-sub">@(_heapSupported ? T["used by this tab"] : T["Chromium-only metric"])</span>
+                </div>
+                <div class="mon-card">
+                    <span class="mon-card-label">@T["FRAME RATE"]</span>
+                    <span class="mon-card-value">@(_browser.Count > 0 && _browser[^1].Fps >= 0 ? $"{_browser[^1].Fps:0}" : "—")</span>
+                    <span class="mon-card-sub">@T["rendered fps"]</span>
+                </div>
+                <div class="mon-card">
+                    <span class="mon-card-label">@T["CIRCUIT"]</span>
+                    <span class="mon-card-value">@(_browser.Count > 0 ? $"{_browser[^1].LatencyMs:0} ms" : "—")</span>
+                    <span class="mon-card-sub">@T["UI round-trip (SignalR)"]</span>
+                </div>
+                <div class="mon-card">
+                    <span class="mon-card-label">@T["DOM"]</span>
+                    <span class="mon-card-value">@(_browser.Count > 0 ? _browser[^1].DomNodes.ToString("n0") : "—")</span>
+                    <span class="mon-card-sub">@T["elements on this page"]</span>
+                </div>
+            </div>
+
+            <div class="mon-grid">
+                @if (_heapSupported)
+                {
+                    <MonChart Title="@T["Browser JS heap"]" Unit=" MB" WindowSec="_windowSec"
+                              Series="@(new() { new(T["used"], Blue, BPts(b => b.HeapMb)) })" />
+                }
+                <MonChart Title="@T["Frame rate"]" Unit=" fps" WindowSec="_windowSec"
+                          Series="@(new() { new(T["rendered"], Green, BPts(b => b.Fps)) })" />
+                <MonChart Title="@T["UI latency"]" Unit=" ms" WindowSec="_windowSec"
+                          Series="@(new() { new(T["round-trip"], Purple, BPts(b => b.LatencyMs)) })" />
+            </div>
+
+            <div class="mon-foot">
+                @T.F("{0} backend samples · {1} browser samples · history covers 24 h (full 2 s detail for the last hour, one-minute averages beyond) · everything on this page follows the selected window", _samples.Count, _browser.Count)
+            </div>
+        </div>
+    }
+</div>
+
+@code {
+    // Series colors (match the app palette)
+    private const string Blue = "#4f8cff";
+    private const string Green = "#3fd07f";
+    private const string Amber = "#ffb020";
+    private const string Purple = "#b06bff";
+    private const string Red = "#ff5f6b";
+    private const double Mb = 1024.0 * 1024.0;
+    private const double Gb = Mb * 1024.0;
+
+    // Up to 1h the charts show full 2s detail; 6h/24h ride the server's
+    // one-minute aggregate tier (24h is the whole history the server keeps).
+    private static readonly (string Label, int Sec)[] Windows =
+        { ("5m", 300), ("15m", 900), ("1h", 3600), ("6h", 21600), ("24h", 86400) };
+
+    private bool _authRedirected;
+
+    /// <summary>No session: bounce to the sign-in page, which returns here
+    /// once the sign-in succeeds.</summary>
+    private void RedirectToSignIn()
+    {
+        if (_authRedirected) return;
+        _authRedirected = true;
+        Nav.NavigateTo("/?return=" + Uri.EscapeDataString("/" + Nav.ToBaseRelativePath(Nav.Uri)));
+    }
+
+    private string _server = "";
+    private string _origin = "";
+    private string? _token;
+    private string? _error;
+    private bool _supported = true;
+    private bool _paused;
+    private int _windowSec = 900;
+    private bool _heapSupported = true;
+
+    private ApiSystemInfo? _info;
+    private List<ApiCamAvail> _avail = new();
+    private List<ApiStorageLocation> _storage = new();
+    private DateTime _storageNext = DateTime.MinValue;
+    private readonly List<ApiSystemSample> _samples = new();
+    private readonly List<BrowserSample> _browser = new();
+    private PeriodicTimer? _timer;
+    private bool _perfStarted;
+
+    // Admin session? Gates the toolbar link to the logs page and the viewer list.
+    private bool _admin;
+    private bool _viewersOpen;
+    private List<ApiViewer>? _viewers; // null until the first fetch answers
+    private bool _viewersUnsupported;   // the server has no viewer list
+
+    private sealed record BrowserSample(long T, double HeapMb, double Fps, double LatencyMs, int DomNodes);
+    private sealed record JsPerf(long Heap, long HeapLimit, double Fps, int DomNodes);
+
+    private ApiSystemSample? Last => _samples.Count > 0 ? _samples[^1] : null;
+
+    /// <summary>Where this page's fetches go. They run SERVER-side (Blazor circuit),
+    /// so when the configured server is the page's own origin they use loopback
+    /// instead of dialing back out through a reverse proxy's public URL.</summary>
+    private string ApiBase => _origin.Length > 0
+        && string.Equals(_server.TrimEnd('/'), _origin.TrimEnd('/'), StringComparison.OrdinalIgnoreCase)
+        ? Local.BaseUrl.TrimEnd('/')
+        : _server.TrimEnd('/');
+
+    protected override async Task OnAfterRenderAsync(bool firstRender)
+    {
+        if (!firstRender) return;
+
+        // Server + session are shared with the live view's persisted settings.
+        try
+        {
+            var json = await JS.InvokeAsync<string?>("neolink.lsGet", "neolink.view");
+            if (json != null)
+                _server = JsonSerializer.Deserialize<PersistedView>(json)?.Server ?? "";
+            var auth = await JS.InvokeAsync<string?>("neolink.lsGet", "neolink.auth");
+            if (!string.IsNullOrWhiteSpace(auth))
+            {
+                var el = JsonSerializer.Deserialize<JsonElement>(auth);
+                if (el.TryGetProperty("token", out var t)) _token = t.GetString();
+            }
+        }
+        catch { }
+        try { _origin = await JS.InvokeAsync<string>("neolink.defaultServer"); } catch { }
+        if (string.IsNullOrWhiteSpace(_server))
+            _server = _origin;
+
+        await JS.InvokeVoidAsync("neolink.perfStart");
+        _perfStarted = true;
+        try { await JS.InvokeVoidAsync("neolink.monHoverInit"); } catch { }
+
+        await FetchAuthAsync();  // are we the admin? gates the live-logs section
+        await FetchAsync();      // backfills up to an hour of server history
+        StateHasChanged();
+        _ = PollLoopAsync();
+    }
+
+    private async Task PollLoopAsync()
+    {
+        _timer = new PeriodicTimer(TimeSpan.FromSeconds(2));
+        try
+        {
+            while (await _timer.WaitForNextTickAsync())
+            {
+                if (_paused) continue;
+                await InvokeAsync(async () =>
+                {
+                    await FetchAsync();
+                    await SampleBrowserAsync();
+                    StateHasChanged();
+                });
+            }
+        }
+        catch (OperationCanceledException) { }
+        catch (ObjectDisposedException) { }
+    }
+
+    private async Task FetchAsync()
+    {
+        try
+        {
+            long after = Last?.T ?? 0;
+            var req = new HttpRequestMessage(HttpMethod.Get, $"{ApiBase}/api/system/stats?after={after}");
+            if (!string.IsNullOrEmpty(_token))
+                req.Headers.Authorization = new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", _token);
+            using var res = await Http.SendAsync(req);
+            if (res.StatusCode == System.Net.HttpStatusCode.Unauthorized)
+            {
+                RedirectToSignIn();
+                return;
+            }
+            if (res.StatusCode == System.Net.HttpStatusCode.NotFound)
+            {
+                _supported = false;
+                return;
+            }
+            if (!res.IsSuccessStatusCode) return;
+            var stats = await res.Content.ReadFromJsonAsync<ApiSystemStats>();
+            if (stats == null) return;
+            _error = null;
+            _info ??= stats.Info;
+            if (stats.Avail is { Count: > 0 } av) _avail = av;
+            _samples.AddRange(stats.Samples);
+            // Mirror the server's tiers: 2s detail for the last hour, ~1/min
+            // beyond, nothing past 24h — a tab left open all day stays light.
+            Compact(_samples, s => s.T);
+        }
+        catch (Exception ex)
+        {
+            _error = _samples.Count == 0 ? T.F("Cannot reach {0}: {1}", ApiBase, ex.Message) : _error;
+        }
+        await FetchStorageAsync();
+        await FetchViewersAsync();
+    }
+
+    private async Task ToggleViewersAsync()
+    {
+        if (!_admin) return;
+        _viewersOpen = !_viewersOpen;
+        _viewers = null; // never reopen on a stale list
+        await FetchViewersAsync();
+    }
+
+    /// <summary>Who is watching, refreshed each poll while the list is open (admin only).</summary>
+    private async Task FetchViewersAsync()
+    {
+        if (!_admin || !_viewersOpen) return;
+        try
+        {
+            var req = new HttpRequestMessage(HttpMethod.Get, $"{ApiBase}/api/system/viewers");
+            if (!string.IsNullOrEmpty(_token))
+                req.Headers.Authorization = new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", _token);
+            using var res = await Http.SendAsync(req);
+            if (res.StatusCode == System.Net.HttpStatusCode.NotFound)
+            {
+                _viewersUnsupported = true;
+                _viewers = null;
+                return;
+            }
+            if (res.StatusCode is System.Net.HttpStatusCode.Unauthorized or System.Net.HttpStatusCode.Forbidden)
+            {
+                // No longer an admin session: close the list rather than let it go stale.
+                _admin = false;
+                _viewersOpen = false;
+                _viewers = null;
+                return;
+            }
+            if (!res.IsSuccessStatusCode) return;
+            _viewersUnsupported = false;
+            _viewers = await res.Content.ReadFromJsonAsync<List<ApiViewer>>() ?? new();
+        }
+        catch { /* keep the last list; the next poll retries */ }
+    }
+
+    /// <summary>Storage-tier capacities (only rendered when split storage is
+    /// configured). Refreshed every ~10s — disks don't fill within a poll tick.</summary>
+    private async Task FetchStorageAsync()
+    {
+        if (DateTime.UtcNow < _storageNext) return;
+        _storageNext = DateTime.UtcNow.AddSeconds(10);
+        try
+        {
+            var req = new HttpRequestMessage(HttpMethod.Get, $"{ApiBase}/api/storage");
+            if (!string.IsNullOrEmpty(_token))
+                req.Headers.Authorization = new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", _token);
+            using var res = await Http.SendAsync(req);
+            if (!res.IsSuccessStatusCode) return; // older server or recording off
+            _storage = await res.Content.ReadFromJsonAsync<List<ApiStorageLocation>>() ?? new();
+        }
+        catch { /* the section just stays hidden */ }
+    }
+
+    private async Task FetchAuthAsync()
+    {
+        try
+        {
+            var req = new HttpRequestMessage(HttpMethod.Get, $"{ApiBase}/api/auth/status");
+            if (!string.IsNullOrEmpty(_token))
+                req.Headers.Authorization = new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", _token);
+            using var res = await Http.SendAsync(req);
+            if (!res.IsSuccessStatusCode) return;
+            var status = await res.Content.ReadFromJsonAsync<ApiAuthStatus>();
+            _admin = status?.Admin ?? false;
+        }
+        catch { /* the logs link just stays hidden */ }
+    }
+
+    private async Task SampleBrowserAsync()
+    {
+        try
+        {
+            // The awaited no-op measures the full circuit round-trip on the side.
+            var sw = Stopwatch.StartNew();
+            await JS.InvokeAsync<int>("neolink.perfPing");
+            sw.Stop();
+
+            var p = await JS.InvokeAsync<JsPerf>("neolink.perfSample");
+            _heapSupported = p.Heap >= 0;
+            _browser.Add(new BrowserSample(
+                DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
+                p.Heap >= 0 ? p.Heap / Mb : -1,
+                p.Fps,
+                sw.Elapsed.TotalMilliseconds,
+                p.DomNodes));
+            Compact(_browser, b => b.T);
+        }
+        catch { /* circuit hiccup: skip this beat */ }
+    }
+
+    /// <summary>Time-based history budget shared by both sample lists: full detail
+    /// for the last hour, thinned to ~one per minute beyond, dropped after 24h.</summary>
+    private static void Compact<T>(List<T> list, Func<T, long> time)
+    {
+        if (list.Count < 2000) return; // nothing worth compacting yet
+        long now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+        long dayCutoff = now - 24L * 3600 * 1000;
+        long fineCutoff = now - 3600L * 1000;
+        var kept = new List<T>(list.Count);
+        long lastKept = 0; // not long.MinValue: t - lastKept must not overflow
+        foreach (var item in list)
+        {
+            long t = time(item);
+            if (t < dayCutoff) continue;
+            if (t < fineCutoff && t - lastKept < 55_000) continue;
+            kept.Add(item);
+            lastKept = t;
+        }
+        list.Clear();
+        list.AddRange(kept);
+    }
+
+    // ------------------------------------------------------------ chart data
+
+    private IReadOnlyList<(long, double)> Pts(Func<ApiSystemSample, double> f) =>
+        _samples.Select(s => (s.T, f(s))).ToList();
+
+    private IReadOnlyList<(long, double)> BPts(Func<BrowserSample, double> f) =>
+        _browser.Where(b => f(b) >= 0).Select(b => (b.T, f(b))).ToList();
+
+    // ------------------------------------------------------------ availability
+
+    private sealed record Seg(bool On, string Width, string Title);
+    private sealed record ClampedRun(long Start, long End, bool On);
+    private sealed record WinStats(double Pct, int Outs, long Longest, long Obs);
+
+    private static long NowMs() => DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+
+    private string WindowLabel() => Windows.FirstOrDefault(w => w.Sec == _windowSec).Label ?? "1h";
+
+    /// <summary>The camera's online/offline runs clamped to the selected window —
+    /// ribbon and stats both derive from this, so the cards obey the filter.</summary>
+    private List<ClampedRun> WindowRuns(ApiCamAvail a)
+    {
+        long now = NowMs();
+        long winStart = now - (long)_windowSec * 1000;
+        var runs = new List<ClampedRun>();
+        for (int i = 0; i < a.Runs.Count; i++)
+        {
+            long s = a.Runs[i][0];
+            long e = i + 1 < a.Runs.Count ? a.Runs[i + 1][0] : now;
+            if (e <= winStart || e <= s) continue;
+            runs.Add(new ClampedRun(Math.Max(s, winStart), e, a.Runs[i][1] == 1));
+        }
+        return runs;
+    }
+
+    /// <summary>Uptime/outage figures over the clamped window only.</summary>
+    private static WinStats WindowStats(ApiCamAvail a, List<ClampedRun> runs)
+    {
+        if (runs.Count == 0) return new(a.On ? 100 : 0, 0, 0, 0);
+        long obs = runs[^1].End - runs[0].Start;
+        long online = runs.Where(r => r.On).Sum(r => r.End - r.Start);
+        var outages = runs.Where(r => !r.On).ToList();
+        return new(
+            obs <= 0 ? 100 : online * 100.0 / obs,
+            outages.Count,
+            outages.Count == 0 ? 0 : outages.Max(r => r.End - r.Start),
+            obs);
+    }
+
+    /// <summary>Status-page ribbon: one span per run, widths as % of the observed span.</summary>
+    private IEnumerable<Seg> RibbonSegs(List<ClampedRun> runs)
+    {
+        if (runs.Count == 0) yield break;
+        double span = Math.Max(1, runs[^1].End - runs[0].Start);
+        foreach (var r in runs)
+        {
+            var st = DateTimeOffset.FromUnixTimeMilliseconds(r.Start).ToLocalTime();
+            var en = DateTimeOffset.FromUnixTimeMilliseconds(r.End).ToLocalTime();
+            yield return new Seg(r.On,
+                ((r.End - r.Start) / span * 100).ToString("0.###", CultureInfo.InvariantCulture),
+                $"{(r.On ? T["online"] : T["offline"])} {st:HH:mm}–{en:HH:mm} ({Dur(r.End - r.Start)})");
+        }
+    }
+
+    private static string PctLabel(double pct) => pct >= 99.995
+        ? "100"
+        : pct.ToString(pct >= 99 ? "0.##" : "0.#", CultureInfo.InvariantCulture);
+
+    // Report-card grade: harsh on purpose — a camera you can't reach isn't "97% fine".
+    private static string Grade(double pct) =>
+        pct >= 99.9 ? "A+" : pct >= 99 ? "A" : pct >= 97 ? "B" : pct >= 90 ? "C" : "D";
+
+    private static string GradeClass(double pct) => pct >= 99 ? "good" : pct >= 90 ? "warn" : "bad";
+
+    private string GradeHint(double pct) =>
+        T.F("{0}% observed uptime (A+ ≥99.9 · A ≥99 · B ≥97 · C ≥90)", PctLabel(pct));
+
+    private static string PctColor(double pct) =>
+        pct >= 99 ? "var(--ok)" : pct >= 90 ? "#ffb020" : "var(--err)";
+
+    private string OutageLabel(WinStats st) => st.Outs == 0
+        ? T.F("no outages in {0}", Dur(st.Obs))
+        : st.Outs == 1
+            ? T.F("1 outage · longest {0}", Dur(st.Longest))
+            : T.F("{0} outages · longest {1}", st.Outs, Dur(st.Longest));
+
+    private static string Dur(long ms)
+    {
+        var t = TimeSpan.FromMilliseconds(Math.Max(0, ms));
+        return t.TotalDays >= 1 ? $"{(int)t.TotalDays}d {t.Hours}h"
+            : t.TotalHours >= 1 ? $"{(int)t.TotalHours}h {t.Minutes:00}m"
+            : t.TotalMinutes >= 1 ? $"{(int)t.TotalMinutes}m {t.Seconds:00}s"
+            : $"{t.Seconds}s";
+    }
+
+    // ------------------------------------------------------------ formatting
+
+    private static string Bytes(long v) => v switch
+    {
+        >= 1024L * 1024 * 1024 * 1024 => $"{v / (1024.0 * 1024 * 1024 * 1024):0.##} TB",
+        >= 1024 * 1024 * 1024 => $"{v / (1024.0 * 1024 * 1024):0.#} GB",
+        >= 1024 * 1024 => $"{v / (1024.0 * 1024):0} MB",
+        _ => $"{v / 1024.0:0} KB",
+    };
+
+    private string Uptime()
+    {
+        if (_info == null) return "—";
+        var up = DateTimeOffset.UtcNow - DateTimeOffset.FromUnixTimeMilliseconds(_info.StartUtcMs);
+        return up.TotalDays >= 1 ? $"{(int)up.TotalDays}d {up.Hours}h"
+            : up.TotalHours >= 1 ? $"{(int)up.TotalHours}h {up.Minutes}m"
+            : $"{up.Minutes}m {up.Seconds}s";
+    }
+
+    private static string ShortOs(string os) =>
+        os.Contains("Windows", StringComparison.OrdinalIgnoreCase) ? "Windows"
+        : os.Contains("Linux", StringComparison.OrdinalIgnoreCase) ? "Linux"
+        : os.Contains("Darwin", StringComparison.OrdinalIgnoreCase) ? "macOS"
+        : os;
+
+    private string CpuColor() => Last?.Cpu switch
+    {
+        >= 85 => "var(--err)",
+        >= 60 => "#ffb020",
+        _ => "var(--ok)",
+    };
+
+    private string DiskColor() => Last is { DTot: > 0 } s && s.DFree < s.DTot / 10
+        ? "var(--err)"
+        : "var(--text)";
+
+    private static string StorageColor(ApiStorageLocation loc) =>
+        loc.Full || !loc.Online ? "var(--err)"
+        : loc.Warn ? "#ffb020"
+        : "var(--text)";
+
+    /// <summary>The free-space forecast as a card-sub suffix: filling → the projected
+    /// days, steady → retention is keeping up, measuring/old server → nothing.</summary>
+    private string ForecastText(ApiStorageLocation? loc) => loc?.ForecastState switch
+    {
+        "filling" when loc.ForecastDays is { } d && d < 1 => " · " + T["fills within a day at the current rate"],
+        "filling" when loc.ForecastDays is { } d =>
+            " · " + T.F("fills in ~{0} days at the current rate", d < 10 ? d.ToString("0.#") : Math.Round(d).ToString("0")),
+        "steady" => " · " + T["not filling at the current rate"],
+        _ => "",
+    };
+
+    public async ValueTask DisposeAsync()
+    {
+        _timer?.Dispose();
+        if (_perfStarted)
+        {
+            try { await JS.InvokeVoidAsync("neolink.perfStop"); }
+            catch { /* circuit already gone */ }
+        }
+    }
+}
