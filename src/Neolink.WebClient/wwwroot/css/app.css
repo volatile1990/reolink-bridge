@@ -1,0 +1,6331 @@
+/* ---------- Neolink web client ----------
+   Design language: quiet, minimal dark. One accent, hairline dividers instead
+   of boxed borders, generous radii, soft depth. Every page (live wall,
+   timeline, monitor, logs) shares these tokens. */
+:root {
+    color-scheme: dark; /* native widgets (select lists, scrollbars, pickers) render dark */
+    --bg: #0b0d12;
+    --panel: #10131a;
+    --panel-2: #171b25;
+    --line: #222839;
+    --text: #e7ebf4;
+    --muted: #8b94a7;
+    --accent: #5b9dff;
+    --accent-soft: rgba(91, 157, 255, 0.14);
+    --ok: #35d392;
+    --err: #ff6b76;
+    --radius: 12px;
+    --radius-sm: 9px;
+    --shadow: 0 12px 40px rgba(0, 0, 0, 0.5);
+}
+
+* { box-sizing: border-box; }
+
+html, body {
+    margin: 0;
+    height: 100%;
+    background: var(--bg);
+    color: var(--text);
+    font: 14px/1.5 "Segoe UI Variable Text", "Segoe UI", system-ui, -apple-system,
+        "Helvetica Neue", sans-serif;
+    -webkit-font-smoothing: antialiased;
+    text-rendering: optimizeLegibility;
+}
+
+.shell {
+    display: flex;
+    height: 100vh;
+    height: 100dvh; /* mobile: track the real visual viewport (URL bar collapse) */
+    overflow: hidden;
+}
+
+/* Focus is always visible, never a default blue box */
+:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 1px;
+    border-radius: 4px;
+}
+
+/* ---------- sidebar ---------- */
+.sidebar {
+    width: 264px;
+    flex: 0 0 auto;
+    background: var(--panel);
+    border-right: 1px solid var(--line);
+    display: flex;
+    flex-direction: column;
+    padding: 14px 12px;
+    gap: 10px;
+    overflow: hidden; /* only the camera list scrolls (below), so the footer pins */
+    transition: width 0.18s ease; /* desktop collapse; the drawer overrides with transform */
+}
+
+/* Everything the full-width sidebar shows lives in this wrapper, so the
+   collapsed rail can swap it out with one display toggle. It replicates the
+   aside's own column layout (the aside keeps only padding + width). */
+.sidebar-full {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    flex: 1 1 auto;
+    min-height: 0;
+}
+
+/* The camera list is the sole scroll region: it takes the leftover height and
+   scrolls internally, so the background-process strip and the account footer
+   stay pinned no matter how many cameras there are. min-height:0 lets a flex
+   child actually shrink below its content and scroll. */
+.sidebar-cams {
+    flex: 1 1 auto;
+    min-height: 0;
+    overflow-y: auto;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    /* room so the last card isn't flush against the pinned strip below */
+    margin-bottom: 2px;
+}
+
+.brand {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-weight: 700;
+    letter-spacing: 3px;
+    font-size: 15px;
+}
+
+.brand .icon-btn { margin-left: auto; }
+
+/* The logo is also the "restore the wall" control */
+.brand-home {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    cursor: pointer;
+}
+
+.brand-home:hover .brand-dot { box-shadow: 0 0 14px var(--accent); }
+
+.brand-dot {
+    width: 10px;
+    height: 10px;
+    border-radius: 50%;
+    background: var(--accent);
+    box-shadow: 0 0 10px var(--accent);
+}
+
+/* Footage encryption on: the brand dot becomes a padlock — same accent, same glow. */
+.brand-lock {
+    display: inline-flex;
+    align-items: center;
+    color: var(--accent);
+    filter: drop-shadow(0 0 5px var(--accent));
+}
+
+.brand-home:hover .brand-lock { filter: drop-shadow(0 0 9px var(--accent)); }
+
+.brand-net {
+    color: var(--accent);
+    margin-left: -6px; /* sit tight against "NEOLINK" despite the flex gap */
+}
+
+/* ---------- collapsed icon rail (desktop only) ----------
+   The sidebar folds into a slim rail: the logo tile replaces the wordmark,
+   each camera becomes a 3-letter pill with its status dot, and the settings
+   gear pins to the bottom. The drawer breakpoint below neutralizes all of
+   this — a phone's sidebar always opens full. */
+.sidebar-rail { display: none; }
+
+.sidebar.collapsed { width: 66px; padding: 14px 9px; }
+.sidebar.collapsed .sidebar-full { display: none; }
+.sidebar.collapsed .sidebar-rail {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 10px;
+    flex: 1 1 auto;
+    min-height: 0;
+}
+
+/* keep the collapse chevron beside the gear (both would otherwise take the
+   brand row's auto margin and drift apart) */
+.brand .rail-toggle { margin-left: 0; }
+
+.rail-brand { position: relative; cursor: pointer; line-height: 0; }
+.rail-logo { width: 32px; height: 32px; display: block; }
+.rail-brand:hover .rail-logo { filter: drop-shadow(0 0 10px var(--accent)); }
+
+/* Footage-encryption padlock, riding the logo tile's corner */
+.rail-lock {
+    position: absolute;
+    right: -5px;
+    bottom: -5px;
+    display: inline-flex;
+    padding: 2.5px;
+    border-radius: 50%;
+    background: var(--panel);
+    color: var(--accent);
+}
+
+.rail-toggle { position: relative; }
+
+/* The rail can't show banners; this amber dot on the expand button says
+   "open me — a warning is waiting" (same amber as the banners themselves). */
+.rail-alert {
+    position: absolute;
+    top: 2px;
+    right: 2px;
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    background: #ffb020;
+    box-shadow: 0 0 6px #ffb020;
+}
+
+/* Same role as .sidebar-cams: the one scroll region, so the gear stays pinned.
+   No scrollbar — 66px is too narrow to share with one. */
+.rail-cams {
+    flex: 1 1 auto;
+    min-height: 0;
+    width: 100%;
+    overflow-y: auto;
+    scrollbar-width: none;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 8px;
+}
+
+.rail-cams::-webkit-scrollbar { display: none; }
+
+.rail-cam {
+    position: relative;
+    flex: 0 0 auto;
+    width: 48px;
+    height: 40px;
+    border-radius: 10px;
+    background: var(--panel-2);
+    border: 1px solid transparent;
+    color: var(--text);
+    font: inherit;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    cursor: pointer;
+    padding: 0;
+}
+
+.rail-cam:hover { border-color: var(--line); background: var(--accent-soft); }
+.rail-cam-active { border-color: var(--accent); box-shadow: 0 0 8px var(--accent-soft); }
+.rail-cam-offline { opacity: 0.45; }
+
+.rail-cam .dot { position: absolute; top: 5px; right: 5px; }
+
+.rail-abbr {
+    font-size: 11px;
+    font-weight: 700;
+    letter-spacing: 0.8px;
+}
+
+.settings {
+    background: var(--panel-2);
+    border: none;
+    border-radius: var(--radius-sm);
+    padding: 12px;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+}
+
+.settings label {
+    font-size: 11px;
+    color: var(--muted);
+    text-transform: uppercase;
+    letter-spacing: 1px;
+}
+
+.settings input {
+    background: var(--bg);
+    border: 1px solid transparent;
+    color: var(--text);
+    border-radius: var(--radius-sm);
+    padding: 8px 10px;
+    outline: none;
+    transition: border-color 0.12s ease;
+}
+
+.settings input:focus { border-color: var(--accent); }
+
+.section-title {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-top: 6px;
+    font-size: 11px;
+    color: var(--muted);
+    letter-spacing: 2px;
+}
+
+.notice {
+    color: var(--muted);
+    font-size: 13px;
+    padding: 6px 2px;
+}
+
+.notice.error { color: var(--err); }
+
+/* Unsaved edits / disruptive-change warnings: amber reads as "action needed",
+   not failure (server settings pending bar, camera-panel apply warnings). */
+.notice.pending,
+.notice.warn {
+    color: #e8b054;
+    border: 1px solid color-mix(in srgb, #e8b054 40%, transparent);
+    background: color-mix(in srgb, #e8b054 9%, transparent);
+    border-radius: var(--radius-sm);
+    padding: 7px 10px;
+}
+
+/* Test-result verdicts next to their button: green = delivered, red = failed. */
+.notice.ok {
+    color: var(--ok);
+    border: 1px solid color-mix(in srgb, var(--ok) 40%, transparent);
+    background: color-mix(in srgb, var(--ok) 9%, transparent);
+    border-radius: var(--radius-sm);
+    padding: 7px 10px;
+}
+
+.notice.fail {
+    color: var(--err);
+    border: 1px solid color-mix(in srgb, var(--err) 40%, transparent);
+    background: color-mix(in srgb, var(--err) 9%, transparent);
+    border-radius: var(--radius-sm);
+    padding: 7px 10px;
+}
+
+/* Setup pointers ("no email configured yet — here's where"): guidance that
+   must catch the eye without amber's alarm, so accent, not warning. */
+.notice.setup {
+    color: color-mix(in srgb, var(--accent) 75%, #dfe9f5);
+    border: 1px solid color-mix(in srgb, var(--accent) 40%, transparent);
+    background: color-mix(in srgb, var(--accent) 9%, transparent);
+    border-radius: var(--radius-sm);
+    padding: 7px 10px;
+    font-size: 12px;
+}
+
+.cam {
+    background: var(--panel-2);
+    border: 1px solid transparent;
+    border-radius: var(--radius-sm);
+    padding: 10px 11px;
+    transition: border-color 0.12s ease;
+}
+
+.cam:hover { border-color: var(--line); }
+
+/* Sidebar reorder: a drag hovering a card draws the insertion line above it
+   (the dragged camera will land in front of that card). */
+.cam.cam-drop-target { box-shadow: inset 0 2px 0 var(--accent); }
+
+/* The one target "insert before a card" can't express: after the last card.
+   Exists only while a camera card is mid-drag. */
+.cam-drop-end {
+    margin: 2px 0;
+    padding: 7px;
+    border: 1px dashed color-mix(in srgb, var(--muted) 45%, transparent);
+    border-radius: var(--radius-sm);
+    font-size: 10px;
+    letter-spacing: 0.04em;
+    color: var(--muted);
+    text-align: center;
+}
+
+.cam-drop-end.cam-drop-target {
+    border-color: var(--accent);
+    color: var(--accent);
+    box-shadow: none;
+}
+
+/* The camera named in the URL (/cameras/{name}): its sidebar card lights up. */
+.cam-active,
+.cam-active:hover { border-color: color-mix(in srgb, var(--accent) 60%, transparent); }
+.cam-active .cam-name { color: var(--accent); }
+
+.cam-head {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    cursor: pointer;
+    /* Badges wrap to a second line rather than squeezing the name out. A camera
+       carrying the full set (UDP BETA + battery + Wi-Fi + asleep) overflows this
+       narrow column, and since every badge is `flex: 0 0 auto` the name was the
+       only item that could give — it collapsed to zero width and the camera in
+       the sidebar had no name at all. */
+    flex-wrap: wrap;
+    row-gap: 4px;
+}
+
+.cam-head:hover .cam-name { color: var(--accent); }
+
+.cam-name {
+    font-weight: 600;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    /* `overflow: hidden` zeroes a flex item's automatic minimum size, so without
+       a floor the name shrinks away entirely. Ellipsis, never disappearance. */
+    flex: 0 1 auto;
+    min-width: 6ch;
+}
+
+.solo-btn { margin-left: auto; }
+
+.dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    flex: 0 0 auto;
+}
+
+.dot.on { background: var(--ok); box-shadow: 0 0 6px var(--ok); }
+.dot.off { background: var(--err); box-shadow: 0 0 6px var(--err); }
+/* Battery camera dozing on purpose — calm, not alarming like offline-red */
+.dot.doze { background: var(--muted); box-shadow: 0 0 5px color-mix(in srgb, var(--muted) 60%, transparent); }
+
+/* Offline camera: unmistakable badge + a dimmed card (streams can't start) */
+.cam-offline { border-color: color-mix(in srgb, var(--err) 35%, var(--line)); }
+.cam-offline .cam-streams { opacity: 0.4; }
+
+.cam-offline-badge {
+    font-size: 9px;
+    font-weight: 700;
+    letter-spacing: 1px;
+    text-transform: uppercase;
+    color: var(--err);
+    border: 1px solid color-mix(in srgb, var(--err) 55%, transparent);
+    background: color-mix(in srgb, var(--err) 12%, transparent);
+    border-radius: 999px;
+    padding: 1px 7px;
+    flex: 0 0 auto;
+}
+
+/* Battery-powered camera: charge level (and a bolt while charging) */
+.cam-battery {
+    display: inline-flex;
+    align-items: center;
+    gap: 3px;
+    font-size: 10px;
+    font-weight: 600;
+    color: var(--muted);
+    flex: 0 0 auto;
+    white-space: nowrap;
+}
+.cam-battery.battery-low { color: var(--err); }
+
+/* Wi-Fi signal chip in the sidebar card — mirrors the battery chip. Full text
+   color (not muted): at a dozen pixels the arc glyph disappears when dimmed. */
+.cam-wifi {
+    display: inline-flex;
+    align-items: center;
+    color: var(--text);
+    flex: 0 0 auto;
+}
+.cam-wifi.wifi-weak { color: var(--err); }
+
+/* Wi-Fi / battery glyphs inline with the value in the camera-panel device bar. */
+.campanel-devbar .devbar-wifi,
+.campanel-devbar .devbar-batt {
+    display: inline-flex;
+    align-items: center;
+    margin: 0 4px;
+    color: var(--muted);
+}
+
+/* Battery camera intentionally sleeping (as opposed to unreachable) */
+.cam-doze-badge,
+.cam-privacy-badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 3px;
+    font-size: 9px;
+    font-weight: 700;
+    letter-spacing: 1px;
+    text-transform: uppercase;
+    color: var(--muted);
+    border: 1px solid var(--line);
+    background: color-mix(in srgb, var(--panel-2) 70%, transparent);
+    border-radius: 999px;
+    padding: 1px 7px;
+    flex: 0 0 auto;
+    white-space: nowrap;
+}
+
+/* 24/7 footage is actively being written for this camera (sidebar + tile bar) */
+.cam-rec-badge {
+    font-size: 9px;
+    font-weight: 700;
+    letter-spacing: 1px;
+    color: var(--err);
+    border: 1px solid color-mix(in srgb, var(--err) 45%, transparent);
+    background: rgba(0, 0, 0, 0.35);
+    border-radius: 999px;
+    padding: 1px 7px;
+    flex: 0 0 auto;
+    white-space: nowrap;
+    animation: rec-pulse 2.2s ease-in-out infinite;
+}
+
+@keyframes rec-pulse {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.55; }
+}
+
+.cam-streams {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    margin-top: 8px;
+}
+
+.chip {
+    background: var(--bg);
+    border: 1px solid var(--line);
+    color: var(--text);
+    border-radius: 999px;
+    font-size: 12px;
+    padding: 4px 11px;
+    min-height: 26px;
+    cursor: pointer;
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    transition: border-color 0.12s ease, color 0.12s ease, opacity 0.12s ease,
+        background 0.12s ease;
+}
+
+.chip:hover {
+    border-color: var(--accent);
+    color: var(--accent);
+    background: var(--accent-soft);
+}
+
+.chip-off { opacity: 0.45; }
+
+/* A chip the server vetoes (e.g. 24/7 taping on a dozing battery camera):
+   visibly inert — no hover invite, no pointer. */
+.chip:disabled {
+    opacity: 0.35;
+    cursor: not-allowed;
+}
+.chip:disabled:hover {
+    border-color: var(--line);
+    color: var(--text);
+    background: var(--bg);
+}
+
+.badge {
+    font-size: 9px;
+    background: var(--line);
+    color: var(--muted);
+    border-radius: 4px;
+    padding: 1px 4px;
+}
+
+.sidebar-foot {
+    margin-top: auto;
+    color: var(--muted);
+    font-size: 11px;
+    text-align: center;
+    padding-top: 10px;
+}
+
+/* Server version, pinned to the toolbar's right edge */
+.toolbar-version {
+    margin-left: auto;
+    padding-left: 10px;
+    font-size: 10px;
+    letter-spacing: 0.06em;
+    color: color-mix(in srgb, var(--muted) 70%, transparent);
+    font-variant-numeric: tabular-nums;
+    white-space: nowrap;
+}
+
+/* Signed-in user + sign-out, pinned at the sidebar bottom */
+.sidebar-user {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    border-top: 1px solid var(--line);
+    padding-top: 10px;
+    text-align: left;
+}
+
+.sidebar-user-id {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    min-width: 0;
+    flex: 1;
+}
+
+.sidebar-user-icon { font-size: 14px; flex: 0 0 auto; }
+
+.sidebar-user-name {
+    color: var(--text);
+    font-size: 13px;
+    font-weight: 600;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.sidebar-user-role {
+    font-size: 10px;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    color: var(--muted);
+    border: 1px solid var(--line);
+    border-radius: 999px;
+    padding: 1px 7px;
+    flex: 0 0 auto;
+}
+
+.sidebar-signout { flex: 0 0 auto; }
+
+/* ---------- stage ---------- */
+.stage {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+}
+
+.toolbar {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    padding: 8px 12px;
+    border-bottom: 1px solid var(--line);
+    background: var(--panel);
+}
+
+.tool-label {
+    color: var(--muted);
+    font-size: 10px;
+    font-weight: 600;
+    letter-spacing: 2px;
+    margin: 0 4px;
+}
+
+/* Quiet ghost buttons: chrome appears on hover, the accent marks active */
+.tool-btn {
+    background: transparent;
+    color: var(--text);
+    border: 1px solid transparent;
+    border-radius: var(--radius-sm);
+    min-width: 34px;
+    min-height: 32px;
+    padding: 5px 10px;
+    cursor: pointer;
+    font-size: 13px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 6px;
+    white-space: nowrap;
+    text-decoration: none;
+    transition: background 0.12s ease, border-color 0.12s ease;
+}
+
+.tool-btn:hover { background: var(--panel-2); }
+
+.tool-btn.active {
+    background: var(--accent-soft);
+    border-color: color-mix(in srgb, var(--accent) 45%, transparent);
+    color: var(--accent);
+}
+
+.tool-btn.back { min-width: unset; color: var(--accent); }
+
+/* The view-mode dropdown, dressed as a toolbar control (native picker on phones) */
+.tool-select {
+    appearance: none;
+    background: var(--panel-2);
+    color: var(--text);
+    border: 1px solid transparent;
+    border-radius: var(--radius-sm);
+    min-height: 32px;
+    padding: 5px 26px 5px 10px;
+    font-size: 13px;
+    cursor: pointer;
+    background-image: linear-gradient(45deg, transparent 50%, var(--muted) 50%),
+        linear-gradient(135deg, var(--muted) 50%, transparent 50%);
+    background-position: calc(100% - 15px) 55%, calc(100% - 10px) 55%;
+    background-size: 5px 5px;
+    background-repeat: no-repeat;
+    transition: border-color 0.12s ease;
+}
+
+.tool-select:hover, .tool-select:focus { border-color: var(--accent); outline: none; }
+
+.tool-name { font-size: 12px; }
+
+/* The loaded layout's name inside the Layouts button */
+.layout-cur {
+    color: var(--accent);
+    font-size: 12px;
+    font-weight: 600;
+    max-width: 130px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.tool-caret { color: var(--muted); font-size: 9px; }
+
+.tool-count {
+    min-width: 26px;
+    text-align: center;
+    font-weight: 700;
+    color: var(--accent);
+}
+
+.tool-sep {
+    width: 1px;
+    height: 20px;
+    background: var(--line);
+    margin: 0 6px;
+    flex: 0 0 auto;
+}
+
+@media (max-width: 1100px) {
+    .tool-name { display: none; }
+    .layout-cur { max-width: 90px; }
+}
+
+/* ---------- grid & tiles ---------- */
+.grid {
+    flex: 1;
+    display: grid;
+    gap: 8px;
+    padding: 10px;
+    min-height: 0;
+    grid-auto-rows: 1fr;
+}
+
+/* Focus mode: hero pane + thumbnail strip; thumbnails are click-to-promote */
+.grid.mode-focus .tile:not(.hero) { cursor: pointer; }
+.grid.mode-focus .tile:not(.hero):hover { border-color: var(--accent); }
+
+/* Theater mode: one camera, center stage, breathing room */
+.grid.mode-theater {
+    display: flex;
+    padding: 18px 6vw;
+}
+
+.grid.mode-theater .tile {
+    flex: 1;
+    border-color: #000;
+    box-shadow: 0 12px 48px rgba(0, 0, 0, 0.6);
+}
+
+/* Free mode: floating, draggable, resizable windows */
+.grid.mode-free {
+    display: block;
+    position: relative;
+    overflow: hidden;
+}
+
+.grid.mode-free .tile {
+    position: absolute;
+    display: flex;
+    flex-direction: column;
+    width: 440px;
+    height: 280px;
+    min-width: 220px;
+    min-height: 150px;
+    resize: both;
+    overflow: hidden;
+    box-shadow: 0 10px 34px rgba(0, 0, 0, 0.55);
+}
+
+.tile-head { display: none; }
+
+.grid.mode-free .tile-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    flex: 0 0 auto;
+    padding: 4px 10px;
+    background: var(--panel-2);
+    border-bottom: 1px solid var(--line);
+    cursor: grab;
+    user-select: none;
+    touch-action: none;
+    font-size: 12px;
+}
+
+.grid.mode-free .tile-head:active { cursor: grabbing; }
+.tile-head-name { font-weight: 600; }
+.tile-head-hint { color: var(--muted); font-size: 10px; letter-spacing: 1px; }
+.grid.mode-free .tile video { flex: 1; min-height: 0; }
+
+.tile {
+    position: relative;
+    background: #000;
+    border: 1px solid color-mix(in srgb, var(--line) 55%, transparent);
+    border-radius: var(--radius);
+    overflow: hidden;
+    min-height: 0;
+    display: flex;
+    transition: border-color 0.15s ease;
+}
+
+.tile:hover { border-color: var(--line); }
+
+.tile video {
+    width: 100%;
+    height: 100%;
+    object-fit: contain;
+    background: #000;
+}
+
+.tile-empty {
+    margin: auto;
+    color: var(--line);
+    font-size: 46px;
+    user-select: none;
+}
+
+/* Live object boxes: a canvas laid exactly over the <video>, so the detector can
+   draw in the element's own pixels and let digital zoom (a transform on the
+   video, mirrored onto this) carry the boxes along with the picture. */
+.tile-detect {
+    position: absolute;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    pointer-events: none;
+}
+
+.tile-detect-badge {
+    position: absolute;
+    top: 8px;
+    left: 8px;
+    padding: 2px 7px;
+    border-radius: 999px;
+    background: rgba(0, 0, 0, 0.55);
+    border: 1px solid color-mix(in srgb, var(--line) 70%, transparent);
+    color: var(--muted);
+    font-size: 10px;
+    letter-spacing: 0.4px;
+    pointer-events: none;
+    user-select: none;
+}
+
+.tile-status {
+    position: absolute;
+    inset: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: var(--muted);
+    font-size: 13px;
+    letter-spacing: 1px;
+    pointer-events: none;
+    background: rgba(0, 0, 0, 0.25);
+}
+
+/* Applies wherever a live player renders a status overlay (grid tiles, quick view) */
+video[data-live="1"] ~ .tile-status { display: none; }
+
+/* The snapshot still shown while the stream spins up. It sits directly ON TOP of
+   the (still frameless) video and dissolves away when the first live frame paints
+   — replacing the browser's instant poster→video cut, which read as a jolt
+   whenever the still didn't match the live scene.
+   Stacking is deliberately left to the defaults: the video is a static element, so
+   this positioned layer covers it, while every other overlay (status, privacy,
+   bar, name, handle) comes later in the DOM and/or carries a higher z-index and so
+   still paints above it. Nothing else needed a z-index change. */
+.tile-poster {
+    position: absolute;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    object-fit: contain;
+    z-index: 0;
+    pointer-events: none;
+    transition: opacity 0.28s ease;
+}
+
+/* One-way: keyed on everLive, not live, so a reconnect never brings it back. */
+video[data-ever-live="1"] ~ .tile-poster {
+    opacity: 0;
+}
+
+/* ---- battery cameras on a viewing budget ---------------------------------
+   A sleep-friendly battery camera (no always_on) is marked with a green edge:
+   watching it holds it awake and costs charge, so the wall bounds how long its
+   tile streams. The controls below are revealed and dismissed by CSS keyed on
+   the player's own data-live, which keeps the whole mechanism free of timers
+   and interop — the tile reacts to real frames, not to a guess. */
+.tile.tile-battery {
+    border-color: color-mix(in srgb, var(--ok) 55%, transparent);
+}
+
+.tile.tile-battery:hover {
+    border-color: color-mix(in srgb, var(--ok) 80%, transparent);
+}
+
+/* Keep-awake sits over the feed's bottom-CENTER (the corners belong to the
+   player's own controls), and ONLY while a frame is actually playing — there
+   is nothing to keep awake otherwise. Wraps on narrow tiles instead of
+   overflowing them. */
+.tile-batt {
+    position: absolute;
+    left: 50%;
+    bottom: 8px;
+    transform: translateX(-50%);
+    max-width: calc(100% - 16px);
+    z-index: 4;
+    display: none;
+    align-items: center;
+    justify-content: center;
+    flex-wrap: wrap;
+    gap: 4px 8px;
+    padding: 3px 8px 3px 6px;
+    border-radius: 999px;
+    font-size: 10px;
+    letter-spacing: 0.5px;
+    color: var(--ok);
+    background: rgba(0, 0, 0, 0.55);
+    border: 1px solid color-mix(in srgb, var(--ok) 45%, transparent);
+    user-select: none;
+}
+
+video[data-live="1"] ~ .tile-batt { display: inline-flex; }
+
+.tile-batt input { accent-color: var(--ok); cursor: pointer; margin: 0; }
+
+.tile-batt-keep {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    cursor: pointer;
+    white-space: nowrap;
+}
+
+/* "Sleep now": hand the rest of the viewing budget back with one click. */
+.tile-batt-sleep {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    padding: 2px 8px;
+    border-radius: 999px;
+    font: inherit;
+    font-size: 10px;
+    letter-spacing: 0.5px;
+    white-space: nowrap;
+    color: var(--ok);
+    background: color-mix(in srgb, var(--ok) 14%, transparent);
+    border: 1px solid color-mix(in srgb, var(--ok) 45%, transparent);
+    cursor: pointer;
+}
+
+.tile-batt-sleep:hover {
+    background: color-mix(in srgb, var(--ok) 24%, transparent);
+    border-color: var(--ok);
+}
+
+/* The tile is on a budget but currently resting/asleep: same overlay language as
+   privacy/suspended, in the battery colour. */
+.tile-resting { color: var(--ok); }
+.tile-resting .tile-privacy-icon { color: color-mix(in srgb, var(--ok) 75%, var(--muted)); }
+.tile-resting small { color: var(--muted); }
+
+/* Awake but not being watched: the camera is up for its own reasons, so viewing
+   costs nothing extra. Brighter than the dozing state to read as "available now"
+   rather than "spend battery to see this". */
+.tile-awake .tile-privacy-icon { color: var(--ok); }
+.tile-awake .tile-resume-btn {
+    background: color-mix(in srgb, var(--ok) 20%, transparent);
+    border-color: var(--ok);
+}
+
+/* An explicit button, not just a clickable overlay: waking a battery camera is a
+   deliberate act that costs charge, so it IS the only thing that wakes one — a
+   stray click on the tile spends nothing. */
+.tile-resume-btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    margin-top: 8px;
+    padding: 4px 12px;
+    border-radius: 999px;
+    font: inherit;
+    font-size: 11px;
+    letter-spacing: 0.5px;
+    color: var(--ok);
+    border: 1px solid color-mix(in srgb, var(--ok) 55%, transparent);
+    background: color-mix(in srgb, var(--ok) 12%, transparent);
+    cursor: pointer;
+}
+
+/* Highlight from anywhere only while the whole overlay is clickable (awake);
+   an asleep tile lights the button up only when the button itself is hovered. */
+.tile-awake:hover .tile-resume-btn,
+.tile-resume-btn:hover {
+    background: color-mix(in srgb, var(--ok) 22%, transparent);
+    border-color: var(--ok);
+}
+
+/* Asleep: the overlay is informational, not a button — no pointer, no hover
+   invitation. The Wake & watch button carries all the interactivity. Doubled-up
+   selectors: .tile-privacy-resume declares cursor/hover later in this sheet. */
+.tile-privacy-resume.tile-asleep { cursor: default; }
+.tile-privacy-resume.tile-asleep:hover {
+    color: var(--ok);
+    background: var(--panel-2);
+}
+.tile-privacy-resume.tile-asleep:hover .tile-privacy-icon {
+    color: color-mix(in srgb, var(--ok) 75%, var(--muted));
+}
+
+/* Waking: dismissed the moment a real frame paints, so the spinner can never
+   outlive the thing it is waiting for. */
+video[data-live="1"] ~ .tile-waking { display: none; }
+
+.tile-spinner {
+    width: 22px;
+    height: 22px;
+    border-radius: 50%;
+    border: 2px solid color-mix(in srgb, var(--ok) 25%, transparent);
+    border-top-color: var(--ok);
+    animation: tile-spin 0.8s linear infinite;
+}
+
+@keyframes tile-spin { to { transform: rotate(360deg); } }
+
+@media (prefers-reduced-motion: reduce) {
+    .tile-spinner { animation-duration: 2.4s; }
+}
+
+/* Someone who prefers reduced motion gets the swap without the dissolve. */
+@media (prefers-reduced-motion: reduce) {
+    .tile-poster { transition: none; }
+}
+
+/* Privacy mode: an OPAQUE cover so neither a frozen last frame nor the player's
+   own status text shows through. Rendered by Blazor from the camera's state. */
+.tile-privacy {
+    position: absolute;
+    inset: 0;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 4px;
+    background: var(--panel-2);
+    color: var(--muted);
+    font-size: 13px;
+    letter-spacing: 1px;
+    z-index: 2;
+    pointer-events: none;
+}
+
+.tile-privacy-icon { font-size: 26px; }
+
+/* Suspended: informational like the asleep overlay — it absorbs clicks (so a
+   stray tap neither resumes nor falls through to the tile) and only the
+   explicit Resume button acts. */
+.tile-privacy.tile-suspended {
+    pointer-events: auto;
+    cursor: default;
+}
+
+/* A resume-capable overlay is a button: it must take clicks (the base overlay
+   is click-through) and read as interactive. */
+.tile-privacy-resume {
+    pointer-events: auto;
+    cursor: pointer;
+    transition: color 0.12s ease, background 0.12s ease;
+}
+.tile-privacy-resume:hover {
+    color: var(--text);
+    background: color-mix(in srgb, var(--accent) 12%, var(--panel-2));
+}
+.tile-privacy-resume:hover .tile-privacy-icon { color: var(--accent); }
+
+/* "Stats for nerds": the live stream's technical readout, opened by right-click
+   on a single-camera view. Sits over the picture like the zoom HUD, JS-owned. */
+.nerd-stats {
+    position: absolute;
+    top: 10px;
+    left: 10px;
+    z-index: 6;
+    max-width: min(420px, calc(100% - 20px));
+    max-height: calc(100% - 76px);   /* never cover the tile bar */
+    overflow-y: auto;
+    padding: 8px 10px 9px;
+    border-radius: 10px;
+    border: 1px solid color-mix(in srgb, var(--text) 14%, transparent);
+    background: color-mix(in srgb, #000 72%, transparent);
+    backdrop-filter: blur(6px);
+    color: var(--text);
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 11px;
+    line-height: 1.45;
+    cursor: default;
+}
+
+.nerd-head {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-bottom: 5px;
+    padding-bottom: 5px;
+    border-bottom: 1px solid color-mix(in srgb, var(--text) 12%, transparent);
+}
+
+.nerd-title {
+    flex: 1 1 auto;
+    font-weight: 700;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    font-size: 10px;
+    color: var(--muted);
+}
+
+.nerd-btn {
+    flex: 0 0 auto;
+    background: transparent;
+    border: 1px solid color-mix(in srgb, var(--text) 18%, transparent);
+    border-radius: 5px;
+    color: var(--muted);
+    font: inherit;
+    font-size: 10px;
+    padding: 1px 6px;
+    cursor: pointer;
+}
+.nerd-btn:hover { color: var(--text); border-color: var(--accent); }
+
+.nerd-row {
+    display: flex;
+    gap: 10px;
+    justify-content: space-between;
+}
+.nerd-row span { color: var(--muted); flex: 0 0 auto; }
+.nerd-row b {
+    font-weight: 600;
+    text-align: right;
+    overflow-wrap: anywhere;
+}
+.nerd-row b.warn { color: #e8b054; }
+.nerd-row b.bad { color: var(--err); }
+
+.nerd-sparkwrap { margin-top: 6px; }
+.nerd-spark {
+    display: block;
+    width: 100%;
+    height: 28px;
+    overflow: visible;
+}
+.nerd-sparkline {
+    fill: none;
+    stroke: var(--accent);
+    stroke-width: 1.5;
+    vector-effect: non-scaling-stroke;
+    stroke-linejoin: round;
+}
+.nerd-sparklabel {
+    display: block;
+    color: var(--muted);
+    font-size: 10px;
+}
+
+.nerd-verdict {
+    margin-top: 6px;
+    padding-top: 5px;
+    border-top: 1px solid color-mix(in srgb, var(--text) 12%, transparent);
+    font-size: 10px;
+    line-height: 1.4;
+}
+.nerd-verdict.ok { color: var(--ok); }
+.nerd-verdict.warn { color: #e8b054; }
+.nerd-verdict.bad { color: var(--err); }
+
+/* Phones: the panel would swallow the picture — keep it readable but contained. */
+@media (max-width: 640px) {
+    .nerd-stats { font-size: 10px; max-width: calc(100% - 16px); left: 8px; top: 8px; }
+}
+
+.tile-privacy small {
+    font-size: 11px;
+    opacity: 0.7;
+    letter-spacing: 0.4px;
+    max-width: 80%;
+    text-align: center;
+}
+
+/* Offline variant: the label reads as a problem, not a setting. */
+.tile-offline span:not(.tile-privacy-icon) { color: var(--err); }
+.tile-offline .tile-privacy-icon { color: color-mix(in srgb, var(--err) 60%, var(--muted)); }
+
+.tile-bar {
+    position: absolute;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 6px 10px;
+    background: linear-gradient(transparent, rgba(0, 0, 0, 0.75));
+    opacity: 0;
+    transition: opacity 0.15s ease;
+}
+
+.tile:hover .tile-bar { opacity: 1; }
+
+/* One-time performance nudge: floats over the stage the first time more than
+   four main streams are on the wall, then auto-fades (or is dismissed). */
+.perf-toast {
+    position: fixed;
+    left: 50%;
+    bottom: 20px;
+    transform: translateX(-50%);
+    z-index: 30;
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    max-width: min(580px, calc(100vw - 40px));
+    padding: 10px 14px;
+    background: color-mix(in srgb, var(--panel) 94%, transparent);
+    border: 1px solid var(--accent);
+    border-radius: 10px;
+    box-shadow: 0 8px 28px rgba(0, 0, 0, 0.5);
+    font-size: 13px;
+    line-height: 1.4;
+    animation: perf-toast-in 0.25s ease;
+}
+
+.perf-toast .chip { flex: 0 0 auto; }
+
+@keyframes perf-toast-in {
+    from { opacity: 0; transform: translate(-50%, 10px); }
+}
+
+/* ---------- circuit reconnect overlay ---------- */
+/* Blazor toggles components-reconnect-show / -failed / -rejected on the modal
+   element; everything visual lives here so the overlay matches the theme and
+   is impossible to miss (the framework default is a small white card). */
+.reconnect-modal {
+    display: none;
+    position: fixed;
+    inset: 0;
+    z-index: 200; /* above every dialog — nothing works while disconnected */
+    align-items: center;
+    justify-content: center;
+    background: color-mix(in srgb, var(--bg) 72%, transparent);
+    backdrop-filter: blur(4px) saturate(0.6);
+}
+
+.reconnect-modal.components-reconnect-show,
+.reconnect-modal.components-reconnect-failed,
+.reconnect-modal.components-reconnect-rejected {
+    display: flex;
+}
+
+.reconnect-box,
+.restarting-box {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 12px;
+    min-width: 280px;
+    max-width: min(420px, calc(100vw - 40px));
+    padding: 28px 32px;
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: var(--radius);
+    box-shadow: var(--shadow);
+    text-align: center;
+    animation: perf-toast-in 0.2s ease;
+}
+
+/* Deliberate "the admin asked to restart" screen — distinct from Blazor's
+   generic reconnect modal, and shown ON TOP of it (the circuit drops right
+   after). Pure browser-owned (see neolink.showRestarting): survives the
+   disconnect and reloads when the server answers again. */
+#neolink-restarting {
+    position: fixed;
+    inset: 0;
+    z-index: 300; /* above the reconnect modal (200) */
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: color-mix(in srgb, var(--bg) 78%, transparent);
+    backdrop-filter: blur(5px) saturate(0.6);
+}
+
+.restarting-title { font-size: 16px; font-weight: 700; letter-spacing: 0.3px; }
+.restarting-sub {
+    color: var(--muted);
+    font-size: 13px;
+    max-width: 340px;
+    line-height: 1.5;
+}
+
+/* While our restarting screen is up, keep Blazor's reconnect modal hidden so
+   the user never sees the alarming generic "Connection lost". */
+body.is-restarting .reconnect-modal { display: none !important; }
+
+.reconnect-title {
+    font-size: 16px;
+    font-weight: 700;
+    letter-spacing: 0.3px;
+}
+
+.reconnect-sub {
+    color: var(--muted);
+    font-size: 13px;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 10px;
+}
+
+.reconnect-attempts { font-size: 11px; opacity: 0.8; }
+
+.reconnect-spinner {
+    width: 34px;
+    height: 34px;
+    border-radius: 50%;
+    border: 3px solid var(--line);
+    border-top-color: var(--accent);
+    animation: reconnect-spin 0.9s linear infinite;
+}
+
+@keyframes reconnect-spin {
+    to { transform: rotate(360deg); }
+}
+
+/* Small inline spinner for an in-flight chip action (e.g. the privacy switch). */
+.btn-spinner {
+    display: inline-block;
+    width: 12px;
+    height: 12px;
+    border-radius: 50%;
+    border: 2px solid color-mix(in srgb, var(--text) 30%, transparent);
+    border-top-color: var(--accent);
+    animation: reconnect-spin 0.8s linear infinite;
+    vertical-align: -2px;
+    margin-right: 6px;
+}
+
+/* One message block per state */
+.reconnect-when-show,
+.reconnect-when-failed,
+.reconnect-when-rejected { display: none; }
+
+.components-reconnect-show .reconnect-when-show { display: block; }
+
+.components-reconnect-failed .reconnect-when-failed,
+.components-reconnect-rejected .reconnect-when-rejected { display: block; }
+
+.components-reconnect-failed .reconnect-spinner,
+.components-reconnect-rejected .reconnect-spinner {
+    animation: none;
+    border-top-color: var(--err);
+    opacity: 0.6;
+}
+
+.reconnect-when-failed .chip,
+.reconnect-when-rejected .chip { margin: 4px 3px 0; }
+
+/* ---------- tile drag & drop, resize grip, right-click menu ---------- */
+
+/* Where a dragged tile/camera would land */
+.tile.drop-target {
+    outline: 2px solid var(--accent);
+    outline-offset: -2px;
+    border-color: var(--accent) !important;
+}
+
+/* Corner grip (grid mode): drag to grow/shrink the tile in grid-cell steps */
+.tile-size-handle {
+    position: absolute;
+    right: 0;
+    bottom: 0;
+    width: 16px;
+    height: 16px;
+    z-index: 6;
+    cursor: nwse-resize;
+    opacity: 0;
+    background:
+        linear-gradient(135deg, transparent 55%, var(--muted) 55%, var(--muted) 65%,
+            transparent 65%, transparent 75%, var(--muted) 75%, var(--muted) 85%, transparent 85%);
+    border-bottom-right-radius: var(--radius);
+    transition: opacity 0.15s ease;
+    touch-action: none;
+}
+
+.tile:hover .tile-size-handle { opacity: 0.9; }
+
+/* Right-click camera picker */
+.ctx-backdrop {
+    position: fixed;
+    inset: 0;
+    z-index: 78;
+}
+
+.ctx-menu {
+    position: fixed;
+    z-index: 79;
+    min-width: 190px;
+    max-width: 260px;
+    max-height: min(60vh, 420px);
+    overflow-y: auto;
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: var(--radius-sm);
+    box-shadow: var(--shadow);
+    padding: 6px;
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    animation: ctx-in 0.12s ease;
+}
+
+@keyframes ctx-in {
+    from { opacity: 0; transform: scale(0.97); }
+}
+
+.ctx-title {
+    color: var(--muted);
+    font-size: 10px;
+    font-weight: 600;
+    letter-spacing: 1.5px;
+    text-transform: uppercase;
+    padding: 5px 9px 3px;
+}
+
+.ctx-item {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    width: 100%;
+    text-align: left;
+    background: none;
+    border: none;
+    color: var(--text);
+    font-size: 13px;
+    padding: 7px 9px;
+    border-radius: 7px;
+    cursor: pointer;
+}
+
+.ctx-item:hover { background: var(--panel-2); }
+.ctx-item-active { color: var(--accent); }
+.ctx-check { margin-left: auto; color: var(--accent); }
+.ctx-danger { color: var(--err); }
+.ctx-sep { height: 1px; background: var(--line); margin: 4px 6px; }
+
+/* In-place maximize: the picked tile fills the stage while the other tiles
+   stay MOUNTED but hidden — their <video> players keep running, so restoring
+   the view never shows a wall of black reconnecting cards. */
+.grid.has-max { position: relative; }
+
+.grid.has-max .tile:not(.maxed) { display: none; }
+
+.grid.has-max .tile.maxed {
+    /* wins over per-mode inline geometry (grid-area, free-mode pixels) */
+    position: absolute !important;
+    inset: 0 !important;
+    width: auto !important;
+    height: auto !important;
+    /* An abspos GRID CHILD with a grid placement uses its grid AREA as the
+       containing block — a focus/mosaic hero would only fill its own cell.
+       Clearing the placement makes inset:0 span the whole grid container. */
+    grid-area: auto !important;
+    z-index: 5;
+}
+
+/* Flash a tile red when its camera is picked again (already on screen).
+   The flash is an overlay ON TOP of the video — an inset shadow on the tile
+   itself paints underneath the <video> child and was invisible while playing. */
+.tile-flash::after {
+    content: "";
+    position: absolute;
+    inset: 0;
+    border-radius: inherit;
+    pointer-events: none;
+    z-index: 6;
+    animation: tile-flash 0.9s ease-in-out;
+}
+
+@keyframes tile-flash {
+    0%, 33%, 66% { box-shadow: inset 0 0 0 3px var(--err); }
+    16%, 50%, 100% { box-shadow: inset 0 0 0 3px transparent; }
+}
+
+.tile-name {
+    font-weight: 600;
+    font-size: 13px;
+    text-shadow: 0 1px 3px #000;
+}
+
+/* Phones: the camera name floats translucent over the feed's top-right corner
+   instead of occupying the crowded bottom bar. Ghosted on purpose — it must
+   label the tile without blocking the picture. Enabled in the coarse block. */
+.tile-name-float {
+    display: none;
+    position: absolute;
+    top: 6px;
+    right: 10px;
+    z-index: 5;
+    max-width: 65%;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-size: 12px;
+    font-weight: 600;
+    color: rgba(255, 255, 255, 0.5);
+    text-shadow: 0 1px 2px rgba(0, 0, 0, 0.65);
+    pointer-events: none;
+}
+
+.tile-spacer { flex: 1; }
+
+.tile-bar select {
+    background: rgba(0, 0, 0, 0.6);
+    color: var(--text);
+    border: 1px solid var(--line);
+    border-radius: 5px;
+    font-size: 12px;
+    padding: 2px 6px;
+}
+
+/* ---------- shared ---------- */
+.icon-btn {
+    background: none;
+    border: none;
+    color: var(--muted);
+    cursor: pointer;
+    font-size: 14px;
+    padding: 2px 5px;
+    border-radius: 6px;
+    line-height: 1;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    transition: color 0.12s ease, background 0.12s ease;
+}
+
+.icon-btn:hover { color: var(--accent); background: var(--accent-soft); }
+
+/* Keyboard navigation: a visible ring on any focused control, mouse clicks unaffected */
+:is(button, a, select, input):focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 1px;
+}
+
+/* Browser-fullscreen toggle: glyph follows the JS-maintained body class */
+/* Both fullscreen glyphs are rendered; the body class picks the visible one */
+.fs-enter, .fs-exit { display: inline-flex; }
+.fs-exit { display: none; }
+body.is-fullscreen .fs-enter { display: none; }
+body.is-fullscreen .fs-exit { display: inline-flex; }
+
+/* Two-way talk mic: pulses red while the mic is live, dimmed while connecting */
+.talk-btn.talk-live {
+    color: #fff;
+    background: var(--err);
+    animation: talk-pulse 1.6s ease-in-out infinite;
+}
+.talk-btn.talk-live:hover { color: #fff; background: var(--err); }
+.talk-btn.talk-connecting { color: var(--accent); background: var(--accent-soft); opacity: 0.75; }
+
+@keyframes talk-pulse {
+    0%, 100% { box-shadow: 0 0 0 0 color-mix(in srgb, var(--err) 55%, transparent); }
+    50% { box-shadow: 0 0 0 5px color-mix(in srgb, var(--err) 0%, transparent); }
+}
+
+/* On-video talk indicator: a pill floating at the left edge of the maximized
+   tile / quick view while the mic is live. Impossible to miss (glowing red,
+   expanding ring off the mic disc) and doubles as the stop button. */
+.talk-overlay {
+    position: absolute;
+    left: 14px;
+    top: 50%;
+    transform: translateY(-50%);
+    z-index: 6;
+    display: flex;
+    align-items: center;
+    gap: 9px;
+    padding: 8px 14px 8px 8px;
+    border-radius: 999px;
+    background: color-mix(in srgb, var(--bg) 74%, transparent);
+    backdrop-filter: blur(6px);
+    border: 1px solid color-mix(in srgb, var(--err) 60%, transparent);
+    color: var(--err);
+    cursor: pointer;
+    user-select: none;
+    animation: talk-overlay-in 0.25s ease;
+}
+
+.talk-overlay:hover { border-color: var(--err); }
+
+.talk-overlay-mic {
+    position: relative;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 30px;
+    height: 30px;
+    border-radius: 50%;
+    background: var(--err);
+    color: #fff;
+    flex: 0 0 auto;
+}
+
+.talk-overlay-label {
+    font-size: 10px;
+    font-weight: 700;
+    letter-spacing: 0.14em;
+    white-space: nowrap;
+}
+
+/* Live: the pill glows and rings ripple outward from the mic disc */
+.talk-overlay.live {
+    animation: talk-overlay-in 0.25s ease, talk-overlay-glow 1.6s ease-in-out infinite 0.25s;
+}
+.talk-overlay.live .talk-overlay-mic::after {
+    content: "";
+    position: absolute;
+    inset: -2px;
+    border-radius: 50%;
+    border: 2px solid var(--err);
+    animation: talk-ring 1.4s ease-out infinite;
+}
+.talk-overlay.live .talk-overlay-mic .nl-icon {
+    animation: talk-mic-beat 1.4s ease-in-out infinite;
+}
+
+/* Connecting: muted, gently blinking, no ring yet */
+.talk-overlay.connecting { color: var(--muted); border-color: var(--line); }
+.talk-overlay.connecting .talk-overlay-mic {
+    background: var(--panel-2);
+    color: var(--muted);
+    animation: talk-blink 1.1s ease-in-out infinite;
+}
+
+@keyframes talk-overlay-in {
+    from { opacity: 0; transform: translateY(-50%) translateX(-8px); }
+    to { opacity: 1; transform: translateY(-50%) translateX(0); }
+}
+@keyframes talk-overlay-glow {
+    0%, 100% { box-shadow: 0 0 12px color-mix(in srgb, var(--err) 35%, transparent); }
+    50% { box-shadow: 0 0 22px color-mix(in srgb, var(--err) 60%, transparent); }
+}
+@keyframes talk-ring {
+    0% { transform: scale(1); opacity: 0.9; }
+    100% { transform: scale(2.1); opacity: 0; }
+}
+@keyframes talk-mic-beat {
+    0%, 100% { transform: scale(1); }
+    18% { transform: scale(1.18); }
+    36% { transform: scale(1); }
+}
+@keyframes talk-blink {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.45; }
+}
+
+/* ---------- on-demand clip recording ---------- */
+/* Tile-bar toggle (maximized view): glows red while its clip records. */
+.clip-btn.clip-live {
+    color: #fff;
+    background: var(--err);
+    animation: talk-pulse 1.6s ease-in-out infinite;
+}
+.clip-btn.clip-live:hover { background: color-mix(in srgb, var(--err) 80%, #000); }
+
+/* The always-on corner chip while a clip records — visible whatever started it
+   (the tile button or HA's Record switch) and wherever the tile is shown. The
+   countdown runs to the automatic stop at max_clip_seconds. */
+.clip-overlay {
+    position: absolute;
+    top: 10px;
+    left: 10px;
+    z-index: 6;
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    padding: 4px 11px 4px 8px;
+    border-radius: 999px;
+    background: color-mix(in srgb, var(--bg) 74%, transparent);
+    backdrop-filter: blur(6px);
+    border: 1px solid color-mix(in srgb, var(--err) 60%, transparent);
+    color: var(--err);
+    font-size: 11px;
+    font-weight: 700;
+    letter-spacing: 1px;
+    user-select: none;
+    pointer-events: none; /* inert on grid tiles: clicks fall through to the tile */
+}
+
+.clip-overlay-dot {
+    flex: 0 0 auto;
+    width: 9px;
+    height: 9px;
+    border-radius: 50%;
+    background: var(--err);
+    animation: clip-dot 1.3s ease-in-out infinite;
+}
+
+@keyframes clip-dot {
+    0%, 100% { opacity: 1; box-shadow: 0 0 0 0 color-mix(in srgb, var(--err) 55%, transparent); }
+    50% { opacity: 0.55; box-shadow: 0 0 0 5px color-mix(in srgb, var(--err) 0%, transparent); }
+}
+
+.clip-overlay-label {
+    font-variant-numeric: tabular-nums; /* steady width — no jitter as digits tick */
+    text-shadow: 0 1px 3px #000;
+    white-space: nowrap;
+}
+
+/* Maximized: the chip doubles as the stop button. */
+.tile.maxed .clip-overlay { pointer-events: auto; cursor: pointer; }
+.tile.maxed .clip-overlay:hover {
+    color: #fff;
+    border-color: var(--err);
+    background: color-mix(in srgb, var(--err) 45%, rgba(0, 0, 0, 0.55));
+}
+
+/* On-video camera rail (maximized tile): PTZ and two-way talk in one quiet
+   glass pill on the RIGHT edge, directly below the zoom HUD — visually one
+   column of controls in the zoom HUD's own language (same glass, same radius,
+   same edge offset). Ghosted until hovered / opened / talking so it never
+   fights the video, and clear of every other overlay (toolbar top, clip chip
+   top-left, talk indicator left, camera name & grip bottom corners). */
+.cam-rail {
+    position: absolute;
+    right: 10px;
+    top: calc(50% + 88px); /* the zoom HUD is centered; this starts just below it */
+    z-index: 6;
+    display: flex; /* pad first in markup = flies out LEFT; pill hugs the edge */
+    align-items: center;
+    gap: 8px;
+    opacity: 0.5;
+    transition: opacity 0.15s ease;
+}
+
+.cam-rail:hover, .cam-rail:focus-within, .cam-rail.open { opacity: 1; }
+
+.cam-rail-pill {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 4px;
+    padding: 5px;
+    background: color-mix(in srgb, var(--panel) 82%, transparent);
+    border: 1px solid var(--line);
+    border-radius: 999px;
+    backdrop-filter: blur(6px);
+}
+
+.cam-rail-btn {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 32px;
+    height: 32px;
+    border: none;
+    border-radius: 50%;
+    background: none;
+    color: var(--muted);
+    font-size: 10px;
+    font-weight: 700;
+    letter-spacing: 0.5px;
+    cursor: pointer;
+    user-select: none;
+    -webkit-user-select: none;
+}
+
+.cam-rail-btn:hover { color: var(--fg); background: color-mix(in srgb, var(--fg) 10%, transparent); }
+
+.cam-rail-btn.rail-active { color: var(--accent); background: var(--accent-soft); }
+
+/* The rail mic mirrors the toolbar mic's talk states (red pulse while live). */
+.cam-rail-btn.talk-live {
+    color: #fff;
+    background: var(--err);
+    animation: talk-pulse 1.6s ease-in-out infinite;
+}
+
+.cam-rail-btn.talk-connecting { color: var(--accent); background: var(--accent-soft); opacity: 0.75; }
+
+/* The pan pad flies out to the LEFT of the rail, vertically centered on the
+   pill — absolute, so opening it never shifts the pill it came from. */
+.cam-rail .ptz-overlay-pad {
+    position: absolute;
+    right: calc(100% + 8px);
+    top: 50%;
+    transform: translateY(-50%);
+}
+
+.ptz-overlay-pad {
+    display: grid;
+    grid-template-areas: ". up ." "left stop right" ". down .";
+    gap: 4px;
+    padding: 6px;
+    border-radius: 14px;
+    background: color-mix(in srgb, var(--bg) 74%, transparent);
+    backdrop-filter: blur(6px);
+    border: 1px solid var(--line);
+    animation: talk-overlay-in 0.18s ease;
+}
+
+.ptz-ov-up { grid-area: up; }
+.ptz-ov-left { grid-area: left; }
+.ptz-ov-stop { grid-area: stop; }
+.ptz-ov-right { grid-area: right; }
+.ptz-ov-down { grid-area: down; }
+
+.ptz-overlay-pad button {
+    width: 40px;
+    height: 40px;
+    border: 1px solid var(--line);
+    border-radius: 9px;
+    background: color-mix(in srgb, var(--panel) 55%, transparent);
+    color: var(--fg);
+    font-size: 13px;
+    line-height: 1;
+    cursor: pointer;
+    user-select: none;
+    -webkit-user-select: none;
+    touch-action: none; /* press-and-hold must not turn into a scroll */
+}
+
+.ptz-overlay-pad button:active {
+    background: color-mix(in srgb, var(--accent) 30%, transparent);
+    border-color: var(--accent);
+    color: var(--accent);
+}
+
+/* No hover on touch: keep the rail readable instead of ghosted. */
+@media (hover: none) {
+    .cam-rail { opacity: 0.9; }
+}
+
+/* Flat inline icons: behave in text flow AND as flex items */
+.nl-icon {
+    display: inline-block;
+    vertical-align: -2px;
+    flex: 0 0 auto;
+}
+
+/* Themed scrollbars. WebKit/Blink needs both width (vertical bars) AND height
+   (horizontal bars, e.g. the event strip) or the horizontal one falls back to
+   the chunky default. Firefox uses the inherited scrollbar-color/-width below. */
+::-webkit-scrollbar { width: 10px; height: 10px; }
+::-webkit-scrollbar-thumb {
+    background: var(--line);
+    border-radius: 5px;
+    border: 2px solid transparent;
+    background-clip: padding-box;
+}
+::-webkit-scrollbar-thumb:hover { background: var(--muted); }
+::-webkit-scrollbar-track,
+::-webkit-scrollbar-corner { background: transparent; }
+:root { scrollbar-color: var(--line) transparent; scrollbar-width: thin; }
+
+/* ---------- responsive ---------- */
+.menu-btn { display: none; }
+.backdrop { display: none; }
+
+.toolbar { flex-wrap: wrap; row-gap: 6px; }
+
+@media (max-width: 900px) {
+    /* Sidebar becomes a slide-in drawer */
+    .menu-btn { display: inline-flex; }
+
+    .sidebar {
+        position: fixed;
+        left: 0;
+        top: 0;
+        bottom: 0;
+        width: 290px;
+        z-index: 100;
+        transform: translateX(-105%);
+        transition: transform 0.18s ease;
+        box-shadow: 8px 0 32px rgba(0, 0, 0, 0.6);
+    }
+
+    .sidebar.open { transform: none; }
+
+    /* The desktop collapse is meaningless in the drawer: whatever the saved
+       rail state says, a phone's sidebar always opens full. */
+    .sidebar.collapsed { width: 290px; padding: 14px 12px; }
+    .sidebar.collapsed .sidebar-full { display: flex; }
+    .sidebar.collapsed .sidebar-rail { display: none; }
+    .brand .rail-toggle { display: none; }
+
+    .backdrop {
+        display: block;
+        position: fixed;
+        inset: 0;
+        z-index: 90;
+        background: rgba(0, 0, 0, 0.55);
+    }
+}
+
+@media (max-width: 700px) {
+    /* Phones: two columns max, scroll vertically, ignore desktop grid areas */
+    .grid:not(.mode-free):not(.mode-theater) {
+        grid-template-columns: repeat(2, 1fr) !important;
+        grid-template-rows: none !important;
+        grid-auto-rows: minmax(120px, 26vh);
+        overflow-y: auto;
+    }
+
+    .grid.mode-focus .tile,
+    .grid.mode-mosaic .tile {
+        grid-area: auto !important;
+    }
+
+    /* The hero spans real grid rows; a min-height taller than the row made it
+       overflow its cell and the next row's tiles rendered on top of it. */
+    .grid.mode-focus .tile.hero,
+    .grid.mode-mosaic .tile.hero {
+        grid-column: span 2 !important;
+        grid-row: span 2 !important;
+    }
+
+    .grid.mode-theater { padding: 8px; }
+
+    /* Freeform windows assume a mouse; keep them usable but scrollable */
+    .grid.mode-free { overflow: auto; }
+
+    /* Phones: every tile control must stay on-screen. The camera name is the
+       only flexible item — it shrinks to an ellipsis — while the buttons and
+       the stream picker compact instead of being pushed off the right edge. */
+    .tile-bar { gap: 4px; padding: 4px 6px; }
+
+    .tile-name {
+        flex: 0 1 auto;
+        min-width: 0;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+    }
+
+    .tile-bar select {
+        min-width: 0;
+        max-width: 72px;
+        font-size: 11px;
+        padding: 2px 4px;
+    }
+
+    .tile-bar .icon-btn {
+        min-width: 30px;
+        min-height: 30px;
+        padding: 4px;
+        flex: 0 0 auto;
+    }
+
+    .cam-rec-badge { letter-spacing: 0.5px; padding: 1px 5px; }
+
+    /* Phones: the toolbar scrolls sideways instead of stacking into a wall */
+    .toolbar {
+        flex-wrap: nowrap;
+        overflow-x: auto;
+        scrollbar-width: none;
+        padding: 8px 10px;
+        padding-left: max(10px, env(safe-area-inset-left));
+        padding-right: max(10px, env(safe-area-inset-right));
+    }
+
+    .toolbar::-webkit-scrollbar { display: none; }
+
+    .layouts-bar { flex-wrap: wrap; }
+
+    /* The review strip trades a little height for stage room */
+    .events-bar { height: min(150px, 24dvh) !important; }
+}
+
+/* Touch devices, any width: finger-sized targets and no hover-only affordances */
+@media (pointer: coarse) {
+    /* Hover-revealed controls must be ALWAYS visible on touch — and gated on
+       pointer type, not viewport width: a phone in landscape is wider than the
+       phone breakpoint, and WebKit turns any content-revealing :hover into a
+       "first tap hovers, second tap clicks" trap (the two-taps-to-minimize bug). */
+    .tile-bar { opacity: 1; }
+
+    .tool-btn, .tool-select, .tl-play { min-height: 40px; }
+    .icon-btn { min-width: 36px; min-height: 36px; }
+    .chip { min-height: 32px; padding: 5px 13px; }
+    .zoom-hud { display: flex; } /* no hover on touch: JS fades it when idle instead */
+    .zoom-hud:not(:is(.zoom-on *, :fullscreen *)) { display: none; }
+
+    /* Compact + translucent on phones: less video real estate stolen while shown */
+    .zoom-hud {
+        padding: 5px 4px;
+        gap: 2px;
+        right: 6px;
+        opacity: 0.8;
+    }
+    .zoom-hud.hud-idle { opacity: 0; }
+    /* The camera rail tracks the zoom HUD's tighter phone edge — one column. */
+    .cam-rail { right: 6px; }
+
+    /* Two fingers on the PICTURE must pinch, never scroll/browser-zoom.
+       Scoped to the video element only: putting touch-action:none on the whole
+       container degraded WebKit's tap→click synthesis for the tile-bar buttons
+       (maximize/minimize taking seconds to register on iOS). */
+    .zoom-on video, .quick-view-media video, .event-player-media video { touch-action: none; }
+
+
+    /* The camera name leaves the bottom bar for the translucent top-right float. */
+    .tile-name-float { display: block; }
+    .tile-bar .tile-name { display: none; }
+
+    /* Recording indicators shrink to a blinking dot — the labels are dead
+       weight at phone tile sizes (the clip chip keeps its countdown). */
+    .tile-bar .cam-rec-badge {
+        border: none;
+        background: none;
+        padding: 0;
+        font-size: 13px;
+    }
+    .tile-bar .cam-rec-badge .rec-text { display: none; }
+    .clip-overlay-word { display: none; }
+}
+
+/* ---------- camera settings dialog ---------- */
+.panel-backdrop {
+    display: block;
+    position: fixed;
+    inset: 0;
+    background: rgba(0, 0, 0, 0.55);
+    z-index: 60;
+}
+
+.campanel {
+    position: fixed;
+    top: 50%;
+    left: 50%;
+    transform: translate(-50%, -50%);
+    width: min(560px, 94vw);
+    max-height: min(92vh, 960px);
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: 14px;
+    z-index: 61;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    padding: 16px;
+    overflow-y: auto;
+    box-shadow: 0 24px 64px rgba(0, 0, 0, 0.55);
+}
+
+/* Pinned header: the title/close row must stay visible while the panel body
+   scrolls (applies to the camera settings dialog and the events panel alike). */
+.campanel-head {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-weight: 700;
+    letter-spacing: 1px;
+    position: sticky;
+    top: -16px; /* campanel padding: pin flush to the panel edge */
+    background: var(--panel);
+    z-index: 2;
+    padding: 6px 0;
+}
+
+/* Suspend chip in the panel header: the head is bold/spaced for its title —
+   the chip must not inherit that voice. */
+.campanel-head .head-suspend {
+    font-weight: 400;
+    letter-spacing: normal;
+    font-size: 11px;
+    white-space: nowrap;
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+}
+
+/* The suspend confirmation card: sits between the pinned header and the
+   scrollable body, so it is in view wherever the panel was scrolled. */
+.suspend-confirm {
+    border: 1px solid var(--warn, #d9a441);
+    border-radius: 8px;
+    padding: 10px 12px;
+    margin: 4px 0 8px;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    background: var(--panel-2, var(--panel));
+}
+
+.suspend-skip {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 12px;
+    cursor: pointer;
+    user-select: none;
+}
+
+.suspend-confirm-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    justify-content: flex-end;
+}
+
+.campanel-title {
+    flex: 1;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.campanel-section {
+    background: var(--panel-2);
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    padding: 10px 12px;
+}
+
+/* Camera settings dialog: roomier than the base panel, with the section cards
+   flowing masonry-style into two columns (cards never split across columns).
+   Below the breakpoint it falls back to the familiar single column.
+   FIXED height from the moment it opens — no snap when content loads, no
+   resize when switching tabs; only the body scrolls, keeping the header,
+   device strip and tabs in view. */
+.campanel-wide {
+    width: min(1080px, 94vw);
+    height: min(880px, 92vh);
+    overflow: hidden;
+}
+.campanel-wide .campanel-head { position: static; top: auto; }
+
+/* Draggable + resizable (desktop): the header drags, the native corner grip
+   resizes — so staged OSD/picture changes can be watched applying on the
+   video beneath the modal. JS (delegated, neolink.js) owns the geometry as
+   inline styles that die with the element, so a reopened dialog is always
+   back to this centered default. Phones keep the fixed sheet untouched. */
+@media (min-width: 701px) {
+    .campanel-wide {
+        resize: both;
+        min-width: 440px;
+        min-height: 340px;
+        max-width: calc(100vw - 16px);
+        max-height: calc(100vh - 16px);
+    }
+    .campanel-head { cursor: move; user-select: none; }
+    .campanel-head button { cursor: pointer; }
+}
+.campanel-wide .campanel-body {
+    flex: 1 1 auto;
+    min-height: 0;
+    overflow-y: auto;
+    padding: 2px; /* focus rings aren't clipped by the scroll edge */
+}
+
+/* The always-visible identity strip under the panel header. */
+.campanel-devbar {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px 16px;
+    padding: 2px 2px 6px;
+    border-bottom: 1px solid var(--line);
+    font-size: 12px;
+    color: var(--muted);
+    flex: 0 0 auto;
+}
+
+/* "Querying the camera" hint while capabilities lazy-load: keep the spinner on
+   the text baseline so the row reads as one line. */
+.campanel-probing {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+.campanel-devbar .devbar-model {
+    color: var(--text);
+    font-weight: 600;
+}
+
+/* Tiny caption before each vital, so "v3.0.0.6460…" reads as a firmware
+   version instead of a random string. */
+.campanel-devbar .devbar-k {
+    text-transform: uppercase;
+    font-size: 10px;
+    letter-spacing: 1px;
+    opacity: 0.65;
+    margin-right: 5px;
+}
+.campanel-tabs { flex: 0 0 auto; }
+
+/* The masonry columns live on an INNER wrapper, not the scroll container: CSS
+   columns size themselves to their element's height, and inside a fixed-height
+   scroller that capped the columns at the visible area — fragmenting cards
+   (break-inside notwithstanding) and clipping them mid-card. The wrapper grows
+   with its content, so cards stay whole and the body scrolls past them. */
+/* Controls tab: two EXPLICIT columns, not flowed ones. Sections lazy-load as
+   their probes answer; with `columns: 2` every arrival re-balanced the flow and
+   cards (notably SUSPEND) wandered. Each column keeps its own fixed order —
+   SUSPEND is always the right column's first card. */
+.campanel-cols {
+    display: flex;
+    align-items: flex-start;
+    gap: 12px;
+}
+
+.campanel-cols > * { margin: 0 0 12px; }
+
+.campanel-col {
+    flex: 1 1 0;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+    margin: 0;
+}
+
+/* Single-card tabs (Recording) and the probing notice use the full width. */
+.campanel-cols.one-col { display: block; }
+.campanel-cols > .campanel-probing { flex: 1 1 100%; }
+
+/* Camera-panel forms get the same label-column treatment as the server
+   settings: the control sits right next to its label and lines up between
+   rows instead of drifting to the card's far edge (worst on the full-width
+   Recording tab). Third column holds slider value readouts. */
+.campanel-wide .campanel-cols .control-row {
+    display: grid;
+    grid-template-columns: minmax(150px, 230px) minmax(0, 1fr) auto;
+    align-items: center;
+    justify-items: start;
+    column-gap: 12px;
+}
+
+/* Sliders and wide selects fill the control column up to the readout. */
+.campanel-wide .campanel-cols .control-row > .zf-slider,
+.campanel-wide .campanel-cols .control-row > .qr-select { width: 100%; }
+
+/* Label-less control strips (quick-reply play, preset save) stay inline. */
+.campanel-wide .campanel-cols .control-row.row-inline {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
+}
+.campanel-wide .campanel-cols .control-row.row-inline > .qr-select { width: auto; flex: 1 1 auto; }
+
+/* PHONES: the label-column grid needs width it doesn't have — the label track
+   resolves toward its 230px max and squeezes the control into overflow (labels
+   were clipping off the left edge). Fall back to the original label-left /
+   control-right row, which reads well at this width. */
+@media (max-width: 640px) {
+    .campanel-wide .campanel-cols .control-row {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 8px;
+        flex-wrap: wrap;
+    }
+    .campanel-wide .campanel-cols .control-row > .zf-slider {
+        width: auto;
+        flex: 1 1 120px;
+    }
+    .campanel-wide .campanel-cols .control-row > .qr-select { width: auto; flex: 1 1 auto; }
+}
+
+.campanel-body .campanel-section { transition: border-color 0.15s ease; }
+
+.campanel-body .campanel-section:hover {
+    border-color: color-mix(in srgb, var(--accent) 30%, var(--line));
+}
+
+@media (max-width: 860px) {
+    /* Narrow: the two explicit columns stack — left group first, then the
+       right group (Suspend, Siren, PIR, Maintenance) as one block. */
+    .campanel-cols { flex-direction: column; align-items: stretch; }
+}
+
+/* Staged-edits bar: pinned to the panel's bottom edge (mirror of .campanel-head)
+   so Apply/Discard and the disruption warning never scroll out of sight. */
+.campanel-pending {
+    position: sticky;
+    bottom: -16px; /* campanel padding: pin flush to the panel edge */
+    background: var(--panel);
+    border-top: 1px solid var(--line);
+    margin: 0 -16px -16px;
+    padding: 10px 16px 14px;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    z-index: 2;
+}
+
+.campanel-pending-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
+}
+
+/* Server settings: head and foot pinned, only the sections scroll — the
+   unsaved state and the Save/Restart buttons can never leave the screen. */
+.settings-panel { overflow: hidden; }
+
+.settings-panel .campanel-head {
+    position: static;
+    top: auto;
+    padding: 0 0 4px;
+    flex: 0 0 auto;
+}
+
+.settings-body {
+    flex: 1 1 auto;
+    min-height: 0;
+    overflow-y: auto;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    /* breathing room so focus rings aren't clipped by the scroll edge */
+    padding: 2px;
+    margin: -2px;
+}
+
+.settings-foot {
+    flex: 0 0 auto;
+    border-top: 1px solid var(--line);
+    padding-top: 10px;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+}
+
+.settings-foot-btns {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
+}
+
+/* Server settings: roomier and organised into top tabs so each section is short.
+   Two-class selector so it beats the reused .auth-panel width (defined later).
+   The HEIGHT is fixed (not content-driven): switching tabs must not resize the
+   dialog — the body scrolls inside instead. */
+.settings-panel.settings-wide {
+    /* Wide enough for all NINE tabs on one line on a desktop screen — 880px fit
+       seven, then Notifications and AI arrived and wrapped to a second row.
+       980px fits them with only ~9px to spare, which another system's font
+       metrics would eat, so leave a real margin. Tabs still wrap gracefully
+       below this width; they just shouldn't have to on a desktop. */
+    width: min(1020px, 96vw);
+    /* Fixed height on purpose (switching tabs must not resize the dialog), but
+       it now grows with the screen: the old 700px cap left a 1440p monitor
+       scrolling settings it had the room to show. 1200px is where a dialog
+       stops being easier to read and starts being a lot of eye travel, so the
+       viewport, not the cap, is what binds on ordinary screens. dvh second:
+       on mobile 90vh can exceed the VISIBLE viewport while the URL bar shows,
+       which would push the footer's Save button off-screen. */
+    height: min(1200px, 90vh);
+    height: min(1200px, 90dvh);
+}
+
+.settings-tabs {
+    flex: 0 0 auto;
+    display: flex;
+    /* Tabs WRAP instead of overflowing: a hidden horizontal scrollbar silently
+       cut off the last tab whenever the row outgrew the panel. */
+    flex-wrap: wrap;
+    gap: 4px;
+    border-bottom: 1px solid var(--line);
+    margin: 2px -2px 8px;
+    padding: 0 2px 8px;
+}
+
+/* ---- Server-settings forms: label column + adjacent control ----
+   The old space-between rows flung every control to the far edge of the (now
+   880px) dialog and scattered multi-button rows. A fixed label column keeps
+   each control right next to its label, and action clusters line up between
+   rows. Scoped to the settings panel — the camera panel's narrow masonry
+   columns read fine with space-between. */
+.settings-panel .settings-body .control-row,
+.settings-panel .settings-body .admin-field {
+    display: grid;
+    grid-template-columns: minmax(170px, 280px) 1fr;
+    align-items: center;
+    justify-items: start;
+    column-gap: 14px;
+}
+
+.settings-panel .settings-body .admin-field input {
+    width: min(100%, 340px);
+    max-width: none;
+}
+
+.settings-panel .settings-body .control-row > input,
+.settings-panel .settings-body .control-row > select {
+    width: min(100%, 340px);
+}
+
+/* Action clusters in rows (users/cameras lists, confirm/cancel pairs):
+   grouped, gapped, aligned as one unit in the control column. */
+.row-actions {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    flex-wrap: wrap;
+}
+
+/* The add-user composite (two inputs + button) is one inline strip, not a form row. */
+.settings-panel .user-add-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
+    padding: 3px 0;
+    font-size: 13px;
+}
+
+/* PHONES: same fallback as the camera panel — the fixed label track starves
+   the control column at this width, so revert to label-left / control-right. */
+@media (max-width: 640px) {
+    .settings-panel .settings-body .control-row,
+    .settings-panel .settings-body .admin-field {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 8px;
+        flex-wrap: wrap;
+    }
+    .settings-panel .settings-body .admin-field input,
+    .settings-panel .settings-body .control-row > input,
+    .settings-panel .settings-body .control-row > select {
+        width: 190px;
+        max-width: 55%;
+    }
+}
+
+.settings-tab {
+    flex: 0 0 auto;
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    background: transparent;
+    border: 1px solid transparent;
+    border-radius: 8px;
+    color: var(--muted);
+    padding: 6px 12px;
+    font-size: 13px;
+    font-weight: 600;
+    cursor: pointer;
+    white-space: nowrap;
+    transition: background 0.12s ease, color 0.12s ease;
+}
+
+.settings-tab:hover { color: var(--text); background: var(--panel-2); }
+
+.settings-tab.active {
+    color: var(--text);
+    background: color-mix(in srgb, var(--accent) 14%, transparent);
+    border-color: color-mix(in srgb, var(--accent) 35%, var(--line));
+}
+
+.settings-tab .nl-icon { opacity: 0.75; vertical-align: -2px; }
+
+/* Unsaved-changes marker on the Notifications tab (its own save target) */
+.settings-tab .tab-dot {
+    color: var(--accent);
+    font-size: 9px;
+    margin-left: 5px;
+    vertical-align: 1px;
+}
+
+/* The probe spinner rides IN the tab label, so it must not carry the standalone
+   spinner's trailing gap (the tab's own flex gap already spaces it). */
+.settings-tab .tab-spinner {
+    width: 10px;
+    height: 10px;
+    margin-right: 0;
+    vertical-align: 0;
+}
+
+/* Pending-edits badge in the settings header (hover for the full story) */
+.unsaved-badge {
+    margin-left: 10px;
+    font-size: 10px;
+    font-weight: 700;
+    letter-spacing: 0.05em;
+    color: #e8b054;
+    border: 1px solid color-mix(in srgb, #e8b054 40%, transparent);
+    background: color-mix(in srgb, #e8b054 9%, transparent);
+    border-radius: 999px;
+    padding: 2px 9px;
+    white-space: nowrap;
+    cursor: help;
+}
+
+.campanel-section-title {
+    font-size: 11px;
+    color: var(--muted);
+    letter-spacing: 2px;
+    margin-bottom: 8px;
+}
+
+.campanel-section-title .nl-icon {
+    vertical-align: -2.5px;
+    margin-right: 5px;
+    opacity: 0.7;
+}
+
+/* Sub-grouping inside a section (e.g. the RECORDING card's ARCHIVE block). */
+.campanel-subtitle {
+    font-size: 11px;
+    color: var(--muted);
+    letter-spacing: 2px;
+    margin: 2px 0 8px;
+}
+
+.campanel-subtitle .nl-icon {
+    vertical-align: -2px;
+    margin-right: 5px;
+    opacity: 0.7;
+}
+
+/* Doubled class: .event-sub (later in this file) ellipsizes single lines;
+   an explanation must wrap, so this needs the higher specificity. */
+.event-sub.lc-explain {
+    margin: -2px 0 8px;
+    line-height: 1.4;
+    white-space: normal;
+}
+
+/* The lifecycle strip's footer line must wrap too. */
+.lifecycle .event-sub { white-space: normal; }
+
+/* Footage-lifecycle strip: the RECORDING card's living summary — colored pills
+   trace each recording type from live disk to archive to deletion, built from
+   the settings as currently toggled (so flipping a switch explains itself). */
+.lifecycle {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    margin-top: 10px;
+    padding: 8px 10px;
+    border: 1px dashed var(--line);
+    border-radius: 8px;
+    background: color-mix(in srgb, var(--panel) 55%, transparent);
+}
+
+.lc-title {
+    font-size: 10px;
+    color: var(--muted);
+    letter-spacing: 2px;
+}
+
+.lc-row {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    flex-wrap: wrap;
+}
+
+.lc-name {
+    min-width: 44px;
+    font-size: 10px;
+    letter-spacing: 1px;
+    text-transform: uppercase;
+    color: var(--muted);
+}
+
+.lc-arrow { color: var(--muted); font-size: 12px; }
+
+.lc-pill {
+    font-size: 11px;
+    border-radius: 999px;
+    padding: 1px 9px;
+    white-space: nowrap;
+    border: 1px solid;
+}
+
+.lc-live {
+    color: var(--ok);
+    border-color: color-mix(in srgb, var(--ok) 45%, transparent);
+    background: color-mix(in srgb, var(--ok) 8%, transparent);
+}
+
+.lc-archive {
+    color: #e8b054;
+    border-color: color-mix(in srgb, #e8b054 45%, transparent);
+    background: color-mix(in srgb, #e8b054 8%, transparent);
+}
+
+.lc-del {
+    color: color-mix(in srgb, var(--err) 80%, var(--text));
+    border-color: color-mix(in srgb, var(--err) 40%, transparent);
+    background: color-mix(in srgb, var(--err) 7%, transparent);
+}
+
+.kv {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 13px;
+}
+
+.kv td {
+    padding: 2px 0;
+    vertical-align: top;
+}
+
+.kv td:first-child {
+    color: var(--muted);
+    padding-right: 12px;
+    white-space: nowrap;
+}
+
+.stream-group {
+    display: flex;
+    align-items: baseline;
+    gap: 10px;
+    padding: 4px 0;
+}
+
+.stream-group-name {
+    flex: 0 0 44px;
+    color: var(--muted);
+    font-size: 13px;
+}
+
+.stream-options {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+}
+
+/* Browser-alerts per-camera picker: one card per camera so it's obvious which
+   detection chips belong to which camera (the old flat rows blended together). */
+.alert-cams {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    margin-top: 8px;
+}
+.alert-cam {
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    padding: 9px 11px;
+    background: var(--panel-2, rgba(255, 255, 255, 0.02));
+}
+/* A camera with at least one alert selected reads as "active" at a glance. */
+.alert-cam.has-alerts {
+    border-color: color-mix(in srgb, var(--accent) 45%, var(--line));
+    background: color-mix(in srgb, var(--accent) 7%, transparent);
+}
+.alert-cam-head {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 10px;
+    margin-bottom: 8px;
+}
+.alert-cam-name {
+    font-weight: 600;
+    font-size: 13px;
+    color: var(--text);
+}
+.alert-cam-count {
+    font-size: 11px;
+    color: var(--muted);
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    flex: 0 0 auto;
+}
+.alert-cam.has-alerts .alert-cam-count { color: var(--accent); }
+.alert-cam-actions {
+    display: flex;
+    gap: 6px;
+    flex: 0 0 auto;
+}
+/* Compact chips for the per-camera head actions (All / offline). */
+.chip-mini {
+    padding: 2px 9px;
+    font-size: 11px;
+    min-height: 0;
+}
+.alert-cam-chips {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+}
+
+/* ------------------------------------------------------------ events (NVR) */
+
+/* Frigate-style review strip across the top of the stage.
+   Tall cards: preview on top (with ambient trickle playback), label below.
+   The height comes from an inline style (user-resizable via the bottom handle);
+   cards scale to fill it, and the stage below takes whatever remains. */
+.events-bar {
+    position: relative;
+    display: flex;
+    align-items: stretch;
+    gap: 8px;
+    padding: 8px 10px 12px;
+    background: var(--panel);
+    border-bottom: 1px solid var(--line);
+    min-height: 96px;
+    max-height: 60vh;
+    flex: 0 0 auto;
+}
+
+/* Compact header rail at the strip's left edge: what was detected, how many,
+   and the strip's own actions (filter / dismiss-all) as clear, bordered buttons. */
+.events-rail {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 3px;
+    flex: 0 0 auto;
+    min-width: 68px;
+    padding-right: 10px;
+    border-right: 1px solid var(--line);
+}
+
+.events-rail-label {
+    font-size: 9px;
+    letter-spacing: 2px;
+    text-transform: uppercase;
+    color: var(--muted);
+}
+
+.events-rail-count {
+    font-size: 22px;
+    font-weight: 700;
+    line-height: 1.1;
+    color: var(--accent);
+    font-variant-numeric: tabular-nums;
+}
+
+.events-rail-actions {
+    display: flex;
+    gap: 5px;
+    margin-top: 3px;
+}
+
+.rail-btn {
+    position: relative;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 28px;
+    height: 28px;
+    border-radius: 7px;
+    background: var(--panel-2);
+    border: 1px solid var(--line);
+    color: var(--muted);
+    cursor: pointer;
+    transition: color 0.12s ease, border-color 0.12s ease, background 0.12s ease;
+}
+
+.rail-btn:hover {
+    color: var(--accent);
+    border-color: var(--accent);
+}
+
+.rail-btn.open {
+    color: var(--accent);
+    border-color: var(--accent);
+    background: rgba(79, 140, 255, 0.14);
+}
+
+/* "Filters are active" indicator, visible even when the drawer is closed */
+.rail-btn-dot {
+    position: absolute;
+    top: -4px;
+    right: -4px;
+    width: 9px;
+    height: 9px;
+    border-radius: 50%;
+    background: var(--accent);
+    border: 2px solid var(--panel);
+}
+
+.strip-resize {
+    position: absolute;
+    left: 0;
+    right: 0;
+    bottom: -2px;
+    height: 10px;
+    cursor: ns-resize;
+    touch-action: none;
+    z-index: 5;
+}
+
+.strip-resize::after {
+    content: "";
+    position: absolute;
+    left: 50%;
+    top: 3px;
+    width: 48px;
+    height: 4px;
+    margin-left: -24px;
+    border-radius: 2px;
+    background: var(--line);
+}
+
+.strip-resize:hover::after { background: var(--accent); }
+
+/* Hosts the scroll area and its edge arrows (position anchor for both) */
+.events-scroll-wrap {
+    position: relative;
+    display: flex;
+    flex: 1;
+    min-width: 0;
+}
+
+.events-bar-scroll {
+    display: flex;
+    align-items: stretch;
+    gap: 8px;
+    overflow-x: auto;
+    overflow-y: hidden;
+    scrollbar-width: thin;
+    flex: 1;
+    min-width: 0;
+    padding: 2px 0;
+    cursor: grab; /* the strip pans with a mouse drag (cards override with pointer) */
+}
+
+/* While drag-panning: grabbing cursor everywhere and no accidental text/image
+   selection on the cards flying past (JS toggles the class). */
+.events-bar-scroll.strip-dragging,
+.events-bar-scroll.strip-dragging * {
+    cursor: grabbing !important;
+    user-select: none;
+}
+
+/* Edge scroll arrows: near full height of the strip, gradient fade into the
+   cards, only visible while that side has more to scroll (JS sets can-*). */
+.strip-nav {
+    position: absolute;
+    top: 2px;
+    bottom: 2px;
+    width: 56px;
+    display: flex;
+    align-items: center;
+    border: none;
+    padding: 0;
+    background: none;
+    color: var(--text);
+    cursor: pointer;
+    z-index: 5;
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity 0.18s ease, color 0.12s ease;
+}
+
+.strip-nav svg { filter: drop-shadow(0 1px 3px rgba(0, 0, 0, 0.9)); }
+.strip-nav:hover { color: var(--accent); }
+
+.strip-nav-left {
+    left: 0;
+    justify-content: flex-start;
+    padding-left: 2px;
+    background: linear-gradient(to right, var(--panel) 25%, transparent);
+}
+
+.strip-nav-right {
+    right: 0;
+    justify-content: flex-end;
+    padding-right: 2px;
+    background: linear-gradient(to left, var(--panel) 25%, transparent);
+}
+
+.events-scroll-wrap.can-left .strip-nav-left,
+.events-scroll-wrap.can-right .strip-nav-right {
+    opacity: 1;
+    pointer-events: auto;
+}
+
+.event-card {
+    position: relative; /* anchors the overlaid meta and the dismiss button */
+    display: flex;
+    flex-direction: column;
+    align-items: stretch;
+    background: var(--bg);
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    overflow: hidden;
+    cursor: pointer;
+    flex: 0 0 auto;
+    /* Width follows the (resizable) bar height so previews scale with it */
+    height: 100%;
+    /* The card takes the camera's exact shape (inline aspect-ratio per event;
+       this is the fallback) and the media fills it edge to edge — the title
+       overlays the bottom of the clip, so no meta row distorts the geometry. */
+    aspect-ratio: 16 / 9;
+    min-width: 150px;
+    max-width: 560px;
+    transition: transform 0.12s ease, border-color 0.12s ease, box-shadow 0.12s ease;
+}
+
+.event-card:hover {
+    border-color: var(--accent);
+    transform: translateY(-1px);
+    box-shadow: 0 6px 18px rgba(0, 0, 0, 0.4);
+}
+
+.event-card.live { border-color: var(--err); }
+
+.event-thumb {
+    position: relative;
+    width: 100%;
+    flex: 1;
+    min-height: 0;
+    overflow: hidden;
+    background: #000;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+
+.event-thumb img,
+.event-thumb video {
+    width: 100%;
+    height: 100%;
+    /* contain, not cover: ultrawide cameras must show their full width (the
+       card already matches the camera's aspect, so bars only appear when the
+       camera is unknown and the 16:9 fallback misses). */
+    object-fit: contain;
+    display: block;
+    pointer-events: none; /* clicks land on the card (open player) */
+}
+
+.event-thumb-icon { display: inline-flex; opacity: 0.8; }
+
+.event-live {
+    position: absolute;
+    left: 4px;
+    top: 3px;
+    font-size: 9px;
+    font-weight: 700;
+    color: #fff;
+    background: var(--err);
+    border-radius: 3px;
+    padding: 0 4px;
+    animation: event-pulse 1.2s ease-in-out infinite;
+}
+
+@keyframes event-pulse { 50% { opacity: 0.45; } }
+
+/* Title/time float over the clip's bottom edge (NVR style) so the card can be
+   exactly the camera's shape — a meta row below would pad the media with bars. */
+.event-meta {
+    position: absolute;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 1px;
+    padding: 14px 8px 5px;
+    background: linear-gradient(transparent, rgba(0, 0, 0, 0.82));
+    pointer-events: none; /* clicks land on the card (open player) */
+}
+
+.event-meta .event-title,
+.event-meta .event-sub {
+    text-shadow: 0 1px 2px rgba(0, 0, 0, 0.9);
+}
+
+/* Muted grey is unreadable over video: lift the sub-line on overlaid cards */
+.event-meta .event-sub { color: #c6cdd9; }
+
+.event-title {
+    font-size: 12px;
+    font-weight: 600;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.event-sub {
+    font-size: 11px;
+    color: var(--muted);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+/* ---- AI event descriptions: the threat verdict and what the LLM saw. ----
+   Cameras without the feature never render these, so there is no empty shell. */
+.ai-dot {
+    display: inline-block;
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    margin-left: 5px;
+    vertical-align: baseline;
+    flex: 0 0 auto;
+}
+
+.ai-green { background: var(--ok); }
+.ai-yellow { background: var(--warn, #d9a441); }
+.ai-red { background: var(--err); }
+
+/* The description banner in the event players (Events page + quick view):
+   a quiet card with the verdict chip leading the sentence. */
+/* What the model listed as visible, above its prose: a row of small words, each
+   one a search for itself. Deliberately quieter than the description — an
+   inventory is for scanning and for clicking, not for reading. */
+.event-objects {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px;
+    margin: 6px 0 0;
+}
+
+.event-object {
+    padding: 1px 8px;
+    font-size: 11px;
+    letter-spacing: 0.2px;
+    color: var(--muted);
+    text-transform: lowercase;
+}
+
+.event-object:hover { color: var(--accent); border-color: var(--accent); }
+
+.event-ai {
+    display: flex;
+    align-items: flex-start;
+    gap: 8px;
+    padding: 8px 10px;
+    margin: 6px 0;
+    border: 1px solid var(--line);
+    border-left: 3px solid var(--line);
+    border-radius: 6px;
+    background: var(--panel-2, var(--panel));
+    font-size: 12px;
+    line-height: 1.45;
+}
+
+.event-ai.ai-green { border-left-color: var(--ok); }
+.event-ai.ai-yellow { border-left-color: var(--warn, #d9a441); }
+.event-ai.ai-red { border-left-color: var(--err); }
+
+.ai-level-chip {
+    flex: 0 0 auto;
+    font-size: 10px;
+    font-weight: 700;
+    letter-spacing: 0.5px;
+    padding: 1px 7px;
+    border-radius: 9px;
+    color: var(--bg);
+    margin-top: 1px;
+}
+
+.ai-level-chip.ai-green { background: var(--ok); }
+.ai-level-chip.ai-yellow { background: var(--warn, #d9a441); }
+.ai-level-chip.ai-red { background: var(--err); }
+
+.event-ai-text { color: var(--text); flex: 1; }
+
+/* Model still working: quieter voice than a finished description. */
+.event-ai-pending { color: var(--muted); font-style: italic; }
+
+/* Mobile only: the description folds to one line behind "more…" so it cannot
+   crowd the player off a phone screen. */
+.ai-more {
+    display: none;
+    flex: 0 0 auto;
+    border: 0;
+    padding: 0;
+    background: none;
+    color: var(--accent);
+    font: inherit;
+    font-size: 12px;
+    cursor: pointer;
+}
+
+@media (max-width: 760px) {
+    .event-ai-text.ai-clamped {
+        display: -webkit-box;
+        -webkit-line-clamp: 1;
+        -webkit-box-orient: vertical;
+        overflow: hidden;
+    }
+
+    .event-ai .ai-more { display: inline; }
+}
+
+.event-dismiss {
+    position: absolute;
+    top: 4px;
+    right: 4px;
+    background: rgba(0, 0, 0, 0.55);
+    border-radius: 6px;
+    padding: 1px 6px;
+}
+
+.event-dismiss:hover { background: rgba(0, 0, 0, 0.8); }
+
+/* Event history panel (reuses the campanel chrome).
+   Fixed height: content changes (polling, expanding days, switching tabs) must
+   scroll inside the panel, never resize the popup itself. */
+/* Events history panel: wider than the settings dialog — the rows carry thumbnails */
+.events-panel {
+    height: min(92vh, 1020px);
+    width: min(780px, 96vw);
+}
+
+.events-head-title {
+    font-size: 15px;
+    white-space: nowrap;
+}
+
+/* "last 24 hours" / the picked date, right under the title */
+.events-head-sub {
+    font-size: 11px;
+    font-weight: 400;
+    letter-spacing: 0;
+    color: var(--muted);
+    white-space: nowrap;
+}
+
+.events-panel-scroll {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+}
+
+.event-filter {
+    background: var(--bg);
+    color: var(--text);
+    border: 1px solid var(--line);
+    border-radius: 6px;
+    font-size: 12px;
+    padding: 3px 6px;
+    max-width: 130px;
+}
+
+/* Native date picker, matched to the dark chrome */
+.event-date-input {
+    color-scheme: dark;
+    max-width: 150px;
+}
+
+.event-day-count {
+    color: var(--muted);
+    font-weight: 400;
+    margin-left: 6px;
+}
+
+/* Day header stays visible while its rows scroll under the pinned panel head */
+.events-day { padding-top: 0; }
+
+.events-day-head {
+    position: sticky;
+    top: 26px;
+    z-index: 1;
+    background: var(--panel-2);
+    padding: 10px 12px 6px;
+    margin: 0 -12px 6px;
+    border-radius: 10px 10px 0 0;
+}
+
+.event-row {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 6px;
+    border-radius: 10px;
+    cursor: pointer;
+    transition: background 0.12s ease;
+}
+
+.event-row:hover { background: var(--bg); }
+.event-row.reviewed { opacity: 0.55; }
+.event-row.reviewed:hover { opacity: 0.85; }
+
+/* Thumbnail tile: fixed 16:9 box, contain-fit so ultrawide frames never crop */
+.event-row-thumb {
+    position: relative;
+    width: 150px;
+    aspect-ratio: 16 / 9;
+    flex: 0 0 auto;
+    border-radius: 8px;
+    overflow: hidden;
+    background: #000;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+
+.event-row-thumb img {
+    width: 100%;
+    height: 100%;
+    object-fit: contain;
+    display: block;
+}
+
+.event-row-dur {
+    position: absolute;
+    right: 4px;
+    bottom: 4px;
+    font-size: 10px;
+    font-weight: 600;
+    color: #fff;
+    background: rgba(0, 0, 0, 0.7);
+    border-radius: 4px;
+    padding: 0 5px;
+    font-variant-numeric: tabular-nums;
+}
+
+.event-row-main {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    min-width: 0;
+    flex: 1;
+}
+
+.event-row-main .event-title { font-size: 13px; }
+
+/* Unreviewed marker, same language as the strip's filter dot */
+.event-new-dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: var(--accent);
+    box-shadow: 0 0 6px var(--accent);
+    flex: 0 0 auto;
+}
+
+.rec-types-row { align-items: flex-start; }
+.rec-types-row .stream-options { justify-content: flex-end; }
+
+/* Playback modal */
+.player-backdrop {
+    display: block;
+    position: fixed;
+    inset: 0;
+    background: rgba(0, 0, 0, 0.7);
+    z-index: 62;
+}
+
+.event-player {
+    position: fixed;
+    inset: 0;
+    margin: auto;
+    width: min(1440px, calc(100vw - 32px));
+    height: fit-content;
+    max-height: calc(100vh - 32px);
+    max-height: calc(100dvh - 32px);
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: 12px;
+    z-index: 63;
+    display: flex;
+    flex-direction: column;
+    padding: 12px;
+    gap: 10px;
+    box-shadow: 0 18px 60px rgba(0, 0, 0, 0.6);
+}
+
+.event-player-head {
+    display: flex;
+    align-items: flex-start;
+    gap: 8px;
+}
+
+.event-player-title {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    flex: 1;
+    min-width: 0;
+}
+
+.event-player-title .event-title { font-size: 15px; }
+
+/* The player's sub-line can carry the "recording…" chip — wrap on narrow
+   widths rather than ellipsize it away. */
+.event-player-title .event-sub { white-space: normal; }
+
+/* The player sub-line's "recording…": solid amber, not the translucent warn
+   style — it must register before the user judges the clip incomplete. */
+.ev-rec-inline {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    padding: 0 6px;
+    border-radius: 3px;
+    background: #e8b054;
+    color: #201607;
+    font-weight: 650;
+}
+
+.ev-rec-dot {
+    flex: none;
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: #b3261e;
+    animation: ev-rec-blink 1.2s ease-in-out infinite;
+}
+
+@keyframes ev-rec-blink { 50% { opacity: .3; } }
+
+/* Wraps the clip so digital zoom has a clipping frame (same role as a tile) */
+.event-player-media {
+    position: relative;
+    width: 100%;
+    display: flex;
+    flex: 1 1 auto;
+    min-height: 0;
+    background: #000;
+    border-radius: 8px;
+    overflow: hidden;
+}
+
+/* Playback-failure overlay (neolink.js eventPlayer onerror): a fetch the server
+   refused leaves the <video> silently black otherwise. */
+.video-error {
+    position: absolute;
+    inset: 0;
+    /* The player's own controls stay reachable underneath: pressing play is
+       the first thing anyone tries. */
+    pointer-events: none;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    text-align: center;
+    padding: 16px 12%;
+    background: rgba(0, 0, 0, .72);
+    color: #e6b8b8;
+    font-size: .85rem;
+    line-height: 1.4;
+    z-index: 3;
+}
+
+.event-player video {
+    display: block;
+    width: 100%;
+    aspect-ratio: 16 / 9; /* stable modal size while media loads */
+    min-height: 0;
+    max-height: 100%;
+    object-fit: contain;
+    background: #000;
+    outline: none;
+}
+
+/* ---------- dedicated Events page (/events) ---------- */
+/* Master–detail: a scrollable recent-events list beside the selected clip.
+   Deep-linkable (/events/{camera}) so a phone push notification lands here. */
+.ev-page {
+    display: flex;
+    flex-direction: column;
+    height: 100vh;
+    height: 100dvh;
+    background: var(--bg);
+}
+
+.ev-toolbar { flex: 0 0 auto; }
+
+.ev-autoplay {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    font-size: 12px;
+    color: var(--muted);
+    cursor: pointer;
+    user-select: none;
+    white-space: nowrap;
+}
+.ev-autoplay input { cursor: pointer; margin: 0; }
+
+/* ---- multi-select delete: action bar, row checkboxes, confirm dialog ---- */
+/* Label and bar share one line; on narrow screens the bar wraps below. */
+.ev-search-row { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; margin: 10px 0 4px; padding-left: 10px; }
+.ev-search-row .ev-search { flex: 1 1 auto; min-width: 260px; }
+
+/* Phones: the "AI SEARCH" heading is what pushed the field onto a second row.
+   The magnifier (or sparkle, when a local model is configured) already sits
+   inside the field and says the same thing. */
+@media (max-width: 700px) {
+    .ev-search-row { gap: 0; flex-wrap: nowrap; padding-left: 0; }
+    .ev-search-row .ev-search-head { display: none; }
+    .ev-search-row .ev-search { min-width: 0; gap: 6px; padding: 6px 10px; }
+    .ev-search-hint { padding-left: 10px; }
+}
+.ev-search-head { display: flex; align-items: center; gap: 7px; flex: 0 0 auto; }
+.ev-search-title { font-size: 12px; font-weight: 600; letter-spacing: .08em; text-transform: uppercase; color: var(--muted); white-space: nowrap; }
+.ev-search-hint { font-size: 12px; color: var(--muted); margin: 4px 0 2px; padding-left: 10px; max-width: 640px; }
+
+/* Camera multi-select: chip button + checkbox popover. */
+.cam-filter { position: relative; display: inline-flex; }
+.cam-filter > .chip { display: inline-flex; align-items: center; gap: 5px; }
+.cam-filter-backdrop { position: fixed; inset: 0; z-index: 39; }
+.cam-filter-menu {
+    position: absolute;
+    top: calc(100% + 6px);
+    left: 0;
+    z-index: 40;
+    background: var(--panel-2);
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    padding: 8px 12px;
+    min-width: 180px;
+    max-height: 60vh;
+    overflow: auto;
+    display: flex;
+    flex-direction: column;
+    gap: 7px;
+    box-shadow: 0 10px 28px rgba(0, 0, 0, .5);
+}
+.cam-filter-menu label { display: flex; align-items: center; gap: 8px; font-size: 13px; cursor: pointer; white-space: nowrap; }
+.cam-filter-menu .cam-filter-all { padding-bottom: 7px; border-bottom: 1px solid var(--line); }
+
+/* Phones: the toolbar scrolls sideways (overflow-x: auto), which clips an
+   absolute popover to the strip. A fixed bottom sheet escapes the clip. */
+@media (max-width: 700px) {
+    .cam-filter-menu {
+        position: fixed;
+        top: auto;
+        left: 0;
+        right: 0;
+        bottom: 0;
+        border-radius: 12px 12px 0 0;
+        padding: 12px 16px calc(12px + env(safe-area-inset-bottom));
+        max-height: 60vh;
+    }
+    .cam-filter-menu label { font-size: 15px; padding: 4px 0; }
+}
+.ev-search {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex: 0 0 auto;
+    padding: 6px 14px;
+    border-bottom: 1px solid var(--line);
+}
+.ev-search-icon { display: inline-flex; color: var(--muted); flex: 0 0 auto; }
+.ev-search-icon.ai { color: var(--accent); }
+.ev-search-box { position: relative; flex: 1 1 auto; min-width: 0; max-width: 520px; display: flex; }
+.ev-search-box .ev-search-input { max-width: none; width: 100%; padding-right: 30px; }
+.ev-search-clear {
+    position: absolute;
+    right: 6px;
+    top: 50%;
+    transform: translateY(-50%);
+    display: inline-flex;
+    padding: 3px;
+    background: none;
+    border: none;
+    color: var(--muted);
+    cursor: pointer;
+}
+.ev-search-clear:hover { color: var(--text); }
+.ev-search-input {
+    flex: 1 1 auto;
+    min-width: 0;
+    max-width: 520px;
+    background: var(--panel-2, var(--panel));
+    color: var(--text);
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    padding: 6px 10px;
+    font-size: 13px;
+}
+.ev-search-input:focus { outline: none; border-color: var(--accent); }
+.ev-search-info {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
+    flex: 0 0 auto;
+    padding: 4px 14px 6px;
+    border-bottom: 1px solid var(--line);
+    font-size: 12px;
+    color: var(--muted);
+}
+.ev-search-chips { color: var(--text); }
+.ev-search-ai { display: inline-flex; align-items: center; gap: 4px; color: var(--accent); }
+.ev-search-miss { color: #d9a13c; }
+.ev-more, .ev-end { padding: 12px; text-align: center; font-size: 12px; color: var(--muted); }
+.ev-more { display: block; width: 100%; background: none; border: none; cursor: pointer; }
+.ev-more:hover { color: var(--text); }
+
+.ev-selbar {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex: 0 0 auto;
+    padding: 8px 14px;
+    border-bottom: 1px solid var(--line);
+    background: color-mix(in srgb, var(--panel-2) 55%, transparent);
+}
+
+.ev-selall {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 13px;
+    font-weight: 600;
+    cursor: pointer;
+    user-select: none;
+}
+
+.ev-selall input { cursor: pointer; }
+
+/* Delete button reads danger; disabled when nothing is picked */
+.ev-del-btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    color: var(--err);
+    border-color: color-mix(in srgb, var(--err) 45%, transparent);
+}
+.ev-del-btn:not(:disabled):hover {
+    background: color-mix(in srgb, var(--err) 14%, transparent);
+    color: var(--err);
+}
+
+.event-row-check {
+    flex: 0 0 auto;
+    width: 17px;
+    height: 17px;
+    cursor: pointer;
+    accent-color: var(--accent);
+}
+
+.event-row.picked { background: var(--accent-soft); }
+.event-row.picked:hover { background: color-mix(in srgb, var(--accent) 22%, transparent); }
+
+/* Confirmation dialog: centered modal with the deletion summary */
+.ev-del-backdrop {
+    position: fixed;
+    inset: 0;
+    z-index: 80;
+    background: rgba(0, 0, 0, 0.45);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 12px;
+}
+
+.ev-del-dialog {
+    width: min(420px, calc(100vw - 24px));
+    max-height: calc(100dvh - 24px);
+    overflow-y: auto;
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: 14px;
+    box-shadow: var(--shadow);
+    padding: 16px 18px;
+}
+
+.ev-del-title {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    font-size: 11px;
+    font-weight: 700;
+    letter-spacing: 0.14em;
+    color: var(--err);
+    margin-bottom: 12px;
+}
+.ev-del-title span { display: inline-flex; align-items: center; gap: 7px; }
+
+.ev-del-lead { font-size: 14px; line-height: 1.45; margin: 0 0 10px; }
+
+.ev-del-facts {
+    list-style: none;
+    margin: 0 0 10px;
+    padding: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+    max-height: 160px;
+    overflow-y: auto;
+}
+.ev-del-facts li {
+    display: flex;
+    justify-content: space-between;
+    font-size: 12.5px;
+    padding: 3px 8px;
+    border-radius: 6px;
+    background: color-mix(in srgb, var(--panel-2) 60%, transparent);
+}
+.ev-del-cam { font-weight: 600; }
+.ev-del-n { color: var(--muted); font-variant-numeric: tabular-nums; }
+
+.ev-del-warn {
+    font-size: 12px;
+    color: var(--err);
+    margin: 10px 0 0;
+}
+.ev-del-skip { color: #e8b054; }
+.ev-del-err { color: var(--err); }
+
+.ev-del-actions {
+    display: flex;
+    justify-content: flex-end;
+    gap: 8px;
+    margin-top: 14px;
+}
+
+.ev-del-confirm {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    background: var(--err);
+    color: #fff;
+    border-color: transparent;
+}
+.ev-del-confirm:not(:disabled):hover { filter: brightness(1.1); }
+.ev-del-confirm:disabled { opacity: 0.5; cursor: default; }
+
+/* Events ⇄ Live segmented toggle in the toolbar */
+.ev-switch {
+    display: inline-flex;
+    border: 1px solid var(--line);
+    border-radius: 999px;
+    overflow: hidden;
+    background: var(--panel-2);
+}
+.ev-switch-opt {
+    padding: 4px 14px;
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--muted);
+    text-decoration: none;
+    cursor: pointer;
+}
+
+/* The options render as <span>/<a> (page links) or <button> (mode switch) —
+   the button form sheds the UA chrome. `.ev-switch-opt.active` outranks this,
+   so the accent fill still applies. */
+button.ev-switch-opt {
+    border: none;
+    background: none;
+    font-family: inherit;
+    line-height: inherit;
+}
+.ev-switch-opt.active { background: var(--accent); color: #fff; }
+.ev-switch-opt:not(.active):hover { color: var(--fg); }
+
+.ev-body {
+    flex: 1;
+    min-height: 0;
+    display: flex;
+    gap: 14px;
+    padding: 14px;
+}
+
+/* The list: fixed-width column on desktop, full width on phones */
+.ev-list {
+    flex: 0 0 400px;
+    min-width: 0;
+    overflow-y: auto;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    padding-right: 4px;
+}
+
+.ev-day { margin-bottom: 6px; }
+.ev-day-head {
+    position: sticky;
+    top: 0;
+    z-index: 1;
+    background: var(--bg);
+    padding: 8px 4px 4px;
+    font-size: 10px;
+    letter-spacing: 1.5px;
+    color: var(--muted);
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+
+.ev-list .event-row.selected {
+    background: var(--accent-soft);
+    outline: 1px solid color-mix(in srgb, var(--accent) 45%, transparent);
+}
+.ev-row-live { flex: 0 0 auto; color: var(--muted); }
+.ev-row-live:hover { color: var(--accent); }
+
+/* The detail pane: the selected event's clip + transport */
+.ev-detail {
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: 12px;
+    padding: 12px;
+    overflow: hidden;
+}
+
+.ev-detail .event-player-media { flex: 1; min-height: 0; }
+.ev-detail #ev-video {
+    display: block;
+    width: 100%;
+    height: 100%;
+    max-height: calc(100vh - 220px);
+    object-fit: contain;
+    background: #000;
+    outline: none;
+}
+
+.ev-back { display: none; } /* only shown when the list is hidden (phones) */
+.event-player-head > .chip { flex: 0 0 auto; align-self: center; white-space: nowrap; }
+
+.ev-detail-empty {
+    margin: auto;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 10px;
+    color: var(--muted);
+    font-size: 13px;
+}
+.ev-detail-empty-icon { opacity: 0.5; }
+
+/* Phones: single column. The list fills the screen; picking an event slides the
+   detail over it (the ‹ back button returns to the list). */
+@media (max-width: 760px) {
+    .ev-body { padding: 8px; gap: 0; }
+    .ev-list { flex: 1 1 auto; padding-right: 0; }
+    .ev-list .event-row-thumb { width: 108px; }
+    .ev-list .ev-row-live { display: none; } /* the detail's Go-live is enough */
+    .ev-detail { display: none; }             /* hidden until an event is picked */
+
+    .ev-page.has-selection .ev-list { display: none; }
+    .ev-page.has-selection .ev-detail {
+        display: flex;
+        border: none;
+        border-radius: 0;
+        padding: 8px;
+    }
+    .ev-detail .ev-back { display: inline-flex; }
+    .ev-detail #ev-video { max-height: calc(100dvh - 200px); }
+}
+
+/* Quick view: temporary pop-up live player (sidebar ⛶) — the layout underneath
+   is untouched; closing it simply returns to whatever was on screen. */
+.quick-view {
+    position: fixed;
+    inset: 0;
+    margin: auto;
+    width: min(1280px, calc(100vw - 32px));
+    height: fit-content;
+    max-height: calc(100vh - 32px);
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: 12px;
+    z-index: 63;
+    display: flex;
+    flex-direction: column;
+    padding: 12px;
+    gap: 10px;
+    box-shadow: 0 18px 60px rgba(0, 0, 0, 0.6);
+}
+
+.quick-view-media {
+    position: relative;
+    width: 100%;
+    aspect-ratio: 16 / 9; /* stable pop-up size while the stream connects */
+    max-height: calc(100vh - 140px);
+    background: #000;
+    border-radius: 8px;
+    overflow: hidden;
+}
+
+.quick-view-media video {
+    width: 100%;
+    height: 100%;
+    object-fit: contain;
+    background: #000;
+}
+
+/* ---------- digital zoom (theater/maximized tiles, fullscreen, quick view) ---------- */
+
+/* Vertical glass pill hugging the right edge; appears while hovering a
+   zoomable surface and stays pinned while zoomed. JS (zoomInit) owns all
+   state — wheel zooms at the cursor, drag pans, double-click restores 1:1. */
+.zoom-hud {
+    position: absolute;
+    right: 10px;
+    top: 50%;
+    transform: translateY(-50%);
+    z-index: 6;
+    display: none;
+    flex-direction: column;
+    align-items: center;
+    gap: 4px;
+    padding: 8px 5px;
+    background: color-mix(in srgb, var(--panel) 82%, transparent);
+    border: 1px solid var(--line);
+    border-radius: 999px;
+    backdrop-filter: blur(6px);
+    transition: opacity 0.35s ease;
+}
+
+/* Desktop: while the pill is shown it sits GHOSTED on the video — full
+   strength only when the mouse is actually on it. One rule for every zoom
+   surface (live tiles, quick view, event pop-up, Events page, timeline
+   monitors). Scoped to hover-capable devices: touch keeps its own opacity
+   (the tap-revealed 0.8 below) and the hud-idle fade. */
+@media (hover: hover) {
+    .zoom-hud { opacity: 0.55; }
+    .zoom-hud:hover, .zoom-hud:focus-within { opacity: 1; }
+}
+
+/* Touch: JS fades the on-video pills after a moment of stillness so they stop
+   covering the picture — any tap on the video (or a pinch) brings them back.
+   The camera rail joins the zoom HUD here; a rail in use (.open: pad out or
+   talking) is exempted by the JS sweep. */
+.cam-rail.hud-idle {
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity 0.35s ease;
+}
+
+.zoom-hud.hud-idle {
+    opacity: 0;
+    pointer-events: none;
+}
+
+.zoom-on:hover .zoom-hud,
+.zoom-on.zoomed .zoom-hud,
+.tile:fullscreen:hover .zoom-hud,
+.tile:fullscreen.zoomed .zoom-hud {
+    display: flex;
+}
+
+/* Video-player chrome: on the maximized/fullscreen tile a STILL cursor means
+   "watching, not operating" — JS marks the tile ui-idle after a moment of no
+   mouse movement, and every on-video control fades until the mouse moves
+   (hover alone can't do this: a cursor parked on the video keeps :hover true
+   forever). The extra :hover/.open/.zoomed variants out-rank the rules that
+   would otherwise keep each control shown. Touch never gets ui-idle (no
+   cursor); its chrome is governed by the tap-revealed rules above. */
+.tile.ui-idle .tile-bar,
+.tile.ui-idle:hover .tile-bar,
+.tile.ui-idle .cam-rail,
+.tile.ui-idle .cam-rail:hover,
+.tile.ui-idle .cam-rail:focus-within,
+.tile.ui-idle .cam-rail.open {
+    opacity: 0;
+    pointer-events: none;
+}
+
+.tile.ui-idle.zoom-on:hover .zoom-hud,
+.tile.ui-idle.zoom-on.zoomed .zoom-hud,
+.tile.ui-idle:fullscreen:hover .zoom-hud,
+.tile.ui-idle:fullscreen.zoomed .zoom-hud {
+    display: none;
+}
+
+.tile.ui-idle,
+.tile.ui-idle video {
+    cursor: none; /* the player look: idle hides the pointer too */
+}
+
+/* The camera rail (PTZ + mic) is hover-revealed on desktop like the rest of
+   the on-video chrome (it used to sit ghosted on the video permanently).
+   Touch keeps it always visible — there is no hover to reveal it with. */
+@media (hover: hover) {
+    .tile:not(:hover):not(:fullscreen) .cam-rail {
+        opacity: 0;
+        pointer-events: none;
+    }
+}
+
+/* Zoomable surfaces keep their video on its own compositor layer from the
+   start: promoting it only when the first zoom transform lands can leave a
+   PAUSED video's stale frame unpainted — black until a mouse drag forces a
+   repaint. Cheap: zoom-on only ever marks the active surface (maximized tile,
+   quick view, event player), never the whole wall. */
+.zoom-on video,
+.tile:fullscreen video {
+    will-change: transform;
+}
+
+/* A player handed fullscreen (see detect.js: the native button fullscreens the
+   bare <video>, which would leave the boxes behind on the page) has to fill the
+   screen — its normal height cap is sized for sitting inside a dialog. */
+.event-player-media:fullscreen {
+    max-height: none;
+    height: 100%;
+    border-radius: 0;
+}
+
+.event-player-media:fullscreen video {
+    width: 100%;
+    height: 100%;
+    object-fit: contain;
+}
+
+.zoom-badge {
+    font-size: 10px;
+    font-weight: 700;
+    min-width: 34px;
+    text-align: center;
+    color: var(--muted);
+    user-select: none;
+}
+
+.zoomed .zoom-badge { color: var(--accent); }
+
+.zoom-btn { font-size: 14px; }
+
+.zoom-reset {
+    font-size: 9px;
+    font-weight: 700;
+    letter-spacing: 0.5px;
+}
+
+
+/* While zoomed the frame pans with a drag */
+.zoomed video { cursor: grab; }
+.zoom-panning video { cursor: grabbing; }
+.zoom-panning { user-select: none; }
+
+/* ------------------------------------------------------------ timeline page */
+
+.tl-page {
+    display: flex;
+    flex-direction: column;
+    height: 100vh;
+    background: var(--bg);
+    color: var(--text);
+    overflow: hidden;
+}
+
+.tl-toolbar { flex: 0 0 auto; gap: 8px; }
+
+/* Related controls cluster inside a subtle pill so the toolbar reads as a few
+   groups (date · transport · speed · view) instead of one long button run. */
+.tl-group {
+    display: inline-flex;
+    align-items: center;
+    gap: 3px;
+    padding: 2px;
+    border-radius: 999px;
+    background: color-mix(in srgb, var(--panel-2) 60%, transparent);
+    border: 1px solid color-mix(in srgb, var(--line) 60%, transparent);
+}
+.tl-group .tool-btn, .tl-group .chip { border: none; }
+
+/* Pushes the view group (clock/zoom/help) to the right edge */
+.tool-spacer { flex: 1 1 auto; }
+
+/* The calendar-dropdown date button: the day, flanked by prev/next chevrons */
+.tl-date-btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 13px;
+    font-weight: 600;
+    padding: 5px 10px;
+}
+.tl-date-btn .tl-date-text { font-variant-numeric: tabular-nums; }
+.tl-date-btn.active { color: var(--accent); background: var(--accent-soft); }
+
+/* Day-selector chevrons stay quiet so the transport control can stand out */
+.tl-daynav { color: var(--muted); }
+.tl-daynav:hover:not(:disabled) { color: var(--text); }
+.tl-daynav:disabled { opacity: 0.35; cursor: default; }
+
+/* ---- calendar popover: pick a day, footage days highlighted ---- */
+.tl-cal-backdrop { position: fixed; inset: 0; z-index: 60; }
+.tl-cal {
+    position: absolute;
+    top: 46px;
+    left: 12px;
+    z-index: 61;
+    width: 272px;
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: 12px;
+    box-shadow: 0 18px 50px rgba(0, 0, 0, 0.55);
+    padding: 10px;
+    animation: talk-overlay-in 0.14s ease;
+}
+.tl-cal-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: 8px;
+}
+.tl-cal-month { font-size: 13px; font-weight: 700; }
+.tl-cal-grid {
+    display: grid;
+    grid-template-columns: repeat(7, 1fr);
+    gap: 2px;
+}
+.tl-cal-dow {
+    font-size: 10px;
+    font-weight: 700;
+    color: var(--muted);
+    text-align: center;
+    padding-bottom: 4px;
+}
+.tl-cal-day {
+    position: relative;
+    aspect-ratio: 1;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    border: none;
+    background: none;
+    color: var(--text);
+    font-size: 12px;
+    font-variant-numeric: tabular-nums;
+    border-radius: 8px;
+    cursor: pointer;
+}
+.tl-cal-day.empty { cursor: default; }
+.tl-cal-day:disabled { color: color-mix(in srgb, var(--muted) 45%, transparent); cursor: default; }
+.tl-cal-day:not(:disabled):hover { background: var(--accent-soft); }
+/* A dot under the number marks days that hold footage — visible at a glance */
+.tl-cal-day.has::after {
+    content: "";
+    position: absolute;
+    bottom: 3px;
+    width: 4px;
+    height: 4px;
+    border-radius: 50%;
+    background: var(--accent);
+}
+.tl-cal-day.today { outline: 1px solid color-mix(in srgb, var(--muted) 55%, transparent); }
+.tl-cal-day.sel {
+    background: var(--accent);
+    color: #0a1424;
+    font-weight: 700;
+}
+.tl-cal-day.sel.has::after { background: #0a1424; }
+.tl-cal-foot {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-top: 8px;
+    padding-top: 8px;
+    border-top: 1px solid var(--line);
+}
+.tl-cal-legend { display: inline-flex; align-items: center; gap: 6px; font-size: 11px; color: var(--muted); }
+.tl-cal-dot { width: 5px; height: 5px; border-radius: 50%; background: var(--accent); }
+
+/* The play/pause transport: a solid accent pill with a filled glyph — nothing
+   like the thin date chevrons, so the two can't be confused again. */
+.tl-play {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 7px;
+    min-height: 32px;
+    padding: 5px 16px;
+    border: 1px solid transparent;
+    border-radius: 999px;
+    background: var(--accent);
+    color: #0a1424;
+    font-size: 13px;
+    font-weight: 700;
+    cursor: pointer;
+    white-space: nowrap;
+}
+
+.tl-play:hover { filter: brightness(1.12); }
+
+.tl-play.playing {
+    background: var(--accent-soft);
+    border-color: color-mix(in srgb, var(--accent) 45%, transparent);
+    color: var(--accent);
+}
+
+.tl-clock {
+    font-size: 15px;
+    font-weight: 700;
+    font-variant-numeric: tabular-nums;
+    color: var(--accent);
+}
+
+.tl-clock-btn { cursor: text; border-radius: 6px; padding: 1px 6px; }
+.tl-clock-btn:hover { background: var(--accent-soft); }
+
+/* The clock swapped for direct input: type 16:39:12, Enter, you're there. */
+.tl-clock-edit {
+    width: 108px;
+    background: var(--bg);
+    border: 1px solid var(--accent);
+    border-radius: 6px;
+    color: var(--accent);
+    font-size: 15px;
+    font-weight: 700;
+    font-variant-numeric: tabular-nums;
+    text-align: center;
+    padding: 1px 6px;
+    outline: none;
+}
+
+/* Fine-step transport buttons: compact, tabular, clearly a cluster */
+.tl-step {
+    min-width: 34px;
+    padding: 5px 8px;
+    font-size: 12px;
+    font-variant-numeric: tabular-nums;
+}
+
+.tl-zoom-chip { font-variant-numeric: tabular-nums; white-space: nowrap; }
+
+.tl-keys-btn { min-width: 30px; font-weight: 700; color: var(--muted); }
+.tl-keys-btn:hover, .tl-keys-btn.active { color: var(--accent); }
+
+/* Keyboard cheat-sheet popover */
+.tl-keys-backdrop {
+    position: fixed;
+    inset: 0;
+    z-index: 70;
+    background: rgba(0, 0, 0, 0.35);
+}
+
+.tl-keys-panel {
+    position: absolute;
+    top: 62px;
+    right: 16px;
+    width: min(360px, calc(100vw - 24px));
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: 12px;
+    padding: 14px 16px;
+    box-shadow: var(--shadow);
+}
+
+.tl-keys-title {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    font-size: 11px;
+    letter-spacing: 2px;
+    color: var(--muted);
+    margin-bottom: 10px;
+}
+
+.tl-keys-grid {
+    display: grid;
+    grid-template-columns: auto 1fr;
+    gap: 7px 14px;
+    font-size: 12px;
+}
+
+.tl-keys-grid span:nth-child(odd) {
+    color: var(--accent);
+    font-family: Consolas, "Cascadia Mono", monospace;
+    white-space: nowrap;
+}
+
+.tl-keys-hint { margin-top: 10px; }
+
+/* ---- footage export dialog: camera, range, format cards, download ---- */
+.tl-export-panel {
+    /* centered modal (the keys panel it borrows from is corner-anchored, which
+       breaks when the studio layout docks the toolbar at the bottom) */
+    position: fixed;
+    inset: 0;
+    margin: auto;
+    height: fit-content;
+    width: min(440px, calc(100vw - 24px));
+    max-height: calc(100dvh - 24px);
+    overflow-y: auto;
+}
+
+/* Little uppercase captions so each row reads as what it is at a glance */
+.tl-export-sec {
+    font-size: 10px;
+    font-weight: 700;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    color: var(--muted);
+    margin: 2px 0 6px;
+}
+
+.tl-export-cams {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    margin-bottom: 14px;
+}
+
+.tl-export-range {
+    display: flex;
+    gap: 10px;
+    align-items: center;
+    flex-wrap: wrap;
+    margin-bottom: 8px;
+}
+
+.tl-export-range label {
+    display: inline-flex;
+    align-items: center;
+    gap: 7px;
+    font-size: 12px;
+    color: var(--muted);
+}
+
+.tl-export-range .tl-clock-edit { width: 86px; }
+
+.tl-export-arrow { color: var(--muted); }
+
+/* Live length of the chosen range — instant feedback while typing times */
+.tl-export-window {
+    font-size: 11px;
+    font-variant-numeric: tabular-nums;
+    color: var(--accent);
+    background: var(--accent-soft);
+    border-radius: 999px;
+    padding: 2px 9px;
+    white-space: nowrap;
+}
+
+.tl-export-presets {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    margin-bottom: 14px;
+}
+
+/* Format picker: two self-explanatory cards instead of bare chips */
+.tl-export-format {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 8px;
+    margin-bottom: 12px;
+}
+
+.tl-export-card {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    text-align: left;
+    padding: 9px 11px;
+    border-radius: 10px;
+    border: 1px solid var(--line);
+    background: color-mix(in srgb, var(--panel-2) 55%, transparent);
+    color: var(--text);
+    cursor: pointer;
+}
+
+.tl-export-card.sel {
+    border-color: color-mix(in srgb, var(--accent) 65%, transparent);
+    background: var(--accent-soft);
+}
+
+.tl-export-card:disabled {
+    opacity: 0.55;
+    cursor: default;
+}
+
+.tl-export-card-title { font-size: 12px; font-weight: 700; }
+
+.tl-export-card-sub {
+    font-size: 10.5px;
+    color: var(--muted);
+    line-height: 1.4;
+}
+
+.tl-export-card.sel .tl-export-card-sub {
+    color: color-mix(in srgb, var(--text) 82%, transparent);
+}
+
+/* Phones: the cards stack — side by side their captions get too cramped */
+@media (max-width: 480px) {
+    .tl-export-format { grid-template-columns: 1fr; }
+}
+
+.tl-export-est {
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+    font-size: 12px;
+    min-height: 18px;
+}
+
+.tl-export-warn { color: #e8b054; }
+.tl-export-err { color: var(--err); }
+
+.tl-export-actions {
+    display: flex;
+    justify-content: flex-end;
+    align-items: center;
+    gap: 8px;
+    margin-top: 12px;
+}
+
+.tl-export-go {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+}
+
+.tl-export-go:disabled {
+    opacity: 0.45;
+    cursor: default;
+    filter: none;
+}
+
+/* Adaptive playback: shown while the clock is held back for lagging streams */
+.tl-lag {
+    font-size: 10px;
+    font-weight: 700;
+    letter-spacing: 0.06em;
+    color: #e8b054;
+    border: 1px solid color-mix(in srgb, #e8b054 40%, transparent);
+    background: color-mix(in srgb, #e8b054 9%, transparent);
+    border-radius: 999px;
+    padding: 2px 8px;
+    white-space: nowrap;
+    animation: talk-blink 1.4s ease-in-out infinite;
+}
+
+/* Not lagging: keep the pill's space (no toolbar reflow when it comes and goes),
+   just don't show it. */
+.tl-lag-idle {
+    visibility: hidden;
+    animation: none;
+}
+
+.tl-cams {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    padding: 8px 12px 0;
+    align-items: center;
+}
+
+/* EVENTS row: a legend that filters. Each chip carries its category's mark colour
+   (set inline, so it can never drift from the colour drawn on the lanes); the
+   swatch keeps that colour even when the chip is switched off, so the row still
+   reads as a legend while filtering. */
+.tl-ev-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+}
+
+.tl-ev-swatch {
+    width: 9px;
+    height: 9px;
+    border-radius: 2px;
+    flex: 0 0 auto;
+}
+
+/* The scrubbing area. Its height is the user's to set (the divider below/above
+   it drags): natural size until then, and whatever was dragged after — the
+   tracks inside share it, so a taller board means thicker, easier-to-hit lanes. */
+.tl-board {
+    display: flex;
+    flex-direction: column;
+    padding: 10px 12px;
+    gap: 0;
+    flex: 0 0 auto;
+    /* Scroll when the tracks outgrow a dragged-short (or studio-capped) board —
+       and never sideways: ruler and cursor labels poke a few px past the right
+       edge at some zoom positions, and overflow-y:auto alone silently turns
+       overflow-x into auto as well (CSS computed-value rule), so a horizontal
+       scrollbar flashed in and out under the tracks while zooming/panning,
+       jolting the board by its height. The stable gutter keeps lane widths
+       constant when the vertical scrollbar appears with many cameras. */
+    overflow-y: auto;
+    overflow-x: hidden;
+    scrollbar-gutter: stable;
+}
+
+/* Names beside lanes. Grows into a taller board so the tracks thicken with it,
+   but never shrinks below its natural size: a board dragged shorter than its
+   tracks scrolls instead of squashing them into slivers. */
+.tl-tracks { display: flex; flex: 1 0 auto; }
+
+.tl-names { display: flex; flex-direction: column; width: 110px; flex: 0 0 auto; }
+
+/* Name rows mirror the lanes exactly — same 26px floor, same growth, same 2px
+   gap — so every camera's label stays level with its track at any board height. */
+.tl-name {
+    flex: 1 0 26px;
+    margin-bottom: 2px;
+    display: flex;
+    align-items: center;
+    font-size: 12px;
+    color: var(--muted);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    padding-right: 8px;
+}
+
+.tl-lanes {
+    position: relative;
+    display: flex;
+    flex-direction: column;
+    flex: 1;
+    min-width: 0;
+    cursor: crosshair;
+    touch-action: none; /* pointer-drag scrubbing on touch too */
+    user-select: none;
+}
+
+/* The whole day at a glance while the lanes are zoomed: footage blocks, the
+   red cursor and the draggable view-window rectangle. */
+.tl-overview {
+    position: relative;
+    flex: 0 0 auto;
+    height: 16px;
+    margin-bottom: 4px;
+    background: color-mix(in srgb, var(--panel) 70%, transparent);
+    border-radius: 4px;
+    overflow: hidden;
+    cursor: grab;
+}
+
+.tl-ov-cov {
+    position: absolute;
+    top: 5px;
+    height: 6px;
+    background: #35507e;
+    border-radius: 2px;
+    pointer-events: none;
+}
+
+.tl-ov-win {
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    min-width: 3px;
+    background: var(--accent-soft);
+    border: 1px solid color-mix(in srgb, var(--accent) 55%, transparent);
+    border-radius: 4px;
+    pointer-events: none;
+}
+
+.tl-ov-cursor {
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    width: 2px;
+    background: var(--err);
+    pointer-events: none;
+}
+
+/* Blank spacer opposite the overview strip + ruler. Fixed, and explicitly out
+   of the name rows' growth (it shares their class): let it flex like a real
+   row and it would both mis-size and shove every label off its lane. */
+.tl-name-head { flex: 0 0 46px; margin-bottom: 0; }
+
+.tl-ruler { position: relative; flex: 0 0 auto; height: 26px; }
+
+.tl-tick {
+    position: absolute;
+    top: 8px;
+    bottom: 0;
+    border-left: 1px solid var(--line);
+    font-size: 10px;
+    color: var(--muted);
+    padding-left: 3px;
+    pointer-events: none;
+    white-space: nowrap;
+}
+
+.tl-tick-minor {
+    position: absolute;
+    bottom: 0;
+    height: 6px;
+    border-left: 1px solid color-mix(in srgb, var(--line) 55%, transparent);
+    pointer-events: none;
+}
+
+/* JS-owned hover readout: a hairline plus a time bubble under the mouse */
+.tl-hover {
+    position: absolute;
+    top: 20px;
+    bottom: 0;
+    display: none;
+    pointer-events: none;
+    z-index: 4;
+}
+
+.tl-hover-line {
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    width: 1px;
+    background: color-mix(in srgb, var(--text) 30%, transparent);
+}
+
+.tl-hover-time {
+    position: absolute;
+    top: 2px;
+    left: 4px;
+    font-size: 10px;
+    font-variant-numeric: tabular-nums;
+    color: var(--text);
+    background: var(--panel-2);
+    border: 1px solid var(--line);
+    padding: 0 4px;
+    border-radius: 3px;
+    white-space: nowrap;
+}
+
+/* 26px is the floor, not the size: the lanes share every pixel the board is
+   dragged to, so the tracks thicken instead of leaving dead space below them. */
+.tl-lane {
+    position: relative;
+    flex: 1 0 26px;
+    background: color-mix(in srgb, var(--panel) 70%, transparent);
+    border-radius: 4px;
+    margin-bottom: 2px;
+    overflow: hidden;
+}
+
+/* Footage blocks and event marks are inset by proportion, not pixels — they
+   grow with the lane (at the 26px floor these land on the original 7/12 and
+   4/18 pixel geometry). */
+.tl-cov {
+    position: absolute;
+    top: 27%;
+    bottom: 27%;
+    background: #35507e;
+    border-radius: 2px;
+    pointer-events: none;
+}
+
+.tl-ev {
+    position: absolute;
+    top: 15%;
+    bottom: 15%;
+    min-width: 3px;
+    border-radius: 2px;
+    opacity: 0.95;
+}
+
+.tl-cursor {
+    position: absolute;
+    top: 20px; /* below the day-overview strip, which has its own mini cursor */
+    bottom: 0;
+    width: 2px;
+    background: var(--err);
+    pointer-events: none;
+    z-index: 3;
+}
+
+.tl-cursor-time {
+    position: absolute;
+    top: 0;
+    left: 4px;
+    font-size: 10px;
+    color: var(--err);
+    background: var(--bg);
+    padding: 0 3px;
+    border-radius: 3px;
+    white-space: nowrap;
+}
+
+/* Gentle discovery hint: zooming is the timeline's superpower and nothing
+   visible said so. Flows under the lanes, never intercepts the pointer, and
+   disappears the moment the user is zoomed in. Sits outside .tl-lanes so the
+   names column mirrors the lane column exactly (an extra row in one and not the
+   other would drift every label off its track as the board grows). */
+.tl-zoom-hint {
+    display: flex;
+    flex: 0 0 auto;
+    align-items: center;
+    justify-content: flex-end;
+    gap: 5px;
+    padding-top: 4px;
+    font-size: 10.5px;
+    color: var(--muted);
+    pointer-events: none;
+    user-select: none;
+}
+
+/* ---- Board divider: drag to trade height between the monitors and the tracks.
+   It rides the boundary in both layouts — under the board in the classic view
+   (monitors below), above the docked desk in studio (monitors above) — and the
+   drag itself is JS-owned so the tracks track the pointer without a round-trip
+   per pixel. Blazor gets the final height, persists it, and renders it back. */
+.tl-resizer {
+    flex: 0 0 auto;
+    height: 12px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    cursor: row-resize;
+    touch-action: none; /* the drag owns the gesture; never scroll the page */
+    z-index: 2;
+}
+
+.tl-resizer-grip {
+    width: 44px;
+    height: 3px;
+    border-radius: 999px;
+    background: color-mix(in srgb, var(--line) 90%, transparent);
+    transition: background 0.12s ease, width 0.12s ease;
+}
+
+.tl-resizer:hover .tl-resizer-grip,
+.tl-resizer.dragging .tl-resizer-grip {
+    background: var(--accent);
+    width: 64px;
+}
+
+/* While dragging, the pointer belongs to the divider: the resize cursor holds
+   even when it outruns the handle, and nothing highlights along the way. */
+body.tl-resizing, body.tl-resizing * { cursor: row-resize !important; user-select: none; }
+
+/* ---- Rail divider (focused studio): the vertical twin, between the program
+   monitor and the thumbnail rail. It occupies the thin middle grid column that
+   GridStyle() lays out; z-index floats the hit area over the tiles' edges. */
+.tl-vresizer {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    cursor: col-resize;
+    touch-action: none; /* the drag owns the gesture; never scroll the page */
+    z-index: 2;
+}
+
+.tl-vresizer-grip {
+    width: 3px;
+    height: 44px;
+    border-radius: 999px;
+    background: color-mix(in srgb, var(--line) 90%, transparent);
+    transition: background 0.12s ease, height 0.12s ease;
+}
+
+.tl-vresizer:hover .tl-vresizer-grip,
+.tl-vresizer.dragging .tl-vresizer-grip {
+    background: var(--accent);
+    height: 64px;
+}
+
+body.tl-colresizing, body.tl-colresizing * { cursor: col-resize !important; user-select: none; }
+
+@media (pointer: coarse) {
+    .tl-resizer { height: 20px; }    /* a finger-sized target for the same 3px grip */
+    .tl-vresizer { margin: 0 -5px; } /* widen the touch target into the grid gaps */
+}
+
+.tl-grid {
+    flex: 1;
+    min-height: 0;
+    display: grid; /* columns are set inline: fewer cameras = bigger tiles */
+    /* Rows share the available height so tiles fill the screen instead of a
+       single wide tile forcing its own 16:9 height (which zoomed on ultrawide). */
+    grid-auto-rows: minmax(140px, 1fr);
+    gap: 8px;
+    padding: 4px 12px 12px;
+    overflow-y: auto;
+    align-content: stretch;
+}
+
+/* No camera picked: the hint sits centered where the monitors go. */
+.tl-grid > .notice { margin: auto; text-align: center; }
+
+.tl-tile {
+    position: relative;
+    background: #000;
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    overflow: hidden;
+    min-height: 0;
+}
+
+.tl-tile video {
+    width: 100%;
+    height: 100%;
+    /* contain, never stretch: letterbox/pillarbox the real feed (fixes the
+       zoomed, distorted look on wide screens and non-16:9 cameras). */
+    object-fit: contain;
+    display: block;
+    background: #000;
+}
+
+.tl-tile-name {
+    position: absolute;
+    left: 8px;
+    bottom: 6px;
+    font-size: 12px;
+    background: rgba(0, 0, 0, 0.55);
+    padding: 2px 8px;
+    border-radius: 6px;
+}
+
+.tl-nofootage {
+    position: absolute;
+    inset: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: var(--muted);
+    font-size: 13px;
+}
+
+/* Buffering veil: JS (tlSync) toggles .tl-loading while the player has no
+   decodable picture under the cursor. The fade-in delay keeps ordinary quick
+   seeks spinner-free — only genuinely slow loads surface it. */
+.tl-tile.tl-loading::after {
+    content: "";
+    position: absolute;
+    top: 50%;
+    left: 50%;
+    width: 26px;
+    height: 26px;
+    margin: -13px 0 0 -13px;
+    border-radius: 50%;
+    border: 3px solid rgba(255, 255, 255, 0.18);
+    border-top-color: var(--accent);
+    opacity: 0;
+    animation:
+        tl-busy-in 0.15s ease 0.35s forwards,
+        reconnect-spin 0.9s linear infinite;
+}
+
+@keyframes tl-busy-in {
+    to { opacity: 1; }
+}
+
+/* ---- Studio layout (opt-in): monitors on top, editing desk at the bottom ----
+   Pure flex re-ordering of the same DOM — the scrub/zoom/hover JS hooks and the
+   render path are identical in both layouts, only the visual order changes. */
+.tl-page.studio .tl-grid { order: 1; padding: 8px 12px; }
+/* The divider leads the docked desk here, so it lands on the toolbar's existing
+   top border — the visible seam between the monitors and everything below it. */
+.tl-page.studio .tl-resizer { order: 2; }
+.tl-page.studio .tl-toolbar { order: 3; border-top: 1px solid var(--line); }
+.tl-page.studio .tl-cams { order: 4; padding-top: 4px; }
+.tl-page.studio .tl-board {
+    order: 5;
+    max-height: 34vh; /* until dragged: an explicit height overrides this inline */
+}
+/* Empty-state and error notices sit centered on the (otherwise black) stage. */
+.tl-page.studio .notice { order: 1; margin: auto; }
+/* The calendar can't drop below a bottom-docked toolbar — center it instead.
+   inset/margin centering, and an opacity-only entrance: the default popover
+   animation drives transform, which would fight (and visibly jump) a
+   transform-based centering. */
+.tl-page.studio .tl-cal {
+    position: fixed;
+    inset: 0;
+    margin: auto;
+    height: fit-content;
+    animation: tl-cal-in 0.14s ease;
+}
+
+@keyframes tl-cal-in {
+    from { opacity: 0; }
+}
+
+/* Program monitor: click a tile to focus it, the rest become a thumbnail rail. */
+.tl-page.studio .tl-tile { cursor: pointer; }
+.tl-page.studio .tl-grid.tl-focused { grid-auto-rows: minmax(64px, 1fr); }
+.tl-tile-focus { border-color: color-mix(in srgb, var(--accent) 55%, transparent); }
+.tl-tile-rail .tl-tile-name { font-size: 10px; left: 5px; bottom: 4px; padding: 1px 6px; }
+.tl-tile-rail .tl-nofootage { font-size: 10px; }
+
+/* Frame snapshot: quiet until the tile is hovered (always faintly visible on touch). */
+.tl-snap {
+    position: absolute;
+    right: 6px;
+    bottom: 6px;
+    z-index: 2;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 28px;
+    height: 26px;
+    border: none;
+    border-radius: 6px;
+    background: rgba(0, 0, 0, 0.55);
+    color: #fff;
+    cursor: pointer;
+    opacity: 0;
+    transition: opacity 0.12s ease;
+}
+.tl-tile:hover .tl-snap, .tl-snap:focus-visible { opacity: 1; }
+.tl-snap:hover { background: rgba(0, 0, 0, 0.8); color: var(--accent); }
+@media (pointer: coarse) {
+    .tl-snap { opacity: 0.7; }
+}
+.tl-tile-rail .tl-snap { display: none; } /* thumbnails: too small, focus first */
+.tl-tile-rail .zoom-hud { display: none !important; } /* same: zoom the focused monitor instead */
+
+/* Solo-audio speaker: sits just left of the snapshot button. Stays lit once a
+   camera is unmuted, so which monitor you are hearing is visible at a glance. */
+.tl-audio { right: 40px; }
+.tl-audio.on { opacity: 1; color: var(--accent); background: rgba(0, 0, 0, 0.78); }
+
+/* Object boxes get the live view's on-video pill rather than a fourth flat
+   button: it is the same control in the same clothes, and it is lit on the one
+   monitor carrying them — only one can, so it doubles as the answer to "which".
+   It hangs just under the zoom pill exactly as it does on a camera's own view —
+   until the monitor is too short for that, when it stops at the foot instead of
+   sliding off the bottom (a board can show eight cameras at once). */
+.tl-tile .cam-rail { top: min(calc(50% + 88px), calc(100% - 54px)); }
+
+.tl-tile-rail .cam-rail { display: none; } /* thumbnails: too small, focus first */
+
+/* ---------------------------------------------------------------- bookmarks
+   Gold ribbons in the ruler's empty top band (ticks start at 8px, so the
+   0–8px strip is theirs): a saved moment reads at a glance and clicks to
+   jump. Same gold on the day overview so a zoomed view still shows where
+   the moments are. */
+.tl-bm {
+    position: absolute;
+    top: 1px;
+    height: 6px;
+    min-width: 4px;
+    background: color-mix(in srgb, #e8c35a 55%, transparent);
+    border: 1px solid #e8c35a;
+    border-radius: 3px;
+    cursor: pointer;
+    z-index: 1;
+}
+.tl-bm:hover { background: #e8c35a; }
+
+.tl-ov-bm {
+    position: absolute;
+    top: 1px;
+    height: 3px;
+    min-width: 3px;
+    background: #e8c35a;
+    border-radius: 2px;
+    pointer-events: none;
+    opacity: 0.9;
+}
+
+/* The bookmark panel: the export panel's idiom (same title/range/preset
+   styling) plus a name field and the saved-moments list. */
+.tl-bm-name {
+    width: 100%;
+    margin: 2px 0 8px;
+    padding: 7px 10px;
+    background: var(--bg);
+    border: 1px solid var(--line);
+    border-radius: 6px;
+    color: var(--text);
+    font-size: 13px;
+}
+.tl-bm-name:focus { outline: none; border-color: color-mix(in srgb, var(--accent) 55%, transparent); }
+
+.tl-bm-list {
+    max-height: 240px;
+    overflow-y: auto;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+}
+
+.tl-bm-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 6px 8px;
+    border: 1px solid var(--line);
+    border-radius: 6px;
+    cursor: pointer;
+    min-width: 0;
+}
+.tl-bm-row:hover { border-color: color-mix(in srgb, #e8c35a 60%, transparent); background: color-mix(in srgb, #e8c35a 8%, transparent); }
+
+.tl-bm-row-name {
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-size: 13px;
+}
+.tl-bm-row-name::before { content: "🔖 "; font-size: 11px; }
+
+.tl-bm-row-when {
+    flex: 0 0 auto;
+    font-size: 11px;
+    color: var(--muted);
+    white-space: nowrap;
+}
+
+.tl-bm-del { flex: 0 0 auto; }
+.tl-bm-del:hover { color: var(--err); }
+
+@media (max-width: 560px) {
+    /* Narrow phones: the when-label wraps under the name instead of crushing it. */
+    .tl-bm-row { flex-wrap: wrap; }
+    .tl-bm-row-when { order: 3; width: 100%; padding-left: 2px; }
+}
+
+.event-player-foot {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+
+/* Sidebar security warning (server runs without sign-in) */
+.sec-banner {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    margin: 8px 10px 4px;
+    padding: 8px 10px;
+    border: 1px solid #ffb020;
+    border-radius: 8px;
+    background: color-mix(in srgb, #ffb020 12%, transparent);
+}
+
+.sec-banner-text {
+    font-size: 12px;
+    color: #ffcf70;
+    line-height: 1.35;
+}
+
+.sec-banner-actions {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+}
+
+.sec-banner-actions .icon-btn { margin-left: auto; }
+
+/* New-version banner (same shape, accent colour) */
+.update-banner {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    margin: 4px 10px;
+    padding: 8px 10px;
+    border: 1px solid var(--accent);
+    border-radius: 8px;
+    background: color-mix(in srgb, var(--accent) 12%, transparent);
+}
+
+.update-banner-text { font-size: 12px; color: var(--text); line-height: 1.35; }
+.update-banner a.chip { text-decoration: none; }
+
+/* Storage capacity banners: amber = a tier is >= 90% used (dismissible for the
+   session), red = a tier is out of space and recording to it has halted. */
+.storage-banner {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    margin: 4px 10px;
+    padding: 8px 10px;
+    border: 1px solid #ffb020;
+    border-radius: 8px;
+    background: color-mix(in srgb, #ffb020 12%, transparent);
+}
+
+.storage-banner a.chip { text-decoration: none; }
+
+.storage-banner-full {
+    border-color: #ff5252;
+    background: color-mix(in srgb, #ff5252 14%, transparent);
+}
+
+.storage-banner-full .sec-banner-text { color: #ff8a80; }
+
+/* Background-process strip (admins): server work in flight — archiving and
+   whatever reports next — with a live progress bar. Same footprint as the
+   banners above it; disappears entirely when nothing runs. */
+.bg-tasks {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    flex: 0 0 auto; /* pinned just above the account footer, never scrolls away */
+    margin: 0;
+}
+
+.bg-task {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    padding: 8px 10px;
+    border: 1px solid color-mix(in srgb, var(--accent, #4da3ff) 45%, transparent);
+    border-radius: 8px;
+    background: color-mix(in srgb, var(--accent, #4da3ff) 10%, transparent);
+    min-width: 0; /* long detail text must ellipsize, not widen the sidebar */
+}
+
+.bg-task-head {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+
+.bg-task-name { font-size: 12px; font-weight: 600; margin-right: auto; }
+
+.bg-task-pct {
+    font-size: 11px;
+    font-variant-numeric: tabular-nums; /* a counting percentage must not wobble */
+    opacity: .85;
+}
+
+/* Dismiss this run's card (it reappears on the next run). */
+.bg-task-dismiss {
+    flex: 0 0 auto;
+    border: none;
+    background: none;
+    color: var(--muted);
+    cursor: pointer;
+    font-size: 12px;
+    line-height: 1;
+    padding: 0 2px;
+    opacity: .7;
+}
+
+.bg-task-dismiss:hover { opacity: 1; color: var(--text); }
+
+.bg-task-detail {
+    font-size: 11px;
+    opacity: .75;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.bg-task-bar {
+    height: 4px;
+    border-radius: 2px;
+    overflow: hidden;
+    background: color-mix(in srgb, var(--accent, #4da3ff) 18%, transparent);
+}
+
+.bg-task-fill {
+    height: 100%;
+    border-radius: 2px;
+    background: var(--accent, #4da3ff);
+    transition: width .6s ease; /* polls every 2s: glide between readings */
+}
+
+/* No percentage yet: a gentle pulse says "running" without pretending progress. */
+.bg-task-indet .bg-task-fill { animation: bg-task-pulse 1.6s ease-in-out infinite; }
+
+@keyframes bg-task-pulse {
+    0%, 100% { opacity: .35; }
+    50% { opacity: .9; }
+}
+
+/* Event player speed control */
+.player-speed {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-top: 2px;
+    flex-wrap: nowrap; /* speed and quality stay on one line, phone included */
+}
+
+.player-group { display: inline-flex; align-items: center; gap: 6px; min-width: 0; }
+
+/* Divider standing in for the SPEED / QUALITY headings, which cost more width
+   than they were worth once the chips themselves say what they do. */
+.player-div { color: var(--muted); opacity: 0.45; user-select: none; }
+
+/* Phones: seven chips have to share the width, so they lose their roomy padding
+   rather than the row losing its shape. */
+@media (max-width: 560px) {
+    .player-speed { gap: 6px; }
+    .player-speed .chip { padding: 3px 7px; font-size: 11px; }
+    .player-group { gap: 4px; }
+}
+
+/* Admin server-settings fields */
+.admin-field {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    font-size: 13px;
+    padding: 3px 0;
+}
+
+.admin-field span { color: var(--muted); flex: 1; }
+
+.admin-field input {
+    background: var(--bg);
+    color: var(--text);
+    border: 1px solid var(--line);
+    border-radius: 6px;
+    padding: 4px 8px;
+    font-size: 13px;
+    width: 190px;
+    max-width: 48%;
+    outline: none;
+}
+
+.admin-field input:focus { border-color: var(--accent); }
+
+/* Dropdown variant (constrained config values, e.g. record stream) — matches the
+   text inputs so the row reads consistently. */
+.admin-select {
+    background: var(--bg);
+    color: var(--text);
+    border: 1px solid var(--line);
+    border-radius: 6px;
+    padding: 4px 8px;
+    font-size: 13px;
+    width: 190px;
+    max-width: 48%;
+    outline: none;
+    cursor: pointer;
+}
+.admin-select:focus { border-color: var(--accent); }
+.admin-field.edited .admin-select {
+    border-color: var(--accent);
+    box-shadow: inset 2px 0 0 var(--accent);
+}
+
+/* Strip filter drawer (under the events bar): lit chips show, dimmed chips hide */
+.strip-filter {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 6px;
+    padding: 8px 12px;
+    background: var(--panel-2);
+    border-bottom: 1px solid var(--line);
+    box-shadow: inset 0 6px 8px -8px rgba(0, 0, 0, 0.5);
+}
+
+/* ------------------------------------------------------------ monitor page */
+
+.mon-page {
+    display: flex;
+    flex-direction: column;
+    height: 100vh;
+    background: var(--bg);
+}
+
+.mon-scroll {
+    flex: 1;
+    overflow-y: auto;
+    padding: 14px 16px 24px;
+}
+
+/* Heartbeat next to the title: sampling is alive (steady pulse) or paused (dim) */
+.mon-pulse {
+    width: 9px;
+    height: 9px;
+    border-radius: 50%;
+    background: var(--ok);
+    animation: mon-pulse 2s ease-in-out infinite;
+}
+
+.mon-pulse.paused {
+    background: var(--muted);
+    animation: none;
+}
+
+@keyframes mon-pulse {
+    0%, 100% { box-shadow: 0 0 0 0 rgba(63, 208, 127, 0.5); }
+    50% { box-shadow: 0 0 0 5px rgba(63, 208, 127, 0); }
+}
+
+.mon-section {
+    display: flex;
+    align-items: baseline;
+    gap: 10px;
+    margin: 18px 2px 10px;
+}
+
+.mon-section:first-child { margin-top: 2px; }
+
+.mon-section-title {
+    font-size: 11px;
+    font-weight: 700;
+    letter-spacing: 2px;
+    color: var(--accent);
+}
+
+.mon-section-sub {
+    font-size: 12px;
+    color: var(--muted);
+}
+
+/* Headline numbers: current values at a glance, charts below tell the story */
+.mon-cards {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
+    gap: 10px;
+    margin-bottom: 12px;
+}
+
+.mon-card {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    padding: 10px 14px;
+}
+
+.mon-card-label {
+    font-size: 10px;
+    letter-spacing: 1.5px;
+    color: var(--muted);
+}
+
+.mon-card-value {
+    font-size: 22px;
+    font-weight: 700;
+    line-height: 1.15;
+    font-variant-numeric: tabular-nums;
+}
+
+.mon-card-sub {
+    font-size: 11px;
+    color: var(--muted);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.mon-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(330px, 1fr));
+    gap: 10px;
+}
+
+.mon-chart {
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    padding: 10px 12px 8px;
+}
+
+/* Items move to the next line whole, never break inside, and a value keeps the
+   width of its widest reading: a legend that re-wrapped as the numbers ticked
+   over made the whole page jump several times a second. */
+.mon-chart-head {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 2px 10px;
+    margin-bottom: 6px;
+}
+
+.mon-chart-title, .mon-leg, .mon-chart-max { white-space: nowrap; }
+
+.mon-chart-title {
+    font-size: 12px;
+    font-weight: 600;
+}
+
+.mon-leg {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    font-size: 11px;
+    color: var(--muted);
+}
+
+.mon-leg i {
+    width: 8px;
+    height: 8px;
+    border-radius: 2px;
+}
+
+.mon-leg b {
+    color: var(--text);
+    font-weight: 600;
+    font-variant-numeric: tabular-nums;
+    min-width: 7ch;
+}
+
+/* Y-axis ceiling, right-aligned over the plot */
+.mon-chart-max {
+    margin-left: auto;
+    font-size: 10px;
+    color: var(--muted);
+    font-variant-numeric: tabular-nums;
+}
+
+.mon-chart-body { position: relative; }
+
+.mon-svg {
+    display: block;
+    width: 100%;
+    height: 150px;
+    border-radius: 6px;
+    background: color-mix(in srgb, var(--bg) 60%, var(--panel));
+}
+
+.mon-gridline {
+    stroke: var(--line);
+    stroke-width: 1;
+    stroke-dasharray: 2 5;
+    vector-effect: non-scaling-stroke;
+}
+
+.mon-empty {
+    height: 150px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 12px;
+    color: var(--muted);
+}
+
+.mon-foot {
+    margin-top: 14px;
+    font-size: 11px;
+    color: var(--muted);
+    text-align: center;
+}
+
+/* Chart hover: shared tooltip (document-level, JS-owned) + per-chart crosshair */
+.mon-tip {
+    position: fixed;
+    z-index: 300;
+    display: none;
+    pointer-events: none;
+    min-width: 140px;
+    padding: 8px 10px;
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: var(--radius-sm);
+    box-shadow: var(--shadow);
+    font-size: 12px;
+}
+
+.mon-tip-time {
+    margin-bottom: 4px;
+    font-size: 11px;
+    color: var(--muted);
+    font-variant-numeric: tabular-nums;
+}
+
+.mon-tip-row {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    line-height: 1.6;
+    white-space: nowrap;
+}
+
+.mon-tip-row i {
+    flex: none;
+    width: 8px;
+    height: 8px;
+    border-radius: 2px;
+}
+
+.mon-tip-row b {
+    margin-left: auto;
+    padding-left: 14px;
+    font-variant-numeric: tabular-nums;
+}
+
+.mon-cross {
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    width: 1px;
+    background: color-mix(in srgb, var(--text) 35%, transparent);
+    pointer-events: none;
+}
+
+/* ---------------- camera availability (status-page ribbons) ---------------- */
+
+.mon-avail-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+    gap: 10px;
+    margin-bottom: 18px;
+}
+
+.mon-avail-card {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    padding: 12px 14px;
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: var(--radius);
+}
+
+.mon-avail-head {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    min-width: 0;
+}
+
+.mon-avail-dot {
+    flex: none;
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+}
+
+.mon-avail-dot.up {
+    background: var(--ok);
+    box-shadow: 0 0 6px color-mix(in srgb, var(--ok) 70%, transparent);
+}
+
+.mon-avail-dot.down { background: var(--err); }
+
+.mon-avail-name {
+    font-weight: 600;
+    font-size: 13px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.mon-avail-grade {
+    flex: none;
+    padding: 1px 7px;
+    border-radius: 999px;
+    font-size: 11px;
+    font-weight: 700;
+    letter-spacing: 0.03em;
+}
+
+.mon-avail-grade.good { color: var(--ok); background: color-mix(in srgb, var(--ok) 14%, transparent); }
+.mon-avail-grade.warn { color: #ffb020; background: rgba(255, 176, 32, 0.14); }
+.mon-avail-grade.bad { color: var(--err); background: color-mix(in srgb, var(--err) 14%, transparent); }
+
+.mon-avail-pct {
+    margin-left: auto;
+    font-weight: 600;
+    font-size: 13px;
+    font-variant-numeric: tabular-nums;
+}
+
+/* The timeline: one span per online/offline run, oldest on the left */
+.mon-avail-ribbon {
+    display: flex;
+    height: 12px;
+    border-radius: 6px;
+    overflow: hidden;
+    background: var(--panel-2);
+}
+
+.mon-avail-seg { min-width: 3px; } /* a 10s blip on a 24h ribbon must still be visible */
+.mon-avail-seg.up { background: color-mix(in srgb, var(--ok) 55%, transparent); }
+.mon-avail-seg.down { background: var(--err); }
+
+.mon-avail-sub {
+    display: flex;
+    justify-content: space-between;
+    gap: 8px;
+    font-size: 11px;
+    color: var(--muted);
+}
+
+/* ------------------------------------------------------------ logs page */
+
+/* Live server logs (admin): terminal-style tail, lines appended by JS */
+.logs-page {
+    display: flex;
+    flex-direction: column;
+    height: 100vh;
+    background: var(--bg);
+}
+
+.logs-hint { padding: 8px 16px 0; }
+
+/* On the dedicated page the terminal takes all remaining height */
+.mon-logs.logs-full {
+    flex: 1;
+    height: auto;
+    margin: 10px 16px 16px;
+}
+
+.mon-logs {
+    height: 380px;
+    overflow-y: auto;
+    background: #0a0d13;
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    padding: 10px 12px;
+    font: 11.5px/1.55 ui-monospace, Consolas, "Cascadia Mono", monospace;
+    overflow-anchor: none; /* JS owns the follow-the-tail behavior */
+}
+
+.log-line {
+    display: flex;
+    gap: 10px;
+    white-space: pre-wrap;
+    word-break: break-word;
+}
+
+.log-time {
+    flex: 0 0 auto;
+    color: var(--muted);
+}
+
+.log-lvl {
+    flex: 0 0 30px;
+    font-weight: 700;
+}
+
+.log-msg { color: var(--text); }
+
+.log-inf .log-lvl { color: var(--accent); }
+.log-wrn .log-lvl { color: #ffb020; }
+.log-wrn .log-msg { color: color-mix(in srgb, #ffb020 55%, var(--text)); }
+.log-err .log-lvl { color: var(--err); }
+.log-err .log-msg { color: color-mix(in srgb, var(--err) 60%, var(--text)); }
+.log-dbg, .log-trc { opacity: 0.6; }
+
+/* Level filter: the container class hides matching lines (DBG chip covers TRC too) */
+.mon-logs.log-hide-dbg :is(.log-dbg, .log-trc),
+.mon-logs.log-hide-inf .log-inf,
+.mon-logs.log-hide-wrn .log-wrn,
+.mon-logs.log-hide-err .log-err,
+.mon-logs .log-line.log-hide-cam { display: none; }
+
+/* ------------------------------------------------------------ saved layouts */
+
+/* Toolbar button badge: the loaded layout drifted from what was saved */
+.layouts-btn { position: relative; }
+
+.layout-dirty-dot {
+    position: absolute;
+    top: -4px;
+    right: -4px;
+    width: 9px;
+    height: 9px;
+    border-radius: 50%;
+    background: #ffb020;
+    border: 2px solid var(--panel);
+}
+
+/* Drawer under the toolbar (same chrome as the event-strip filter) */
+.layouts-bar {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 6px;
+    padding: 8px 12px;
+    background: var(--panel-2);
+    border-bottom: 1px solid var(--line);
+    box-shadow: inset 0 6px 8px -8px rgba(0, 0, 0, 0.5);
+}
+
+/* One saved layout: a pill with a load area and a delete ✕ */
+.layout-chip {
+    display: inline-flex;
+    align-items: center;
+    background: var(--bg);
+    border: 1px solid var(--line);
+    border-radius: 999px;
+    overflow: hidden;
+}
+
+.layout-chip-active { border-color: var(--accent); }
+.layout-chip-active .layout-chip-load { color: var(--accent); font-weight: 600; }
+
+.layout-chip-load {
+    background: none;
+    border: none;
+    color: var(--text);
+    font-size: 12px;
+    padding: 3px 4px 3px 10px;
+    cursor: pointer;
+}
+
+.layout-chip-load:hover { color: var(--accent); }
+.layout-chip-del { font-size: 11px; padding: 2px 8px 2px 4px; }
+
+.layout-name-input {
+    background: var(--bg);
+    color: var(--text);
+    border: 1px solid var(--line);
+    border-radius: 999px;
+    padding: 4px 12px;
+    font-size: 12px;
+    width: 150px;
+    outline: none;
+}
+
+.layout-name-input:focus { border-color: var(--accent); }
+.layout-name-input::placeholder { color: var(--muted); }
+
+/* ------------------------------------------------------------ authentication */
+
+.auth-overlay {
+    position: fixed;
+    inset: 0;
+    background: var(--bg);
+    z-index: 300;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+
+.auth-box {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    width: min(340px, 90vw);
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: 14px;
+    padding: 24px;
+    box-shadow: 0 24px 64px rgba(0, 0, 0, 0.55);
+}
+
+.auth-box .brand { margin-bottom: 8px; }
+
+.auth-box label {
+    font-size: 11px;
+    color: var(--muted);
+    letter-spacing: 1px;
+    text-transform: uppercase;
+}
+
+.auth-box input {
+    background: var(--bg);
+    color: var(--text);
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    padding: 8px 10px;
+    font-size: 14px;
+    outline: none;
+}
+
+.auth-box input:focus { border-color: var(--accent); }
+.auth-btn { justify-content: center; padding: 8px; font-size: 14px; margin-top: 6px; }
+
+
+.auth-panel { width: min(460px, 94vw); }
+
+.user-row { flex-wrap: wrap; }
+
+.user-pass-input {
+    background: var(--bg);
+    color: var(--text);
+    border: 1px solid var(--line);
+    border-radius: 6px;
+    padding: 4px 8px;
+    font-size: 12px;
+    max-width: 160px;
+}
+
+/* ------------------------------------------------------------ stream chips */
+
+.stream-chip { cursor: default; }
+.stream-chip:hover { border-color: var(--line); color: var(--text); }
+
+/* Profiles become clickable when the camera's HTTP API is configured */
+.stream-chip.clickable { cursor: pointer; }
+.stream-chip.clickable:hover { border-color: var(--accent); color: var(--accent); }
+.stream-chip.clickable:disabled { opacity: 0.5; cursor: wait; }
+
+.chip-active {
+    border-color: var(--accent);
+    color: var(--accent);
+}
+
+.stream-chip.chip-active:hover { border-color: var(--accent); color: var(--accent); }
+
+/* Language picker: one chip per language, wrapping on narrow screens rather
+   than pushing the settings panel into a horizontal scroll. */
+.lang-choice {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    margin: 4px 0 2px;
+}
+
+/* Marks a language whose catalogue is empty — it would render as English. */
+.lang-empty {
+    margin-left: 5px;
+    font-weight: 700;
+    color: #e8b054;
+}
+
+/* Small BETA pill for features still proving themselves on real hardware. */
+.beta-tag {
+    font-size: 9px;
+    font-weight: 700;
+    letter-spacing: 1px;
+    color: #e8b054;
+    border: 1px solid color-mix(in srgb, #e8b054 50%, transparent);
+    border-radius: 4px;
+    padding: 1px 5px;
+    vertical-align: 1px;
+}
+
+/* NEW pill: filled rather than outlined like .beta-tag, so a just-shipped
+   control stands out on a busy toolbar. */
+.new-tag {
+    font-size: 9px;
+    font-weight: 700;
+    letter-spacing: 1px;
+    color: #0b1220;
+    background: var(--ok);
+    border: 1px solid var(--ok);
+    border-radius: 4px;
+    padding: 1px 5px;
+    vertical-align: 1px;
+}
+
+/* The beta/feedback note in the AI settings tab: same amber as the BETA pill,
+   with a left rule so it reads as a callout, not body copy. */
+.notice.ai-beta-note {
+    border-left: 3px solid color-mix(in srgb, #e8b054 55%, transparent);
+    padding-left: 8px;
+}
+
+/* One notch below beta: works on some models, known not to on others. */
+.preview-tag {
+    font-size: 9px;
+    font-weight: 700;
+    letter-spacing: 1px;
+    color: #b48ce8;
+    border: 1px solid color-mix(in srgb, #b48ce8 50%, transparent);
+    border-radius: 4px;
+    padding: 1px 5px;
+    vertical-align: 1px;
+}
+
+/* The preview callout on the Experimental tab: the purple of .preview-tag, with a
+   left rule so it reads as a warning rather than an intro paragraph. */
+.notice.preview-note {
+    border-left: 3px solid color-mix(in srgb, #b48ce8 55%, transparent);
+    padding-left: 8px;
+    margin-bottom: 8px;
+}
+
+/* A staged (not yet applied) camera-setting value: amber + dashed = provisional. */
+.chip-pending,
+.chip.chip-pending {
+    border: 1px dashed #e8b054;
+    color: #e8b054;
+}
+
+/* Recording settings wrap in a fieldset so a non-admin gets them read-only
+   (disabled) in one stroke — the API enforces the same rule server-side. */
+.rec-lock {
+    border: 0;
+    padding: 0;
+    margin: 0;
+    min-width: 0;
+}
+.rec-lock[disabled] { opacity: 0.65; }
+
+/* Quick-reply message selects: take the row's free width so long message names
+   stay readable instead of truncating at the browser's default select width. */
+.qr-select {
+    flex: 1 1 auto;
+    min-width: 0;
+}
+
+/* Action feedback toast: floats at the panel's bottom edge, green = applied,
+   red = rejected; dismisses itself after a few seconds. */
+.campanel-toast {
+    position: absolute;
+    left: 50%;
+    bottom: 14px;
+    transform: translateX(-50%);
+    max-width: calc(100% - 28px);
+    padding: 8px 14px;
+    border-radius: 8px;
+    font-size: 13px;
+    color: #fff;
+    z-index: 5;
+    box-shadow: 0 4px 18px rgb(0 0 0 / 40%);
+    animation: toast-in 160ms ease-out;
+    pointer-events: none;
+}
+.campanel-toast.toast-ok { background: #1d7a46; }
+.campanel-toast.toast-err { background: #9e2b2b; }
+@keyframes toast-in {
+    from { opacity: 0; transform: translate(-50%, 6px); }
+    to { opacity: 1; transform: translate(-50%, 0); }
+}
+
+select.input-pending {
+    border-color: #e8b054;
+    color: #e8b054;
+}
+
+/* ---------- detection-zone editor ---------- */
+/* Where a zone is KEPT changes what editing it means, so the note that says so is
+   set apart from the ordinary help text below it rather than reading as more of it. */
+.zone-local {
+    border-left: 2px solid #5b9dff;
+    padding-left: 8px;
+}
+
+.zone-editor {
+    position: fixed;
+    inset: 0;
+    z-index: 70; /* above the camera panel (61) it opens from */
+    background: rgba(0, 0, 0, 0.55);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 12px;
+}
+
+/* FIXED size from the moment it opens, like the camera dialog it comes from:
+   a type whose grid the camera doesn't report must not collapse the dialog to
+   a strip, and switching types must not resize it under the pointer.
+   The three sizes exist because the cell count is the CAMERA's: an 80x60 grid
+   in a small dialog gives ~10px cells, which is a chore to drag accurately.
+   Scaling the dialog is what makes a cell big enough to hit. */
+.zone-dialog {
+    position: relative; /* anchors the toast */
+    width: min(1180px, 96vw);
+    height: min(820px, 92vh);
+    overflow: hidden;
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: 14px;
+    padding: 14px;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    box-shadow: 0 24px 64px rgba(0, 0, 0, 0.55);
+}
+
+/* The only part that flexes; the head, type chips and button row hold still. */
+.zone-body {
+    flex: 1 1 auto;
+    min-height: 0;
+    overflow: hidden; /* the canvas fits itself to this box — nothing to scroll */
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    padding: 2px; /* focus rings aren't clipped by the scroll edge */
+}
+
+.zone-retry { align-self: flex-start; }
+
+.zone-head {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-weight: 700;
+    letter-spacing: 1px;
+    flex: 0 0 auto;
+}
+
+.zone-types {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    flex: 0 0 auto;
+}
+
+.zone-mode {
+    display: flex;
+    gap: 6px;
+    flex: 0 0 auto;
+}
+
+/* touch-action: none — a touch drag must paint cells, not scroll the dialog */
+/* Width and height are set by the script, which fits the whole frame into the
+   space available; this is only the pre-init state and the centring. */
+.zone-canvas {
+    display: block;
+    width: 100%;
+    margin: 0 auto;
+    flex: 0 0 auto;
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    touch-action: none;
+    cursor: crosshair;
+    user-select: none;
+    -webkit-user-select: none;
+}
+
+.zone-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    align-items: center;
+    flex: 0 0 auto;
+}
+
+/* Zoom/focus + floodlight-brightness sliders in the camera panel */
+.zf-slider {
+    flex: 1;
+    min-width: 90px;
+    accent-color: var(--accent);
+}
+
+.zf-slider.input-pending { accent-color: #e8b054; }
+
+.zf-pos {
+    min-width: 52px;
+    text-align: right;
+    color: var(--muted);
+    font-variant-numeric: tabular-nums;
+    font-size: 12px;
+}
+
+/* Per-stream fps/bitrate pickers next to the resolution chips */
+.stream-tune select {
+    font-size: 12px;
+    padding: 3px 6px;
+}
+
+.stream-tune.tune-pending select {
+    border-color: #e8b054;
+    color: #e8b054;
+}
+
+.notice.small { font-size: 11px; padding-top: 8px; }
+
+.control-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    padding: 4px 0;
+    font-size: 13px;
+}
+
+/* Per-camera retention inputs (camera panel → RECORDING) */
+.ret-input {
+    background: var(--bg);
+    color: var(--text);
+    border: 1px solid var(--line);
+    border-radius: 6px;
+    padding: 4px 8px;
+    font-size: 12px;
+    width: 110px;
+    outline: none;
+}
+
+.ret-input:focus { border-color: var(--accent); }
+.ret-input::placeholder { color: var(--muted); }
+
+/* Wider text input for the notifications form (emails, hostnames, passwords). */
+.notif-input {
+    background: var(--bg);
+    color: var(--text);
+    border: 1px solid var(--line);
+    border-radius: 6px;
+    padding: 4px 8px;
+    font-size: 12px;
+    width: 230px;
+    max-width: 58%;
+    outline: none;
+}
+
+.notif-input:focus { border-color: var(--accent); }
+.notif-input::placeholder { color: var(--muted); }
+
+/* Webhook selects hold sentence-length options ("JSON (full event data +
+   snapshots)"); the panel's default select width clips them. */
+.webhook-select { width: 260px; max-width: 58%; }
+
+/* The AI system-prompt editor: full-width block (the label sits on its own row
+   above), user-resizable downward only — sideways would break the panel. */
+textarea.ai-prompt {
+    width: 100%;
+    max-width: 100%;
+    min-height: 90px;
+    resize: vertical;
+    font: inherit;
+    font-size: 12px;
+    line-height: 1.45;
+    box-sizing: border-box;
+}
+
+/* Per-camera offline overrides: scroll within a bounded box so a long camera
+   list never pushes the (now footer-pinned) save/test actions out of view. */
+.cam-override-list {
+    max-height: 200px;
+    overflow-y: auto;
+    padding-right: 2px;
+}
+
+/* Emergency mode (beta): armed reads as a red state everywhere it appears, and
+   the per-camera grid keeps its four chips in fixed columns. */
+.settings-tab .tab-dot-armed { color: var(--err); }
+.emg-arm-row { align-items: center; }
+.emg-armed { color: var(--err); font-weight: 600; letter-spacing: .04em; }
+
+.chip-armed {
+    color: var(--err);
+    border-color: color-mix(in srgb, var(--err) 55%, transparent);
+    background: color-mix(in srgb, var(--err) 14%, transparent);
+}
+
+.notice.emg-warn {
+    border-color: color-mix(in srgb, var(--err) 45%, transparent);
+    background: color-mix(in srgb, var(--err) 10%, transparent);
+}
+
+.emg-warn-list {
+    margin: 6px 0 8px;
+    padding-left: 18px;
+    line-height: 1.5;
+}
+
+.emg-cam-cols {
+    display: inline-grid;
+    grid-template-columns: repeat(4, 52px);
+    gap: 4px;
+    text-align: center;
+}
+
+.emg-cam-head .emg-cam-cols {
+    font-size: 11px;
+    color: var(--muted);
+    text-transform: uppercase;
+    letter-spacing: .05em;
+}
+
+/* Full-width in its column so the pills line up under the headings. .chip is a
+   flex container, which packs its label left — centre it, or the text sits off
+   to one side of a pill that is wider than the word. */
+.emg-cam-chip {
+    padding: 2px 0;
+    width: 100%;
+    justify-content: center;
+}
+/* "auto" = inheriting the all-cameras choice: present, but not asserting. */
+.chip-auto { opacity: 0.7; border-style: dashed; }
+
+/* Invalid email field + its inline reason, and the "edited but unsaved" accent
+   on config.json fields (mirrors the header badge / footer note). */
+.notif-input.input-error,
+.admin-field input.input-error { border-color: var(--err); }
+.notif-input.input-error:focus { border-color: var(--err); }
+
+/* Inline field problem. The block hugs the control column (margin-left auto)
+   but the TEXT inside reads left-aligned — long messages used to be laid out
+   ragged-left across the whole row width, which read as a jumble. Width is
+   capped at the widest input so the message visually belongs to its field. */
+.field-error {
+    color: var(--err);
+    font-size: 11px;
+    line-height: 1.45;
+    margin: 2px 0 6px auto;
+    width: fit-content;
+    max-width: min(100%, 340px);
+    text-align: left;
+}
+
+/* In the server-settings panel the inputs sit in a label/control grid, left
+   justified in the control column — mirror that grid (same fixed tracks, so
+   they resolve identically) and let ::before occupy the label track, putting
+   the message exactly under its input's left edge. */
+.settings-panel .settings-body .field-error {
+    display: grid;
+    grid-template-columns: minmax(170px, 280px) 1fr;
+    column-gap: 14px;
+    width: auto;
+    max-width: none;
+    margin: 2px 0 6px;
+}
+.settings-panel .settings-body .field-error::before { content: ""; }
+@media (max-width: 640px) {
+    /* Phones drop the label track (fields are flex rows) — full-width text. */
+    .settings-panel .settings-body .field-error { display: block; }
+}
+
+/* Battery keep-alive drain warning: same voice as .field-error but cautionary,
+   not an error, and left-aligned since it is explanatory prose. */
+.field-warn {
+    color: var(--warn, #d9a441);
+    font-size: 11px;
+    line-height: 1.4;
+    margin: -2px 0 6px;
+}
+
+/* Keep-alive slider row: the range fills the space, the readout is fixed-width so
+   it doesn't jitter as the hours change. */
+.keepalive { display: flex; align-items: center; gap: 10px; flex: 1; }
+.keepalive input[type="range"] { flex: 1; accent-color: var(--accent); cursor: pointer; }
+.keepalive-val { min-width: 3.5ch; text-align: right; font-variant-numeric: tabular-nums; color: var(--muted); }
+
+.admin-field.edited input {
+    border-color: var(--accent);
+    box-shadow: inset 2px 0 0 var(--accent);
+}
+.control-row.edited .chip.edited { box-shadow: inset 2px 0 0 var(--accent); }
+
+/* Full-bleed hairline splitting a campanel section into halves (event-based
+   recording above, continuous below) */
+.campanel-divider {
+    border-top: 1px solid var(--line);
+    margin: 10px -12px;
+}
+
+/* Capture schedule (camera panel → RECORDING): day chips + a time window,
+   shown only while the "Scheduled capture" switch is on */
+.sched {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-end;
+    gap: 8px;
+    min-width: 0;
+    padding: 2px 0 4px;
+}
+
+.sched-days { display: flex; gap: 4px; flex-wrap: wrap; justify-content: flex-end; }
+
+.sched-day {
+    min-width: 42px;
+    justify-content: center;
+    text-align: center;
+    padding-left: 0;
+    padding-right: 0;
+}
+
+.sched-times { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; justify-content: flex-end; }
+
+.sched-time {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 12px;
+    color: var(--muted);
+}
+
+.sched-time input[type="time"] {
+    background: var(--bg);
+    color: var(--text);
+    border: 1px solid var(--line);
+    border-radius: 6px;
+    padding: 4px 6px;
+    font-size: 12px;
+    color-scheme: dark;
+}
+
+.sched-time input[type="time"]:focus { border-color: var(--accent); outline: none; }
+
+/* The schedule summary is a full sentence — let it wrap instead of ellipsizing
+   (the base .event-sub is single-line) so it reads on narrow/mobile widths. */
+.sched .event-sub {
+    text-align: right;
+    white-space: normal;
+    overflow: visible;
+    text-overflow: clip;
+}
+
+/* The AI-description and event-email notes are explanatory prose too — wrap,
+   don't ellipsize (.event-sub is nowrap for the single-line event rows). */
+.event-sub.ai-sub,
+.event-sub.email-sub {
+    white-space: normal;
+    overflow: visible;
+    text-overflow: clip;
+}
+
+/* Scene notes for the AI: a full-width textarea in the control column. The
+   first selector out-specifies the wide-panel grid rule
+   (.campanel-wide .campanel-cols .control-row), which would otherwise win. */
+.campanel-wide .campanel-cols .control-row.ai-context-row,
+.control-row.ai-context-row {
+    display: block;
+}
+
+.ai-context {
+    width: 100%;
+    box-sizing: border-box;
+    background: var(--bg);
+    color: var(--text);
+    border: 1px solid var(--line);
+    border-radius: 6px;
+    padding: 5px 8px;
+    font-size: 12px;
+    font-family: inherit;
+    resize: vertical;
+    min-height: 40px;
+}
+
+.control-row select {
+    background: var(--bg);
+    color: var(--text);
+    border: 1px solid var(--line);
+    border-radius: 6px;
+    padding: 3px 6px;
+    font-size: 12px;
+}
+
+.chip-danger {
+    border-color: var(--err);
+    color: var(--err);
+}
+
+.chip-danger:hover {
+    background: var(--err);
+    border-color: var(--err);
+    color: #fff;
+}
+
+.ptz-row {
+    display: flex;
+    align-items: center;
+    gap: 16px;
+}
+
+.ptz-pad {
+    display: grid;
+    grid-template-columns: repeat(3, 38px);
+    grid-auto-rows: 38px;
+    gap: 4px;
+}
+
+.ptz-pad .tool-btn {
+    min-width: unset;
+    padding: 0;
+    font-size: 15px;
+    user-select: none;
+    touch-action: none;
+}
+
+.ptz-speed {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    font-size: 12px;
+    color: var(--muted);
+    flex: 1;
+}
+
+.ptz-speed input[type="range"] { width: 100%; accent-color: var(--accent); }
+
+/* ---------- mobile bottom sheets (kept LAST: these must out-cascade the
+   dialogs' desktop geometry above, which shares their specificity) ---------- */
+@media (max-width: 700px) {
+    /* Vertically-centered cards on phones (not bottom sheets). */
+    .event-player,
+    .quick-view {
+        position: fixed;
+        inset: 0;
+        width: min(100vw - 16px, 900px);
+        max-height: calc(100dvh - 24px);
+        margin: auto;
+        border-radius: var(--radius);
+    }
+
+    .campanel {
+        /* keep the base rule's centered top/left/transform; just size for phones */
+        width: min(94vw, 560px);
+        max-height: 88dvh;
+        border-radius: var(--radius);
+    }
+
+    .settings-panel.settings-wide { width: min(96vw, 760px); }
+}
+
+/* Armed emergency mode, on the brand line: the one state that must be visible
+   without opening a dialog. */
+.brand-emg {
+    display: inline-flex;
+    align-items: center;
+    color: var(--err);
+    cursor: pointer;
+    animation: emg-pulse 1.6s ease-in-out infinite;
+}
+
+@keyframes emg-pulse {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.35; }
+}
+
+/* Home grid while the saved layout is still being read back: one calm panel in
+   place of the tiles, in both grid and free modes. */
+.stage-loading {
+    grid-column: 1 / -1;
+    align-self: center;
+    justify-self: center;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 14px 18px;
+    color: var(--muted);
+    font-size: 14px;
+}
+
+.grid.mode-free .stage-loading {
+    position: absolute;
+    inset: 0;
+    justify-content: center;
+}
+
+/* Emergency mode armed: the toolbar pulses red until it is switched off, and
+   carries its own off switch at the right end. */
+.toolbar-emg {
+    border-bottom-color: var(--err);
+    animation: toolbar-emg 1.3s ease-in-out infinite;
+}
+
+@keyframes toolbar-emg {
+    0%, 100% { background: var(--panel); }
+    50% { background: color-mix(in srgb, var(--err) 26%, var(--panel)); }
+}
+
+.emg-toolbar-btn {
+    color: var(--err);
+    border-color: color-mix(in srgb, var(--err) 45%, transparent);
+    margin-left: 6px;
+}
+
+.emg-toolbar-btn:hover:not(:disabled) {
+    color: var(--err);
+    border-color: var(--err);
+    background: color-mix(in srgb, var(--err) 16%, transparent);
+}
+
+/* A flashing bar is exactly what motion sensitivity asks us not to do: hold a
+   steady red instead, so the state is still unmistakable. */
+@media (prefers-reduced-motion: reduce) {
+    .toolbar-emg {
+        animation: none;
+        background: color-mix(in srgb, var(--err) 20%, var(--panel));
+    }
+}
+
+/* Phones scroll the toolbar sideways, which would park the off switch past the
+   right edge. Pin it so it is always on screen — the one control that must
+   never need hunting for. */
+@media (max-width: 700px) {
+    .emg-toolbar-btn {
+        position: sticky;
+        right: 0;
+        margin-left: auto;
+        background: var(--panel);
+        box-shadow: -10px 0 10px -6px var(--panel);
+    }
+
+    .toolbar-emg .emg-toolbar-btn {
+        background: color-mix(in srgb, var(--err) 22%, var(--panel));
+        box-shadow: -10px 0 10px -6px color-mix(in srgb, var(--err) 22%, var(--panel));
+    }
+}
+
+/* A toolbar disarm that failed: the settings dialog is closed, so this is the
+   only place the reason can appear. */
+.toolbar-emg-error {
+    max-width: 40ch;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    color: var(--err);
+    font-size: 11px;
+    padding-left: 8px;
+}

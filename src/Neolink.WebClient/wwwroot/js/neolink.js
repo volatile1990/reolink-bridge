@@ -1,0 +1,2780 @@
+// Neolink web client: MSE player fed by fMP4-over-WebSocket from Neolink.Server.
+(function () {
+    'use strict';
+
+    // Has anyone actually touched this page yet? A clip that auto-opens from a
+    // deep link on a FULL page load (notification tap) starts muted — nobody
+    // asked for audio, and unmuted autoplay is usually blocked anyway. Any real
+    // interaction before playback (clicking an event row) keeps sound on.
+    let userGestureSeen = false;
+    // This file's own URL, so a sibling script can be loaded on demand with the
+    // same cache-busting version and behind the same path prefix (HA ingress).
+    const ownSrc = (document.currentScript && document.currentScript.src) || '';
+    for (const evt of ['pointerdown', 'keydown', 'touchstart'])
+        window.addEventListener(evt, () => { userGestureSeen = true; },
+            { once: true, capture: true, passive: true });
+
+    // Latency tuning: like VLC, keep a jitter buffer between the live edge and the
+    // playhead. Cameras deliver video anywhere from per-frame to whole multi-second
+    // GOP batches, so the cushion adapts to the observed delivery cadence: it must
+    // always cover the gap between two network deliveries.
+    const MIN_LATENCY = 1.0;   // floor for the adaptive target (s)
+    const MAX_LATENCY = 12.0;  // ceiling (s)
+
+    // ---- desktop-shell cooperation: stop live video while nobody can see it ----
+    // The desktop app hides to the tray rather than closing, and a hidden window
+    // decoding a whole camera wall is bandwidth and CPU spent on nobody. When the
+    // shell turns this on (a desktop setting), every live player closes its
+    // socket while the page is hidden and reconnects the moment it shows again.
+    // A plain browser never sets the flag, so tabs behave exactly as before.
+    // The shell also reports hide/show itself (shellVisibility) rather than
+    // trusting the WebView to flip document.hidden — either signal counts.
+    let shellPauseHidden = window.__neolinkShellPauseHidden === true;
+    let shellHidden = false;
+    const liveHidden = () => document.hidden === true || shellHidden;
+    const syncLiveSleep = () => {
+        const want = shellPauseHidden && liveHidden();
+        for (const id in players) {
+            try { want ? players[id].sleep() : players[id].wake(); } catch { }
+        }
+    };
+    document.addEventListener('visibilitychange', () => syncLiveSleep());
+
+    class Player {
+        constructor(video, wsUrl) {
+            this.video = video;
+            // Blazor renders the `muted` attribute, but on dynamically created
+            // elements that only sets defaultMuted — the live property stays false,
+            // and unmuted autoplay is blocked until a user gesture (symptom: frozen
+            // first frame + "connecting…" after a page refresh). Mute for real.
+            video.muted = true;
+            this.wsUrl = wsUrl;
+            this.alive = true;
+            // Born hidden (the page re-rendered tiles while the shell sits in
+            // the tray): start asleep and let the show wake it, instead of
+            // streaming to a window nobody can see.
+            this.sleeping = shellPauseHidden && liveHidden();
+            this.queue = [];
+            this.sb = null;
+            this.ms = null;
+            this.ws = null;
+            this.timer = null;
+            this.started = false;
+            this.latencyTarget = MIN_LATENCY;
+            this.msgGaps = [];
+            this.lastMsgAt = 0;
+            this.msgCount = 0;
+            // `live` tracks the CURRENT state (drives the status overlay and is
+            // cleared on every stall/reconnect). `everLive` is one-way: once a real
+            // frame has painted, the snapshot still is retired for good — otherwise
+            // a flaky camera flashes an old frame back over a frozen-but-newer last
+            // frame on each 3 s retry.
+            this.onPlaying = () => {
+                this.video.dataset.live = '1';
+                this.video.dataset.everLive = '1';
+            };
+            this.onWaiting = () => { this.bump('stall'); this.jumpGap(); };
+            video.addEventListener('playing', this.onPlaying);
+            video.addEventListener('waiting', this.onWaiting);
+            // Session totals for the stats panel — the same events as `diag`, but
+            // never reset, so the readout shows the whole session rather than
+            // whatever landed inside the current 30 s console window.
+            this.totals = { resync: 0, hop: 0, stall: 0 };
+            this.bytes = 0;        // binary payload received this session
+            this.reconnects = 0;
+            this.startedAt = performance.now(); // whole viewing session (bytes span this)
+            this.openedAt = 0;     // performance.now() when the CURRENT socket opened
+            this.meta = null;      // the server's init message (codec/mime/size)
+            // Playback-health counters, reported to the console every 30 s when
+            // anything notable happened. Gap-hops mean footage never REACHED the
+            // browser (the server or the network dropped it) — the one signal
+            // that separates "server can't keep up" from "this device can't".
+            this.diag = { resync: 0, hop: 0, stall: 0 };
+            this.diagTimer = setInterval(() => {
+                const d = this.diag;
+                if (d.resync || d.hop || d.stall) {
+                    const path = decodeURIComponent((this.wsUrl.split('path=')[1] || this.wsUrl).split('&')[0]);
+                    console.info(`[neolink] live ${path}: last 30s — ${d.hop} skip(s) over footage that never arrived `
+                        + `(server/network drops), ${d.resync} live-edge resync(s) (player fell behind), ${d.stall} stall(s)`);
+                }
+                this.diag = { resync: 0, hop: 0, stall: 0 };
+            }, 30_000);
+            this.connect();
+        }
+
+        connect() {
+            if (!this.alive || this.sleeping) return;
+            try {
+                this.ws = new WebSocket(this.wsUrl);
+            } catch {
+                this.retry();
+                return;
+            }
+            this.ws.binaryType = 'arraybuffer';
+            this.ws.onopen = () => { this.openedAt = performance.now(); };
+            this.ws.onmessage = (e) => {
+                if (typeof e.data === 'string') {
+                    this.setup(JSON.parse(e.data));
+                } else {
+                    this.bytes += e.data.byteLength;
+                    // Track delivery cadence: the jitter buffer must cover the largest
+                    // gap between deliveries (GOP-batching cameras pause for seconds).
+                    const now = performance.now() / 1000;
+                    if (this.lastMsgAt > 0) {
+                        this.msgGaps.push(now - this.lastMsgAt);
+                        if (this.msgGaps.length > 10) this.msgGaps.shift();
+                        const maxGap = Math.max(...this.msgGaps);
+                        this.latencyTarget = Math.min(MAX_LATENCY, Math.max(MIN_LATENCY, maxGap * 1.25 + 0.3));
+                    }
+                    this.lastMsgAt = now;
+                    this.msgCount++;
+
+                    this.queue.push(e.data);
+                    if (this.queue.length > 900) this.queue.splice(0, this.queue.length - 300);
+                    this.pump();
+                }
+            };
+            this.ws.onclose = () => { this.teardownMse(); this.retry(); };
+            this.ws.onerror = () => { try { this.ws.close(); } catch { } };
+        }
+
+        retry() {
+            if (!this.alive || this.sleeping) return;
+            this.reconnects++;
+            delete this.video.dataset.live;
+            clearTimeout(this.timer);
+            this.timer = setTimeout(() => this.connect(), 3000);
+        }
+
+        /// One playback-health event: counted for the 30 s console line AND for
+        /// the session totals the stats panel shows.
+        bump(kind) { this.diag[kind]++; this.totals[kind]++; }
+
+        setup(meta) {
+            this.teardownMse();
+            this.meta = meta;
+            // iPhone Safari has NO classic MediaSource: since iOS 17.1 Apple
+            // ships ManagedMediaSource instead — near drop-in, but it must be
+            // detected and used explicitly or live view dies with a misleading
+            // "codec not supported" for every codec.
+            const MS = window.ManagedMediaSource || window.MediaSource;
+            if (!MS) {
+                this.setStatus('⚠ this browser has no Media Source support — live view needs Safari 17.1+/iOS 17.1+ or any Chromium/Firefox');
+                this.alive = false;
+                try { this.ws.close(); } catch { }
+                return;
+            }
+            if (!MS.isTypeSupported(meta.mime)) {
+                // Typically H.265 where the browser has no hardware decoder.
+                this.setStatus('⚠ ' + meta.codec + ' not supported by this browser');
+                this.alive = false;
+                try { this.ws.close(); } catch { }
+                // The host owns the slot, so it decides whether another stream
+                // of this camera is playable here.
+                try {
+                    playerHost?.invokeMethodAsync('OnCodecUnsupported', this.video.id, meta.codec || '');
+                } catch { }
+                return;
+            }
+            this.setStatus('connecting…');
+            // Tell the UI whether this stream carries audio — the speaker toggle
+            // only shows for cameras that actually have some.
+            if (meta.audio) this.video.dataset.audio = '1';
+            else delete this.video.dataset.audio;
+            window.neolink.audioSync();
+            this.ms = new MS();
+            this.mms = false;
+            this.msStreaming = true;
+            if (window.ManagedMediaSource && this.ms instanceof window.ManagedMediaSource) {
+                // Apple's contract: remote playback (AirPlay) must be off for a
+                // ManagedMediaSource-backed element, or sourceopen never fires;
+                // and the source signals when it wants data flowing. Appending
+                // against its wishes (thermals, battery) makes iOS stutter, so
+                // deliveries queue up while it says stop.
+                this.mms = true;
+                this.video.disableRemotePlayback = true;
+                this.ms.addEventListener('startstreaming', () => { this.msStreaming = true; this.pump(); });
+                this.ms.addEventListener('endstreaming', () => { this.msStreaming = false; });
+            }
+            this.video.src = URL.createObjectURL(this.ms);
+            this.ms.addEventListener('sourceopen', () => {
+                if (!this.ms) return;
+                this.sb = this.ms.addSourceBuffer(meta.mime);
+                this.sb.mode = 'segments';
+                this.sb.addEventListener('updateend', () => this.pump());
+                this.pump();
+            }, { once: true });
+            // Playback starts from pump() once START_BUFFER is accumulated.
+        }
+
+        pump() {
+            if (!this.sb || this.sb.updating) return;
+
+            // Trim history so the buffer doesn't grow forever
+            try {
+                const b = this.sb.buffered;
+                if (b.length && this.video.currentTime - b.start(0) > 30) {
+                    this.sb.remove(b.start(0), this.video.currentTime - 10);
+                    return;
+                }
+            } catch { }
+
+            // Append the whole backlog in ONE buffer (fragments are self-contained
+            // moof/mdat pairs, so concatenation is valid MSE input). Per-frame
+            // appends are cheap on Chromium but expensive on Safari — at 25 fps
+            // the per-append overhead alone made iPhones stutter and fall behind.
+            if (this.queue.length && this.msStreaming) {
+                let take = 0, bytes = 0;
+                while (take < this.queue.length && bytes < 1_500_000) {
+                    bytes += this.queue[take].byteLength;
+                    take++;
+                }
+                let buf;
+                if (take === 1) {
+                    buf = this.queue.shift();
+                } else {
+                    const parts = this.queue.splice(0, take);
+                    const joined = new Uint8Array(bytes);
+                    let off = 0;
+                    for (const p of parts) { joined.set(new Uint8Array(p), off); off += p.byteLength; }
+                    buf = joined;
+                }
+                try {
+                    this.sb.appendBuffer(buf);
+                } catch {
+                    // QuotaExceeded or detached buffer: force a clean reconnect
+                    try { this.ws.close(); } catch { }
+                    return;
+                }
+            }
+
+            // If the decoder is starved even though data exists ahead, we're at a
+            // buffered-range gap: hop over it instead of waiting.
+            if (this.started && this.video.readyState < 3) this.jumpGap();
+
+            // Latency management (VLC-style jitter buffer).
+            try {
+                const b = this.sb.buffered;
+                if (!b.length) return;
+                const last = b.length - 1;
+                const end = b.end(last);
+                const t = this.video.currentTime;
+                const ahead = end - t;
+
+                if (!this.started) {
+                    // Start once the delivery cadence is known (≥1 measured gap) and the
+                    // buffer can cover the latency target.
+                    const span = end - b.start(last);
+                    if (this.msgGaps.length >= 1 && span >= this.latencyTarget) {
+                        this.started = true;
+                        this.video.currentTime = Math.max(b.start(last), end - this.latencyTarget);
+                        // If playback is refused (autoplay policy), clear `started` so the
+                        // next delivery retries instead of freezing on the first frame.
+                        this.video.play().catch(() => { this.started = false; });
+                    }
+                    return;
+                }
+
+                const inLast = t >= b.start(last) - 0.01;
+                if (!inLast) return; // behind a gap: jumpGap handles it
+
+                // Backgrounded (phone locked, app switched): the element barely
+                // advances by design — chasing now means pointless seeks, and the
+                // first pump after returning does one clean resync instead.
+                if (document.hidden) return;
+
+                // Safari's pipeline visibly janks on higher playback rates, so the
+                // ManagedMediaSource path drifts back more softly.
+                const chase = this.mms ? 1.05 : 1.1;
+                if (ahead > this.latencyTarget + 5) {
+                    this.bump('resync');
+                    this.video.currentTime = end - this.latencyTarget; // hard resync
+                    this.video.playbackRate = 1.0;
+                } else if (ahead > this.latencyTarget + 1) {
+                    this.video.playbackRate = chase;  // drift back gently, invisibly
+                } else if (this.video.playbackRate !== 1.0) {
+                    this.video.playbackRate = 1.0;
+                }
+            } catch { }
+        }
+
+        // Seek over a hole in the buffered ranges (caused by dropped frames upstream).
+        jumpGap() {
+            if (!this.sb) return;
+            try {
+                const b = this.sb.buffered;
+                const t = this.video.currentTime;
+                for (let i = 0; i < b.length; i++) {
+                    if (b.start(i) > t + 0.01 && b.start(i) - t < 10) {
+                        this.bump('hop');
+                        this.video.currentTime = b.start(i) + 0.05;
+                        return;
+                    }
+                }
+            } catch { }
+        }
+
+        setStatus(text) {
+            const overlay = this.video.parentElement?.querySelector('.tile-status');
+            if (overlay) overlay.textContent = text;
+        }
+
+        /// A raw snapshot of everything knowable about this stream right now. Rates
+        /// (fps, bitrate) are deltas, so the caller derives those from consecutive
+        /// snapshots — this only reports counters and instantaneous values.
+        stats() {
+            const v = this.video;
+            let q = null;
+            try { q = v.getVideoPlaybackQuality ? v.getVideoPlaybackQuality() : null; } catch { }
+            let ahead = null;
+            try {
+                const b = this.sb && this.sb.buffered;
+                if (b && b.length) ahead = b.end(b.length - 1) - v.currentTime;
+            } catch { }
+            return {
+                at: performance.now(),
+                path: decodeURIComponent((this.wsUrl.split('path=')[1] || '').split('&')[0]),
+                codec: this.meta && this.meta.codec, mime: this.meta && this.meta.mime,
+                srcW: this.meta && this.meta.width, srcH: this.meta && this.meta.height,
+                hasAudio: !!(this.meta && this.meta.audio), muted: v.muted,
+                w: v.videoWidth, h: v.videoHeight,
+                elW: Math.round(v.clientWidth), elH: Math.round(v.clientHeight),
+                dpr: window.devicePixelRatio || 1,
+                // Decoded/dropped are the browser's own numbers: dropped here means
+                // THIS device couldn't keep up, which is a different failure from a
+                // gap-hop (footage that never arrived at all).
+                frames: q ? q.totalVideoFrames : null,
+                dropped: q ? q.droppedVideoFrames : null,
+                corrupted: q ? q.corruptedVideoFrames : null,
+                ahead, target: this.latencyTarget, rate: v.playbackRate,
+                readyState: v.readyState, live: v.dataset.live === '1',
+                bytes: this.bytes, fragments: this.msgCount,
+                maxGap: this.msgGaps.length ? Math.max(...this.msgGaps) : null,
+                hop: this.totals.hop, resync: this.totals.resync, stall: this.totals.stall,
+                ws: this.ws ? this.ws.readyState : 3,
+                wsQueued: this.ws ? this.ws.bufferedAmount : 0,
+                // Two different clocks, and mixing them lies: bytes accumulate over
+                // the whole session, while a reconnect restarts the link's own uptime.
+                session: (performance.now() - this.startedAt) / 1000,
+                uptime: this.openedAt ? (performance.now() - this.openedAt) / 1000 : 0,
+                reconnects: this.reconnects,
+                engine: this.mms ? 'ManagedMediaSource' : 'MediaSource',
+            };
+        }
+
+        teardownMse() {
+            this.sb = null;
+            this.queue = [];
+            this.started = false;
+            try { this.video.playbackRate = 1.0; } catch { }
+            delete this.video.dataset.live;
+            if (this.video.src) {
+                try { URL.revokeObjectURL(this.video.src); } catch { }
+                this.video.removeAttribute('src');
+                try { this.video.load(); } catch { }
+            }
+            this.ms = null;
+        }
+
+        destroy() {
+            this.alive = false;
+            clearTimeout(this.timer);
+            clearInterval(this.diagTimer);
+            this.video.removeEventListener('playing', this.onPlaying);
+            this.video.removeEventListener('waiting', this.onWaiting);
+            try { this.ws && this.ws.close(); } catch { }
+            this.teardownMse();
+        }
+
+        /// The shell's nap: the window is hidden, so stop the STREAM, not just
+        /// the rendering — the socket closes and the server stops sending.
+        sleep() {
+            if (this.sleeping || !this.alive) return;
+            this.sleeping = true;
+            clearTimeout(this.timer);
+            if (this.ws) {
+                this.ws.onclose = null;   // closed by choice, not a failure: no retry loop
+                this.ws.onerror = null;
+                try { this.ws.close(); } catch { }
+                this.ws = null;
+            }
+            this.teardownMse();
+        }
+
+        wake() {
+            if (!this.sleeping) return;
+            this.sleeping = false;
+            if (this.alive) this.connect();   // straight away, no 3 s retry wait
+        }
+    }
+
+    const players = {};
+    // The Blazor host that owns tile stream selection, so a codec this browser
+    // cannot decode can be answered with one it can.
+    let playerHost = null;
+
+    // ---------- "stats for nerds": the live stream's technical readout ----------
+    // A DOM-side overlay (no Blazor circuit traffic at 1 Hz) that answers the two
+    // questions a camera stream actually raises when it looks bad: is the picture
+    // arriving, and can this device decode it? Those have different culprits, so
+    // the panel keeps them apart — dropped frames are THIS browser giving up,
+    // gap-hops are footage that never reached it at all.
+    const statsPanels = {};
+    const WS_STATE = ['connecting', 'open', 'closing', 'closed'];
+    const nerdEsc = (s) => String(s ?? '—').replace(/[&<>"]/g, c =>
+        ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+    const nerdBytes = (n) => n >= 1e9 ? (n / 1e9).toFixed(2) + ' GB'
+        : n >= 1e6 ? (n / 1e6).toFixed(1) + ' MB'
+        : n >= 1e3 ? (n / 1e3).toFixed(0) + ' kB' : (n | 0) + ' B';
+    const nerdRate = (bps) => bps >= 1e6 ? (bps / 1e6).toFixed(2) + ' Mb/s' : Math.round(bps / 1e3) + ' kb/s';
+    const nerdDur = (s) => {
+        s = Math.max(0, Math.round(s));
+        const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), x = s % 60;
+        return h ? `${h}h ${m}m` : m ? `${m}m ${x}s` : `${x}s`;
+    };
+
+    // One 1 Hz repaint: derives the rates from consecutive snapshots, fills the
+    // rows, extends the bitrate sparkline and writes the plain-language verdict.
+    function nerdRender(st, s) {
+        const prev = st.prev;
+        st.prev = s;
+        let fps = null, bps = null;
+        if (prev) {
+            const dt = (s.at - prev.at) / 1000;
+            if (dt > 0.2) {
+                if (s.frames != null && prev.frames != null) fps = (s.frames - prev.frames) / dt;
+                bps = Math.max(0, (s.bytes - prev.bytes) * 8 / dt);
+            }
+        }
+        if (bps != null) { st.spark.push(bps); if (st.spark.length > 60) st.spark.shift(); }
+        const dropPct = s.frames ? (s.dropped / s.frames) * 100 : 0;
+        const avgBps = s.session > 0 ? s.bytes * 8 / s.session : 0;
+
+        const rows = [
+            ['stream', s.path],
+            ['source', s.srcW ? `${s.srcW}×${s.srcH}` : '—'],
+            ['decoding', s.w ? `${s.w}×${s.h} → ${s.elW}×${s.elH} css @ ${s.dpr}× dpr` : 'no frames yet'],
+            ['codec', s.codec],
+            ['fps', fps == null ? 'measuring…' : fps.toFixed(1)],
+            ['frames', s.frames == null ? 'not reported'
+                : `${s.frames.toLocaleString()} decoded · ${s.dropped.toLocaleString()} dropped (${dropPct.toFixed(2)}%)`,
+                dropPct >= 2 ? 'bad' : dropPct >= 0.5 ? 'warn' : ''],
+            ['buffer', s.ahead == null ? '—' : `${s.ahead.toFixed(2)} s ahead / ${s.target.toFixed(2)} s target`,
+                s.ahead != null && s.ahead < 0.15 ? 'warn' : ''],
+            ['speed', `${s.rate.toFixed(2)}×${s.rate > 1.001 ? ' (catching up)' : ''}`, s.rate > 1.001 ? 'warn' : ''],
+            ['bitrate', bps == null ? 'measuring…' : `${nerdRate(bps)} · avg ${nerdRate(avgBps)}`],
+            ['received', `${nerdBytes(s.bytes)} in ${nerdDur(s.session)}`],
+            ['delivery', `${s.fragments.toLocaleString()} fragments · widest gap ${s.maxGap == null ? '—' : s.maxGap.toFixed(2) + ' s'}`],
+            ['never arrived', `${s.hop} skip${s.hop === 1 ? '' : 's'}`, s.hop ? 'warn' : ''],
+            ['recovery', `${s.resync} resync${s.resync === 1 ? '' : 's'} · ${s.stall} stall${s.stall === 1 ? '' : 's'}`],
+            ['link', `${WS_STATE[s.ws]}${s.ws === 1 ? ' ' + nerdDur(s.uptime) : ''} · ${nerdBytes(s.wsQueued)} queued · `
+                + `${s.reconnects} reconnect${s.reconnects === 1 ? '' : 's'}`,
+                s.ws === 1 ? (s.reconnects ? 'warn' : '') : 'bad'],
+            ['engine', `${s.engine} · audio ${s.hasAudio ? (s.muted ? 'present (muted)' : 'playing') : 'none'}`],
+        ];
+
+        // Starved source: the link is fine and nothing was skipped or dropped, yet
+        // fragments arrive seconds apart at a trickle bitrate — the CAMERA is not
+        // producing/shipping enough video (some battery models' radios can't carry
+        // what their own encoder makes). No knob on this device helps.
+        const starved = s.ws === 1 && s.hop === 0 && dropPct < 2 && s.session > 20
+            && s.maxGap != null && s.maxGap >= 3 && avgBps > 0 && avgBps < 400_000 && s.frames > 0;
+
+        let verdict = 'healthy — picture is arriving and decoding cleanly', vcls = 'ok';
+        if (s.ws !== 1) { verdict = `link ${WS_STATE[s.ws]} — trying to reconnect`; vcls = 'bad'; }
+        else if (dropPct >= 2) { verdict = 'this device is dropping frames — try the sub stream or close other tiles'; vcls = 'bad'; }
+        else if (s.hop > 0) { verdict = 'footage went missing before it reached the browser — server or network, not this device'; vcls = 'warn'; }
+        else if (starved) { verdict = 'the camera is sending less video than the stream needs — its radio can’t keep up with its encoder (known on some battery models); not this device or network'; vcls = 'warn'; }
+        else if (!s.live) { verdict = 'buffering — waiting for enough video to start'; vcls = 'warn'; }
+        else if (s.rate > 1.001) { verdict = 'playing slightly fast to drift back toward live'; vcls = 'warn'; }
+
+        st.el.querySelector('.nerd-rows').innerHTML = rows.map(([k, v, cls]) =>
+            `<div class="nerd-row"><span>${nerdEsc(k)}</span><b class="${cls || ''}">${nerdEsc(v)}</b></div>`).join('');
+
+        // Bitrate over the last minute — the shape says more than the number: a
+        // sawtooth is GOP batching, a cliff is the camera or the link giving up.
+        const peak = Math.max(1, ...st.spark);
+        const pts = st.spark.map((b, i) =>
+            `${(i / Math.max(1, st.spark.length - 1) * 160).toFixed(1)},${(26 - (b / peak) * 24).toFixed(1)}`).join(' ');
+        st.el.querySelector('.nerd-sparkline').setAttribute('points', pts);
+        st.el.querySelector('.nerd-sparklabel').textContent = `bitrate, last ${st.spark.length}s · peak ${nerdRate(peak)}`;
+        const vEl = st.el.querySelector('.nerd-verdict');
+        vEl.textContent = verdict;
+        vEl.className = 'nerd-verdict ' + vcls;
+
+        // Kept ready so "copy" is instant — a paste-ready report for an issue.
+        st.text = [`neolink.net — live stream stats (${new Date().toISOString()})`,
+            ...rows.map(([k, v]) => `${k.padEnd(14)}${v}`),
+            `verdict       ${verdict}`,
+            `browser       ${navigator.userAgent}`].join('\n');
+    }
+
+    // Flat speaker SVGs (built once — audioSync runs on every render). Emoji
+    // render inconsistently across platforms, so these are inline SVG.
+    const _spk = (body) => '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" '
+        + 'stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" '
+        + 'aria-hidden="true"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/>' + body + '</svg>';
+    const VOL_ON = _spk('<path d="M15.54 8.46a5 5 0 0 1 0 7.07"/><path d="M19.07 4.93a10 10 0 0 1 0 14.14"/>');
+    const VOL_OFF = _spk('<line x1="23" y1="9" x2="17" y2="15"/><line x1="17" y1="9" x2="23" y2="15"/>');
+
+    // Fullscreen state only exists browser-side; expose it as a body class so
+    // CSS can swap the enter/exit glyph on the tile buttons without a server trip.
+    document.addEventListener('fullscreenchange', () => {
+        document.body.classList.toggle('is-fullscreen', !!document.fullscreenElement);
+    });
+
+    // ---------- freeform layout (draggable/resizable tiles, geometry persisted) ----------
+    const free = {
+        key: 'neolink.freegeo',
+        z: 10,
+        saveTimer: null,
+        // In-memory geometry is the truth; localStorage is only persistence.
+        // Re-applying straight from localStorage raced the debounced save: a
+        // Blazor render right after a drag re-read the OLD positions (snap-back),
+        // which then "corrected themselves" once the 250ms write landed.
+        geo: null,
+        applying: false, // programmatic layout must not echo back into capture
+        load() {
+            if (!this.geo) {
+                try { this.geo = JSON.parse(localStorage.getItem(this.key)) || {}; } catch { this.geo = {}; }
+            }
+            return this.geo;
+        },
+        save(geo) {
+            this.geo = geo;
+            clearTimeout(this.saveTimer);
+            this.saveTimer = setTimeout(() => localStorage.setItem(this.key, JSON.stringify(geo)), 250);
+        },
+        // Geometry is stored as FRACTIONS of the stage, so freeform windows scale
+        // with the browser instead of being stranded at fixed pixel spots.
+        capture(stage) {
+            if (this.applying) return;
+            const W = stage.clientWidth, H = stage.clientHeight;
+            if (!W || !H) return;
+            const geo = this.load();
+            stage.querySelectorAll('.tile').forEach(tile => {
+                if (!tile.style.width) return;
+                geo[tile.dataset.slot] = {
+                    x: tile.offsetLeft / W, y: tile.offsetTop / H,
+                    w: tile.offsetWidth / W, h: tile.offsetHeight / H,
+                };
+            });
+            this.save(geo);
+        },
+        // Lays every (non-dragging) tile out from its stored fractions at the
+        // stage's CURRENT size — also runs whenever the stage resizes.
+        apply(stage) {
+            const W = stage.clientWidth, H = stage.clientHeight;
+            if (!W || !H) return;
+            const geo = this.load();
+            this.applying = true;
+            let migrated = false;
+            stage.querySelectorAll('.tile').forEach((tile, idx) => {
+                if (tile.dataset.dragging) return;
+                const slot = tile.dataset.slot ?? String(idx);
+                let g = geo[slot] || {
+                    x: (24 + 32 * idx) / W, y: (24 + 32 * idx) / H,
+                    w: Math.min(0.55, 440 / W), h: Math.min(0.5, 280 / H),
+                };
+                // Legacy pixel geometry (pre-fractions): convert once and WRITE IT
+                // BACK — re-normalizing the same pixels at a different stage size
+                // would corrupt the layout.
+                if (g.w > 1.5 || g.h > 1.5) {
+                    g = { x: g.x / W, y: g.y / H, w: g.w / W, h: g.h / H };
+                    geo[slot] = g;
+                    migrated = true;
+                }
+                const w = Math.min(Math.max(g.w, 0.08), 1);
+                const h = Math.min(Math.max(g.h, 0.08), 1);
+                const x = Math.min(Math.max(g.x, 0), 1 - w);
+                const y = Math.min(Math.max(g.y, 0), 1 - h);
+                tile.style.left = Math.round(x * W) + 'px';
+                tile.style.top = Math.round(y * H) + 'px';
+                tile.style.width = Math.round(w * W) + 'px';
+                tile.style.height = Math.round(h * H) + 'px';
+            });
+            if (migrated) this.save(geo);
+            setTimeout(() => { this.applying = false; }, 80); // outlive the ResizeObserver echo
+        },
+    };
+
+    function freeInit(stageId) {
+        const stage = document.getElementById(stageId);
+        if (!stage || !stage.classList.contains('mode-free')) return;
+
+        free.apply(stage);
+
+        // Follow the browser: when the stage resizes, re-lay the windows out
+        // from their fractions so they grow/shrink with it.
+        if (!stage.dataset.freeResize) {
+            stage.dataset.freeResize = '1';
+            new ResizeObserver(() => {
+                if (stage.classList.contains('mode-free')) free.apply(stage);
+            }).observe(stage);
+        }
+
+        stage.querySelectorAll('.tile').forEach((tile, idx) => {
+            if (tile.dataset.freeInit) return;
+            tile.dataset.freeInit = '1';
+
+            tile.addEventListener('pointerdown', () => { tile.style.zIndex = ++free.z; });
+
+            // Drag by the header strip
+            const head = tile.querySelector('.tile-head');
+            if (head) {
+                head.addEventListener('pointerdown', (e) => {
+                    if (e.button !== 0) return;
+                    e.preventDefault();
+                    head.setPointerCapture(e.pointerId);
+                    tile.dataset.dragging = '1';
+                    const sx = e.clientX, sy = e.clientY;
+                    const ox = tile.offsetLeft, oy = tile.offsetTop;
+                    const move = (ev) => {
+                        tile.style.left = Math.max(0, ox + ev.clientX - sx) + 'px';
+                        tile.style.top = Math.max(0, oy + ev.clientY - sy) + 'px';
+                    };
+                    const up = () => {
+                        head.removeEventListener('pointermove', move);
+                        head.removeEventListener('pointerup', up);
+                        delete tile.dataset.dragging;
+                        free.capture(stage);
+                    };
+                    head.addEventListener('pointermove', move);
+                    head.addEventListener('pointerup', up);
+                });
+            }
+
+            // Persist native CSS resize (resize: both)
+            new ResizeObserver(() => {
+                if (!tile.isConnected || !tile.style.width) return;
+                if (!stage.classList.contains('mode-free')) return;
+                free.capture(stage);
+            }).observe(tile);
+        });
+    }
+
+    // ---------- timeline page (recorded footage scrubbing) ----------
+    const scrubs = {};
+    const zooms = {};      // per-element zoom/hover/pinch handler registries
+    const resizers = {};   // per-element board-divider drag registries
+    let tlKeyHandler = null;
+    let tlPinching = false; // two-finger zoom in progress: scrubbing must yield
+
+    // ---------- monitor page (browser-side FPS/heap sampling state) ----------
+    const perf = { raf: 0, frames: 0, windowStart: 0, fps: 0 };
+
+    // ---------- monitor page (live server log tails) ----------
+    const logTails = {};
+    let evMoreObs = null, evMoreScroll = null;
+    // A camera's log lines start "{name}: …" or "{name} (Main): …" — the
+    // delimiter keeps "Drive" from matching "Driveway".
+    const logCamHit = (msg, cam) => msg.startsWith(cam + ':') || msg.startsWith(cam + ' (');
+
+    window.neolink = {
+        freeInit,
+
+        // Freeform geometry accessors for Blazor (saved layouts). They talk to
+        // the LIVE in-memory state — a plain localStorage read could be a
+        // debounce-interval behind what's on screen.
+        freeGeometry() {
+            return JSON.stringify(free.load());
+        },
+        freeSetGeometry(json) {
+            try { free.geo = JSON.parse(json) || {}; } catch { free.geo = {}; }
+            clearTimeout(free.saveTimer);
+            localStorage.setItem(free.key, JSON.stringify(free.geo));
+        },
+
+        // Briefly flash a tile's border red — used when a camera the user picked
+        // is already on screen (so we don't duplicate or clobber another tile).
+        flashTile(id) {
+            const el = document.getElementById(id);
+            if (!el) return;
+            el.classList.remove('tile-flash');
+            void el.offsetWidth; // reflow so a repeat click restarts the animation
+            el.classList.add('tile-flash');
+            setTimeout(() => el.classList.remove('tile-flash'), 950);
+        },
+
+        // The home page's per-render wiring in one interop call. Every helper is
+        // idempotent, so calling all of them each render is safe; batching keeps
+        // it to a single round trip.
+        wire(ref, o) {
+            if (o.freeGrid) this.freeInit(o.freeGrid);
+            // Digital zoom: re-run per render so zoom resets when a surface stops
+            // being zoomable (e.g. un-maximized).
+            this.zoomInit();
+            this.audioInit();
+            this.escInit();
+            this.dndInit();
+            this.tileResizeInit(ref);
+            this.playerHostInit(ref);
+            if (o.strip) {
+                this.trickle(o.trickleSpeed, o.trickleSuspend);
+                this.stripResizeInit('events-bar', ref);
+                this.stripNavInit('events-scroll-wrap');
+            }
+            const p = o.player;
+            if (p) this.eventPlayer(p.id, p.url, p.rate, p.fallback, p.autoplay, p.ongoing);
+            // Zones first: the detector must never draw a box before it knows
+            // which part of the view the camera is set to watch.
+            if (o.detectZones) this.detectZones(o.detectZones);
+            this.detect(o.detect || null);
+        },
+
+        // Live object boxes (preview). The detector is a separate script that is
+        // fetched the first time it is actually wanted, so a server with the
+        // feature off never downloads a byte of it. `cfg` is null whenever boxes
+        // should not be drawn — which is every view except one camera on its own.
+        detect(cfg) {
+            this._detectWant = cfg;
+            if (window.neolinkDetect) { window.neolinkDetect.sync(cfg); return; }
+            if (!cfg || this._detectLoading || !ownSrc) return;
+            this._detectLoading = true;
+            const el = document.createElement('script');
+            el.src = ownSrc.replace(/neolink\.js/, 'detect.js');
+            el.onload = () => {
+                this._detectLoading = false;
+                // The view may have moved on while it loaded.
+                if (!window.neolinkDetect) return;
+                for (const z of Object.values(this._detectZoneStash || {}))
+                    window.neolinkDetect.zones(z);
+                window.neolinkDetect.sync(this._detectWant || null);
+            };
+            el.onerror = () => {
+                this._detectLoading = false;
+                console.warn('neolink: the object detector script could not be loaded');
+            };
+            document.head.appendChild(el);
+        },
+
+        // The camera's detection-zone grids for the boxes. Kept here as well as
+        // handed on, because the detector script may still be downloading — and
+        // sent only when they change: a grid is far too big to ride the per-render
+        // config across the circuit.
+        detectZones(payload) {
+            if (!payload || !payload.camera) return;
+            (this._detectZoneStash ||= {})[payload.camera] = payload;
+            if (window.neolinkDetect) window.neolinkDetect.zones(payload);
+        },
+
+        // Ambient event previews (review strip): ensure real muting, fast-forward
+        // playback rate and looped playback. Idempotent, called per render.
+        // `suspend` RELEASES their decoders (a phone has very few, and the event
+        // player needs one); the src is stashed so the next call restores it.
+        trickle(speed, suspend) {
+            document.querySelectorAll('video[data-trickle]').forEach(v => {
+                if (suspend) {
+                    if (!v.dataset.trickleSrc && v.getAttribute('src')) {
+                        v.dataset.trickleSrc = v.getAttribute('src');
+                        v.pause();
+                        v.removeAttribute('src');
+                        try { v.load(); } catch { }
+                    }
+                    return;
+                }
+                if (v.dataset.trickleSrc) {
+                    // Blazor's diff sees no change, so the attribute is restored here.
+                    v.setAttribute('src', v.dataset.trickleSrc);
+                    delete v.dataset.trickleSrc;
+                    try { v.load(); } catch { }
+                }
+                v.muted = true;
+                v.defaultPlaybackRate = v.playbackRate = speed || 4;
+                if (v.paused) v.play().catch(() => { });
+            });
+        },
+
+        // Drives the event player: points the <video> at `url` (the user picks
+        // main clip or sub-stream preview), preserving the current position
+        // across a source swap, and applies the playback rate. Idempotent — a
+        // same-url call only updates the rate.
+        //
+        // Fast playback borrows the timeline's recipe: above 1× the audio is
+        // muted (the decoder drops the audio pipeline entirely — that, not
+        // video, is what stalled full-res clips at high rates), and the native
+        // playbackRate does the rest. The previous mute state comes back at 1×.
+        // `autoplay === false` attaches the source without starting playback;
+        // a swap made while the video is playing still resumes it. `ongoing`
+        // delays the failure overlay: still-recording clips fail transiently
+        // and auto-retry, so only a persistent failure earns the message.
+        eventPlayer(videoId, url, rate, fallback, autoplay, ongoing) {
+            const v = document.getElementById(videoId);
+            if (!v || !url) return;
+            const clearErrTimer = () => {
+                clearTimeout(+v.dataset.evErrTimer || 0);
+                delete v.dataset.evErrTimer;
+            };
+            const applyRate = () => {
+                v.defaultPlaybackRate = v.playbackRate = rate;
+                if (rate > 1) {
+                    if (!v.dataset.evFfMuted) v.dataset.evFfMuted = v.muted ? 'm' : 'u';
+                    v.muted = true;
+                } else if (v.dataset.evFfMuted) {
+                    v.muted = v.dataset.evFfMuted === 'm';
+                    delete v.dataset.evFfMuted;
+                }
+            };
+            // A failed fetch (camera refused the recording, server error) leaves a
+            // <video> silently black — surface it. The overlay clears whenever a
+            // new source attaches.
+            const errorBox = () => v.closest('.event-player-media') || v.parentElement;
+            v.onerror = () => {
+                // The SD preview can be unplayable (a sub stream that never
+                // delivered a frame) while the HD clip is fine — swap once,
+                // silently, before surfacing an error.
+                if (fallback && v.dataset.evUrl !== fallback) {
+                    const resume = autoplay !== false || !v.paused;
+                    v.dataset.evUrl = fallback;
+                    v.src = fallback;
+                    try { v.load(); } catch { }
+                    if (resume) v.play().catch(() => { v.muted = true; v.play().catch(() => { }); });
+                    return;
+                }
+                // An aborted load is our own doing (a swap, a close) — never an error.
+                const code = v.error?.code ?? 0;
+                if (code === 1) return;
+                const box = errorBox();
+                if (!box || box.querySelector('.video-error')) return;
+                const show = () => {
+                    if (box.querySelector('.video-error')) return;
+                    const d = document.createElement('div');
+                    d.className = 'video-error';
+                    // Only a network/format failure is the server's to explain; a
+                    // decode failure is this device out of video decoders (phones
+                    // have few) and no server log will mention it.
+                    d.textContent = code === 3
+                        ? 'This device could not decode the video — close other camera views, ' +
+                          'or try SD quality or 1× speed.'
+                        : code === 2
+                            ? 'The connection dropped while loading this video.'
+                            : 'Playback failed — the server could not fetch this video. ' +
+                              'The server log has the reason.';
+                    box.appendChild(d);
+                };
+                if (!ongoing) show();
+                else if (!v.dataset.evErrTimer)
+                    v.dataset.evErrTimer = String(setTimeout(show, 7000));
+            };
+            if (v.dataset.evUrl !== url) {
+                errorBox()?.querySelector('.video-error')?.remove();
+                clearErrTimer();
+                const at = (v.currentTime && isFinite(v.currentTime)) ? v.currentTime : 0;
+                const wasPlaying = !v.paused;
+                v.dataset.evUrl = url;
+                v.src = url;
+                const onMeta = () => {
+                    v.removeEventListener('loadedmetadata', onMeta);
+                    clearErrTimer();
+                    try { if (at > 0 && at < v.duration) v.currentTime = at; } catch { }
+                    applyRate();
+                    if (autoplay === false && !wasPlaying) return;
+                    // Fresh full-page load (notification deep link): start muted
+                    // by design. Otherwise autoplay policy can still veto sound —
+                    // retry muted so the clip starts either way; the user can
+                    // unmute on the controls.
+                    if (!userGestureSeen) v.muted = true;
+                    v.play().catch(() => { v.muted = true; v.play().catch(() => { }); });
+                };
+                v.addEventListener('loadedmetadata', onMeta);
+                try { v.load(); } catch { }
+            } else {
+                applyRate();
+                // A failed clip's URL does not change, so the caller's same-url
+                // re-invocations drive retries here. Rate-limited: the home page
+                // re-invokes on every render, which would otherwise reload the
+                // whole clip in a loop.
+                if (v.error && !v.dataset.evRetry
+                    && Date.now() - (+v.dataset.evRetryAt || 0) > 3000) {
+                    v.dataset.evRetry = '1';
+                    v.dataset.evRetryAt = String(Date.now());
+                    const onRetryMeta = () => {
+                        delete v.dataset.evRetry;
+                        errorBox()?.querySelector('.video-error')?.remove();
+                        clearErrTimer();
+                        applyRate();
+                        if (autoplay !== false)
+                            v.play().catch(() => { v.muted = true; v.play().catch(() => { }); });
+                    };
+                    v.addEventListener('loadedmetadata', onRetryMeta, { once: true });
+                    v.addEventListener('error', () => {
+                        delete v.dataset.evRetry;
+                        v.removeEventListener('loadedmetadata', onRetryMeta);
+                    }, { once: true });
+                    v.src = url;
+                    try { v.load(); } catch { delete v.dataset.evRetry; }
+                }
+            }
+        },
+
+        // Event-strip edge arrows: shown only while that side actually has more
+        // to scroll, clicking pages the strip by most of a viewport. All state
+        // lives here (classes on the wrapper) — no circuit traffic per scroll.
+        stripNavInit(wrapId) {
+            const wrap = document.getElementById(wrapId);
+            if (!wrap || wrap.dataset.navInit) return;
+            wrap.dataset.navInit = '1';
+            const scroll = wrap.querySelector('.events-bar-scroll');
+            if (!scroll) return;
+            const update = () => {
+                wrap.classList.toggle('can-left', scroll.scrollLeft > 2);
+                wrap.classList.toggle('can-right',
+                    scroll.scrollLeft + scroll.clientWidth < scroll.scrollWidth - 2);
+            };
+            scroll.addEventListener('scroll', update, { passive: true });
+            new ResizeObserver(update).observe(scroll);            // strip/window resized
+            new MutationObserver(update).observe(scroll, { childList: true }); // cards came/went
+            const page = (dir) => scroll.scrollBy({ left: dir * scroll.clientWidth * 0.8, behavior: 'smooth' });
+            wrap.querySelector('.strip-nav-left')?.addEventListener('click', () => page(-1));
+            wrap.querySelector('.strip-nav-right')?.addEventListener('click', () => page(1));
+
+            // Swipe/drag panning (mouse only): press anywhere on the strip and drag
+            // to scroll it. Touch is left alone — the browser already pans natively.
+            // A real drag (>5px) swallows the click on release so the card under
+            // the cursor doesn't open, but a plain click still plays its event.
+            const drag = { active: false, moved: false, startX: 0, startLeft: 0 };
+            scroll.addEventListener('pointerdown', (e) => {
+                if (e.pointerType !== 'mouse' || e.button !== 0) return;
+                drag.active = true;
+                drag.moved = false;
+                drag.startX = e.clientX;
+                drag.startLeft = scroll.scrollLeft;
+            });
+            scroll.addEventListener('pointermove', (e) => {
+                if (!drag.active) return;
+                const dx = e.clientX - drag.startX;
+                if (!drag.moved) {
+                    if (Math.abs(dx) < 5) return; // still just a (wobbly) click
+                    drag.moved = true;
+                    scroll.classList.add('strip-dragging');
+                    try { scroll.setPointerCapture(e.pointerId); } catch { }
+                }
+                scroll.scrollLeft = drag.startLeft - dx;
+            });
+            const dragEnd = (e) => {
+                if (!drag.active) return;
+                drag.active = false;
+                scroll.classList.remove('strip-dragging');
+                try { scroll.releasePointerCapture(e.pointerId); } catch { }
+            };
+            scroll.addEventListener('pointerup', dragEnd);
+            scroll.addEventListener('pointercancel', dragEnd);
+            scroll.addEventListener('click', (e) => {
+                if (!drag.moved) return;
+                drag.moved = false; // this click ends the pan, nothing more
+                e.stopPropagation();
+                e.preventDefault();
+            }, { capture: true });
+            // Thumbnails are draggable by default; that would hijack the pan.
+            scroll.addEventListener('dragstart', (e) => e.preventDefault());
+
+            update();
+        },
+
+        // Esc dismisses the quick view and the event player by clicking the
+        // dialog's own [data-esc-close] button, so every Blazor-side close effect
+        // runs. Target by that marker, never by the title text: it is localized.
+        escInit() {
+            if (document.body.dataset.escInit) return;
+            document.body.dataset.escInit = '1';
+            document.addEventListener('keydown', (e) => {
+                if (e.key !== 'Escape') return;
+                // The tile context menu closes first (its backdrop is the closer).
+                const ctx = document.querySelector('.ctx-backdrop');
+                if (ctx) {
+                    e.preventDefault();
+                    ctx.click();
+                    return;
+                }
+                const dialogs = document.querySelectorAll('.quick-view, .event-player');
+                const btn = dialogs.length
+                    ? dialogs[dialogs.length - 1].querySelector('[data-esc-close]')
+                    : null;
+                if (btn) {
+                    e.preventDefault();
+                    btn.click();
+                }
+            });
+        },
+
+        // HTML5 drag sources must put SOMETHING in dataTransfer or Firefox never
+        // starts the drag; the real drag state lives Blazor-side. Idempotent.
+        dndInit() {
+            if (document.body.dataset.dndInit) return;
+            document.body.dataset.dndInit = '1';
+            document.addEventListener('dragstart', (e) => {
+                const src = e.target instanceof Element ? e.target.closest('[draggable="true"]') : null;
+                if (src && e.dataTransfer) {
+                    e.dataTransfer.setData('text/plain', src.id || 'neolink');
+                    e.dataTransfer.effectAllowed = 'move';
+                }
+            });
+        },
+
+        // Grid-mode corner grips: dragging resizes a tile in whole grid-cell
+        // steps (live inline preview; the span is committed to Blazor on release
+        // and persisted with the view). All motion stays off the circuit.
+        tileResizeInit(dotnetRef) {
+            if (document.body.dataset.tileResizeInit) return;
+            document.body.dataset.tileResizeInit = '1';
+            document.addEventListener('pointerdown', (e) => {
+                const handle = e.target instanceof Element ? e.target.closest('.tile-size-handle') : null;
+                if (!handle) return;
+                const tile = handle.closest('.tile');
+                const grid = document.getElementById('stage-grid');
+                if (!tile || !grid) return;
+                e.preventDefault();
+                e.stopPropagation();
+                tile.draggable = false; // the grip resizes — it must not start a tile drag
+
+                const colCount = getComputedStyle(grid).gridTemplateColumns.split(' ').length;
+                const gap = parseFloat(getComputedStyle(grid).gap) || 8;
+                const start = tile.getBoundingClientRect();
+                const c0 = parseInt(tile.dataset.cols || '1');
+                const r0 = parseInt(tile.dataset.rows || '1');
+                const unitW = (start.width - gap * (c0 - 1)) / c0;
+                const unitH = (start.height - gap * (r0 - 1)) / r0;
+                let cols = c0, rows = r0;
+
+                const move = (ev) => {
+                    cols = Math.max(1, Math.min(colCount,
+                        Math.round((ev.clientX - start.left + gap / 2) / (unitW + gap)) + 0));
+                    rows = Math.max(1, Math.round((ev.clientY - start.top + gap / 2) / (unitH + gap)));
+                    tile.style.gridColumn = `span ${cols}`;
+                    tile.style.gridRow = `span ${rows}`;
+                };
+                const up = () => {
+                    handle.removeEventListener('pointermove', move);
+                    handle.removeEventListener('pointerup', up);
+                    handle.removeEventListener('pointercancel', up);
+                    dotnetRef.invokeMethodAsync('OnTileSpan', parseInt(tile.dataset.slot), cols, rows)
+                        .catch(() => { });
+                };
+                try { handle.setPointerCapture(e.pointerId); } catch { }
+                handle.addEventListener('pointermove', move);
+                handle.addEventListener('pointerup', up);
+                handle.addEventListener('pointercancel', up);
+            });
+        },
+
+        // Live-audio mute toggles: cameras with AAC audio expose a speaker button
+        // (tile bar / quick view). Videos start muted so autoplay always works;
+        // clicking the toggle is the user gesture that lets sound through. JS owns
+        // the state — audioSync re-stamps the glyphs after every Blazor render.
+        audioInit() {
+            if (!document.body.dataset.audioInit) {
+                document.body.dataset.audioInit = '1';
+                document.addEventListener('click', (e) => {
+                    const btn = e.target instanceof Element ? e.target.closest('[data-audio-toggle]') : null;
+                    if (!btn) return;
+                    e.preventDefault();
+                    e.stopPropagation(); // the tile underneath must not react
+                    const video = btn.closest('.tile, .quick-view')?.querySelector('video');
+                    if (!video) return;
+                    video.muted = !video.muted;
+                    if (!video.muted) video.volume = 1;
+                    this.audioSync();
+                }, { capture: true });
+            }
+            this.audioSync();
+        },
+
+        // Un-mutes one player (talk sessions auto-enable the camera's audio so the
+        // conversation is two-way). Safe under autoplay rules: it only ever runs
+        // from a user gesture (the mic button click started the session).
+        unmute(videoId) {
+            const v = document.getElementById(videoId);
+            if (!v || !v.muted) return;
+            v.muted = false;
+            v.volume = 1;
+            this.audioSync();
+        },
+
+        audioSync() {
+            document.querySelectorAll('[data-audio-toggle]').forEach(btn => {
+                const video = btn.closest('.tile, .quick-view')?.querySelector('video');
+                const has = !!(video && video.dataset.audio);
+                btn.style.display = has ? '' : 'none';
+                if (!has) return;
+                // Only touch the DOM when the muted state actually changed.
+                const state = video.muted ? 'off' : 'on';
+                if (btn.dataset.spk === state) return;
+                btn.dataset.spk = state;
+                btn.innerHTML = video.muted ? VOL_OFF : VOL_ON;
+                btn.title = video.muted ? 'Unmute — this camera has audio' : 'Mute';
+            });
+        },
+
+        // Digital zoom on live video (theater/maximized tiles, browser fullscreen,
+        // and the quick-view pop-up): the mouse wheel zooms around the cursor so
+        // the spot under it stays put, dragging pans while zoomed, the HUD pill
+        // steps in/out and restores 1:1, and a double-click snaps back to 1:1.
+        // All state lives DOM-side — nothing touches the Blazor circuit.
+        zoomInit() {
+            if (document.body.dataset.zoomInit) { this._zoomSweep?.(); return; }
+            document.body.dataset.zoomInit = '1';
+
+            const MAXZ = 8, STEP = 1.25;
+            const states = new WeakMap();  // container -> { z, tx, ty }
+            const zoomedBoxes = new Set(); // containers currently zoomed in (class
+                                           // alone won't do: Blazor re-renders clobber it)
+            const boxOf = (t) => (t instanceof Element ? t : null)
+                ?.closest?.('.tile, .quick-view-media, .event-player-media, .tl-tile');
+            const eligible = (box) => !!box && !!box.querySelector('video') &&
+                (box.classList.contains('zoom-on') || box === document.fullscreenElement);
+            const stOf = (box) => {
+                let s = states.get(box);
+                if (!s) { s = { z: 1, tx: 0, ty: 0 }; states.set(box, s); }
+                return s;
+            };
+
+            // Clamp the pan so the frame always covers the container, then paint.
+            const apply = (box) => {
+                const st = stOf(box);
+                const v = box.querySelector('video');
+                if (!v) return;
+                const wasZoomed = box.classList.contains('zoomed');
+                st.z = Math.min(MAXZ, Math.max(1, st.z));
+                st.tx = Math.min(0, Math.max(box.clientWidth * (1 - st.z), st.tx));
+                st.ty = Math.min(0, Math.max(box.clientHeight * (1 - st.z), st.ty));
+                if (st.z <= 1.001) {
+                    st.z = 1; st.tx = 0; st.ty = 0;
+                    v.style.transform = '';
+                } else {
+                    v.style.transformOrigin = '0 0';
+                    v.style.transform = `translate(${st.tx}px, ${st.ty}px) scale(${st.z})`;
+                }
+                // A video can go black on the first zoom: the transform promotes
+                // it to its own composited layer, and the frame already on screen
+                // doesn't reliably land in the new layer. A paused video then has
+                // nothing repainting it at all — and even a PLAYING clip can sit
+                // black when no fresh frame happens to be due (a stalled buffer,
+                // a long GOP, the end of the clip, seen on the event pop-up).
+                // Re-presenting the current frame via a zero seek repaints it.
+                // File-backed players (the event pop-up and the /events page)
+                // always get the nudge; the live MSE tiles only when paused — a
+                // zero seek there jolts the live pipeline, and a playing live
+                // tile repaints on the next arriving frame anyway. Once per
+                // zoom-in only, so panning stays smooth.
+                const filePlayer = box.classList.contains('event-player-media');
+                if (!wasZoomed && st.z > 1 && v.readyState >= 2 && (v.paused || filePlayer)) {
+                    try { v.currentTime = v.currentTime; } catch { /* detached */ }
+                }
+                box.classList.toggle('zoomed', st.z > 1);
+                if (st.z > 1) zoomedBoxes.add(box); else zoomedBoxes.delete(box);
+                // The event player's native controls would scale with the frame and
+                // fight the pan gesture — hide them while zoomed, restore at 1:1.
+                if (box.classList.contains('event-player-media'))
+                    v.controls = st.z <= 1;
+                const badge = box.querySelector('[data-zoom-badge]');
+                if (badge) badge.textContent = Math.round(st.z * 100) + '%';
+                hudWake(box); // zoom activity keeps the touch HUD visible
+            };
+            // Rescale keeping the container point (px,py) fixed on screen.
+            const zoomAt = (box, factor, px, py) => {
+                const st = stOf(box);
+                const z0 = st.z;
+                st.z = Math.min(MAXZ, Math.max(1, z0 * factor));
+                const k = st.z / z0;
+                st.tx = px - k * (px - st.tx);
+                st.ty = py - k * (py - st.ty);
+                apply(box);
+            };
+            const reset = (box) => { const st = stOf(box); st.z = 1; st.tx = 0; st.ty = 0; apply(box); };
+
+            // On touch screens the on-video pills sit ON the picture and block it —
+            // fade them out after a moment of stillness; any tap on the surface
+            // (or any zoom activity) brings them back. Covers the zoom HUD and the
+            // camera rail (PTZ/mic/settings) alike; a rail with its pad open or a
+            // talk session running (.open) never fades — a control in active use
+            // must not vanish under a resting finger. Desktop keeps the hover
+            // behavior plus the ui-idle cursor fade below and never uses this.
+            const coarse = () => matchMedia('(pointer: coarse)').matches;
+            const hudSeen = new WeakMap(); // pill element -> last activity (ms)
+            const hudPills = (root) => [...root.querySelectorAll('.zoom-hud, .cam-rail')];
+            const hudWake = (box) => {
+                if (!coarse() || !box) return;
+                for (const pill of hudPills(box)) {
+                    pill.classList.remove('hud-idle');
+                    hudSeen.set(pill, performance.now());
+                }
+            };
+            setInterval(() => {
+                if (!coarse()) return;
+                for (const pill of document.querySelectorAll(
+                    '.zoom-hud:not(.hud-idle), .cam-rail:not(.hud-idle):not(.open)')) {
+                    const seen = hudSeen.get(pill) ?? (hudSeen.set(pill, performance.now()), performance.now());
+                    if (performance.now() - seen > 2400) pill.classList.add('hud-idle');
+                }
+            }, 800);
+
+            // Desktop video-player chrome: a still cursor on the maximized (or
+            // browser-fullscreen) tile fades ALL its on-video controls — the
+            // toolbar with the mic, the PTZ overlay, the zoom HUD (CSS keys on
+            // .ui-idle) — and any mouse movement brings them straight back.
+            // Hover can't express this: a cursor parked on the video keeps
+            // :hover true forever. Touch is excluded — no cursor to go still.
+            let uiIdleTimer = null;
+            const uiSurface = () =>
+                (document.fullscreenElement instanceof Element && document.fullscreenElement.classList.contains('tile'))
+                    ? document.fullscreenElement
+                    : document.querySelector('.tile.maxed');
+            document.addEventListener('pointermove', () => {
+                if (coarse()) return;
+                const s = uiSurface();
+                if (!s) return;
+                s.classList.remove('ui-idle');
+                clearTimeout(uiIdleTimer);
+                uiIdleTimer = setTimeout(() => {
+                    const cur = uiSurface();
+                    if (cur) cur.classList.add('ui-idle');
+                }, 2600);
+            }, { passive: true });
+            // Layout changed under us (unmaximized, left fullscreen): back to 1:1.
+            this._zoomSweep = () => [...zoomedBoxes]
+                .forEach(b => { if (!b.isConnected || !eligible(b)) reset(b); });
+
+            document.addEventListener('wheel', (e) => {
+                const box = boxOf(e.target);
+                if (!eligible(box)) return;
+                e.preventDefault(); // the wheel is zoom here, never page scroll
+                const r = box.getBoundingClientRect();
+                zoomAt(box, e.deltaY < 0 ? STEP : 1 / STEP, e.clientX - r.left, e.clientY - r.top);
+            }, { passive: false, capture: true });
+
+            // HUD buttons — capture phase so the tile underneath never sees the click.
+            document.addEventListener('click', (e) => {
+                const btn = e.target instanceof Element ? e.target.closest('[data-zoom]') : null;
+                if (!btn) return;
+                const box = boxOf(btn);
+                if (!box) return;
+                e.preventDefault();
+                e.stopPropagation();
+                if (btn.dataset.zoom === 'reset') reset(box);
+                else zoomAt(box, btn.dataset.zoom === 'in' ? STEP : 1 / STEP,
+                    box.clientWidth / 2, box.clientHeight / 2);
+            }, { capture: true });
+
+            // Drag pans while zoomed; the click on release is swallowed so the
+            // tile doesn't react to it. Two touch pointers on the same surface
+            // PINCH instead — the natural phone gesture, so the HUD buttons are
+            // a convenience there, not the only way in.
+            const pan = { box: null, moved: false, x: 0, y: 0 };
+            const pinch = { box: null, d: 0, pts: new Map() };
+            const pinchDist = () => {
+                const [a, b] = [...pinch.pts.values()];
+                return Math.hypot(a.x - b.x, a.y - b.y);
+            };
+            document.addEventListener('pointerdown', (e) => {
+                const box = boxOf(e.target);
+                if (e.pointerType === 'touch' && eligible(box)) {
+                    hudWake(box); // a tap always resurfaces the faded HUD
+                    pinch.pts.set(e.pointerId, { x: e.clientX, y: e.clientY, box });
+                    if (pinch.pts.size === 2) {
+                        const boxes = [...pinch.pts.values()].map(p => p.box);
+                        if (boxes[0] === boxes[1]) {
+                            pinch.box = box;
+                            pinch.d = pinchDist();
+                            pan.box = null; // the second finger turns a pan into a pinch
+                        }
+                    }
+                }
+                if (!eligible(box) || stOf(box).z <= 1) return;
+                if (e.target.closest('.tile-bar, .zoom-hud, button, select')) return;
+                pan.box = box; pan.moved = false; pan.x = e.clientX; pan.y = e.clientY;
+                // While zoomed, dragging PANS — it must not start an HTML5 tile
+                // drag (Blazor re-stamps draggable on the next render).
+                if (box instanceof HTMLElement) box.draggable = false;
+            }, { capture: true });
+            document.addEventListener('pointermove', (e) => {
+                if (pinch.box && pinch.pts.has(e.pointerId)) {
+                    const p = pinch.pts.get(e.pointerId);
+                    p.x = e.clientX; p.y = e.clientY;
+                    if (pinch.pts.size === 2) {
+                        e.preventDefault();
+                        const d = pinchDist();
+                        if (pinch.d > 0 && d > 0) {
+                            const [a, b] = [...pinch.pts.values()];
+                            const r = pinch.box.getBoundingClientRect();
+                            zoomAt(pinch.box, d / pinch.d,
+                                (a.x + b.x) / 2 - r.left, (a.y + b.y) / 2 - r.top);
+                            hudWake(pinch.box);
+                        }
+                        pinch.d = d;
+                        return;
+                    }
+                }
+                if (!pan.box) return;
+                const dx = e.clientX - pan.x, dy = e.clientY - pan.y;
+                if (!pan.moved && Math.hypot(dx, dy) < 4) return; // still just a click
+                pan.moved = true;
+                pan.box.classList.add('zoom-panning');
+                const st = stOf(pan.box);
+                st.tx += dx; st.ty += dy;
+                pan.x = e.clientX; pan.y = e.clientY;
+                apply(pan.box);
+            }, { capture: true });
+            const panEnd = (e) => {
+                pinch.pts.delete(e.pointerId);
+                if (pinch.pts.size < 2) pinch.box = null;
+                pan.box?.classList.remove('zoom-panning');
+                pan.box = null;
+            };
+            document.addEventListener('pointerup', panEnd, { capture: true });
+            document.addEventListener('pointercancel', panEnd, { capture: true });
+            document.addEventListener('click', (e) => {
+                if (!pan.moved) return;
+                pan.moved = false; // the pan is over; this click is not a tile click
+                e.stopPropagation();
+                e.preventDefault();
+            }, { capture: true });
+
+            // Double-click zoomed video: back to 1:1 (swallowed so the tile's own
+            // double-click — maximize/restore — only fires from an unzoomed state).
+            // Controls are exempt: rapid +/− clicks on the HUD (or any button) fire
+            // a dblclick too, and this capture-phase listener runs before the HUD's
+            // own stopPropagation could shield it — only the video surface resets.
+            document.addEventListener('dblclick', (e) => {
+                const box = boxOf(e.target);
+                if (!box || stOf(box).z <= 1) return;
+                if (e.target instanceof Element &&
+                    e.target.closest('.tile-bar, .zoom-hud, button, select')) return;
+                e.stopPropagation();
+                e.preventDefault();
+                reset(box);
+            }, { capture: true });
+
+            document.addEventListener('fullscreenchange', () => setTimeout(this._zoomSweep, 0));
+            this._zoomSweep();
+        },
+
+        // Review-strip vertical resizing: drag the handle at the bar's bottom edge.
+        // The height is applied live in the DOM (no SignalR churn while dragging)
+        // and reported to Blazor once on release for persistence.
+        stripResizeInit(id, dotnetRef) {
+            const el = document.getElementById(id);
+            if (!el || el.dataset.resizeInit) return;
+            const handle = el.querySelector('.strip-resize');
+            if (!handle) return;
+            el.dataset.resizeInit = '1';
+            handle.addEventListener('pointerdown', (e) => {
+                if (e.button !== 0 && e.pointerType === 'mouse') return;
+                e.preventDefault();
+                e.stopPropagation();
+                try { handle.setPointerCapture(e.pointerId); } catch { }
+                const startY = e.clientY;
+                const startH = el.getBoundingClientRect().height;
+                const move = (ev) => {
+                    const h = Math.max(96, Math.min(window.innerHeight * 0.6, startH + ev.clientY - startY));
+                    el.style.height = h + 'px';
+                };
+                const up = () => {
+                    handle.removeEventListener('pointermove', move);
+                    handle.removeEventListener('pointerup', up);
+                    dotnetRef.invokeMethodAsync('OnStripResized', el.getBoundingClientRect().height);
+                };
+                handle.addEventListener('pointermove', move);
+                handle.addEventListener('pointerup', up);
+            });
+        },
+
+        // Points a <video> at a recording segment and keeps it at the wanted
+        // offset. Tolerance while playing avoids constant reseeks (the video
+        // advances on its own); paused scrubbing snaps tightly.
+        // Batched sync: one interop call per clock tick instead of one per
+        // camera. entries = [{id, url, offset, playing, rate}]; returns the
+        // worst HEALTHY lag across all players (broken media excluded).
+        tlSyncAll(entries) {
+            let maxLag = 0;
+            for (const e of entries || []) {
+                const lag = this.tlSync(e.id, e.url, e.offset, e.playing, e.rate, e.muted);
+                if (lag > maxLag) maxLag = lag;
+            }
+            return maxLag;
+        },
+
+        // Returns the video's LAG: how many seconds the picture is behind the
+        // timeline cursor (0 = keeping up / paused, -1 = broken media). Blazor
+        // uses the worst healthy lag as feedback to slow the cursor down when
+        // the server or the decoder can't sustain the chosen speed.
+        tlSync(videoId, url, offset, playing, rate, muted) {
+            const v = document.getElementById(videoId);
+            if (!v) return 0;
+            // Busy veil: while the player has no decodable picture under the
+            // cursor (first load, a seek into an unbuffered range, a stalled
+            // fetch), the tile carries .tl-loading and CSS shows a spinner —
+            // otherwise a slow segment just looks frozen.
+            const tile = v.closest('.tl-tile');
+            const busy = (b) => { if (tile) tile.classList.toggle('tl-loading', b); };
+            // The sync loop only ticks while playing, so a seek issued on PAUSE
+            // (snapping the frame to the cursor) would strand the veil at
+            // whatever state this call left it in. The media element's own
+            // events keep it truthful between syncs instead.
+            if (!v.dataset.tlBusyHook) {
+                v.dataset.tlBusyHook = '1';
+                const settle = () => {
+                    const t2 = v.closest('.tl-tile');
+                    if (!t2) return;
+                    const playing = v.dataset.tlPlaying === '1';
+                    t2.classList.toggle('tl-loading', !!v.dataset.tlUrl && !v.error
+                        && (v.seeking || v.readyState < (playing ? 3 : 2)));
+                };
+                for (const ev of ['seeking', 'waiting', 'seeked', 'canplay', 'playing', 'loadeddata'])
+                    v.addEventListener(ev, settle);
+            }
+            v.dataset.tlPlaying = playing ? '1' : '0';
+            // Solo audio: Blazor sends muted=false for the one camera the user
+            // asked to hear (undefined from older callers ⇒ stay muted). Set it
+            // every tick so a new segment inherits the choice; volume rides at
+            // full since the mute flag is what gates the sound.
+            v.muted = muted !== false;
+            if (!v.muted && v.volume !== 1) v.volume = 1;
+            if (!url) {
+                busy(false);
+                delete v.dataset.tlUrl;
+                if (v.getAttribute('src')) { v.removeAttribute('src'); try { v.load(); } catch { } }
+                return 0;
+            }
+            const r = Math.max(0.25, Math.min(16, rate || 1));
+            // Cursor beyond this file's media (a segment cut short by a suspension
+            // or outage, or the still-growing live file the browser only has a
+            // snapshot of): the picture is EXHAUSTED, not lagging. Hold the last
+            // frame quietly — reporting lag here would slow every other camera
+            // to a crawl ("catching up…") over footage that does not exist.
+            const dur = v.dataset.tlUrl === url ? v.duration : NaN;
+            const pastEnd = Number.isFinite(dur) && dur > 0 && offset >= dur - 0.3;
+            if (v.dataset.tlUrl !== url) {
+                v.dataset.tlUrl = url;
+                v.src = url;
+                try { v.load(); } catch { }
+                v.currentTime = offset;
+            } else if (!pastEnd) {
+                // The clock ticks every 500 ms, so timer jitter scales with the
+                // playback rate — widen the drift tolerance accordingly or fast
+                // playback degrades into a seek-storm. (The adaptive clock keeps
+                // real lag below this while playing; seeks stay exceptional.)
+                // Paused is the precision path: 0.05 s so the 0.1 s keyboard
+                // nudges land on a genuinely different picture.
+                const tolerance = playing ? Math.max(1.5, r * 0.75) : 0.05;
+                if (Math.abs(v.currentTime - offset) > tolerance) v.currentTime = offset;
+            }
+            // AFTER the src/load branch: load() resets playbackRate to the default,
+            // so set both — a new segment then starts at the chosen speed.
+            try {
+                if (v.defaultPlaybackRate !== r) v.defaultPlaybackRate = r;
+                if (v.playbackRate !== r) v.playbackRate = r;
+            } catch { }
+            if (playing && !pastEnd) { if (v.paused) v.play().catch(() => { }); }
+            else if (!v.paused) v.pause();
+            if (v.error) { busy(false); return -1; } // dead media must not hold the timeline hostage
+            if (pastEnd) { busy(false); return 0; }
+            // Playing needs future data to keep moving; a paused scrub only needs
+            // the current frame to be showing something.
+            busy(v.seeking || v.readyState < (playing ? 3 : 2));
+            return playing ? Math.max(0, offset - (v.currentTime || 0)) : 0;
+        },
+
+        // Saves the player's current frame as a PNG download. Returns false when
+        // there is no decodable picture yet, or the canvas is tainted (a remote
+        // server without CORS headers) — in both cases there is nothing to save.
+        tlSnap(id, filename) {
+            const v = document.getElementById(id);
+            if (!v || v.readyState < 2 || !v.videoWidth) return false;
+            const c = document.createElement('canvas');
+            c.width = v.videoWidth;
+            c.height = v.videoHeight;
+            c.getContext('2d').drawImage(v, 0, 0);
+            try {
+                const a = document.createElement('a');
+                a.href = c.toDataURL('image/png');
+                a.download = filename;
+                a.click();
+                return true;
+            } catch {
+                return false;
+            }
+        },
+
+        // Pointer-drag scrubbing on the timeline lanes: reports the horizontal
+        // fraction (0..1) to Blazor, throttled so dragging doesn't flood SignalR.
+        tlScrubInit(elemId, dotnetRef) {
+            this.tlScrubDispose(elemId);
+            const el = document.getElementById(elemId);
+            if (!el) return;
+            let lastSent = 0;
+            const send = (e, final) => {
+                if (tlPinching) return; // two-finger zoom owns the gesture
+                const now = performance.now();
+                if (!final && now - lastSent < 70) return;
+                lastSent = now;
+                const r = el.getBoundingClientRect();
+                const f = Math.min(1, Math.max(0, (e.clientX - r.left) / r.width));
+                dotnetRef.invokeMethodAsync('OnTimelineScrub', f, final);
+            };
+            const down = (e) => {
+                if (e.button !== 0 && e.pointerType === 'mouse') return;
+                if (e.target.closest('.tl-overview')) return; // the day strip pans, never scrubs
+                if (e.target.closest('.tl-bm')) return; // a bookmark ribbon click jumps (Blazor), never scrubs
+                e.preventDefault();
+                try { el.setPointerCapture(e.pointerId); } catch { }
+                send(e, false);
+                const move = (ev) => send(ev, false);
+                const up = (ev) => {
+                    el.removeEventListener('pointermove', move);
+                    el.removeEventListener('pointerup', up);
+                    send(ev, true);
+                };
+                el.addEventListener('pointermove', move);
+                el.addEventListener('pointerup', up);
+            };
+            el.addEventListener('pointerdown', down);
+            scrubs[elemId] = { el, down };
+        },
+        tlScrubDispose(elemId) {
+            const s = scrubs[elemId];
+            if (s) { s.el.removeEventListener('pointerdown', s.down); delete scrubs[elemId]; }
+        },
+
+        // Fine-seek interactions on the lane strip: wheel/pinch zoom around the
+        // pointer, a JS-local hover time bubble (zero server round-trips while
+        // the mouse moves), and drag-to-pan on the day-overview strip.
+        tlZoomInit(elemId, dotnetRef) {
+            this.tlZoomDispose(elemId);
+            const el = document.getElementById(elemId);
+            if (!el) return;
+            const st = { el, handlers: [] };
+            const on = (target, ev, fn, opts) => {
+                target.addEventListener(ev, fn, opts);
+                st.handlers.push([target, ev, fn, opts]);
+            };
+            const fracAt = (clientX) => {
+                const r = el.getBoundingClientRect();
+                return Math.min(1, Math.max(0, (clientX - r.left) / r.width));
+            };
+
+            // Hover: a hairline + time bubble under the mouse. Mapped through the
+            // data-vs/data-vspan window attributes Blazor keeps fresh, so it stays
+            // correct at any zoom without a single interop call.
+            const hover = document.createElement('div');
+            hover.className = 'tl-hover';
+            hover.innerHTML = '<div class="tl-hover-line"></div><div class="tl-hover-time"></div>';
+            el.appendChild(hover);
+            const bubble = hover.querySelector('.tl-hover-time');
+            on(el, 'pointermove', (e) => {
+                if (e.pointerType !== 'mouse' || e.target.closest('.tl-overview')) { hover.style.display = 'none'; return; }
+                const f = fracAt(e.clientX);
+                const vs = parseFloat(el.dataset.vs || '0');
+                const span = parseFloat(el.dataset.vspan || '86400');
+                let sec = Math.max(0, Math.min(86399.9, vs + f * span));
+                const pad = (v) => String(v).padStart(2, '0');
+                let text = `${pad(Math.floor(sec / 3600))}:${pad(Math.floor(sec / 60) % 60)}:${pad(Math.floor(sec % 60))}`;
+                if (span <= 900) text += '.' + Math.floor((sec % 1) * 10); // tenths once zoomed tight
+                bubble.textContent = text;
+                hover.style.left = (f * 100) + '%';
+                // Keep the bubble on-screen near the right edge.
+                bubble.style.transform = f > 0.92 ? 'translateX(calc(-100% - 6px))' : '';
+                hover.style.display = 'block';
+            });
+            on(el, 'pointerleave', () => { hover.style.display = 'none'; });
+
+            // Wheel: zoom around the pointer; Shift+wheel pans the window.
+            let lastWheel = 0;
+            on(el, 'wheel', (e) => {
+                e.preventDefault();
+                const now = performance.now();
+                if (now - lastWheel < 40) return;
+                lastWheel = now;
+                if (e.shiftKey)
+                    dotnetRef.invokeMethodAsync('OnTimelinePan', (e.deltaY || e.deltaX) > 0 ? 1 : -1);
+                else
+                    dotnetRef.invokeMethodAsync('OnTimelineZoom', fracAt(e.clientX), e.deltaY > 0 ? 1.3 : 0.75);
+            }, { passive: false });
+
+            on(el, 'dblclick', () => dotnetRef.invokeMethodAsync('OnTimelineKey', 'zoom:reset'));
+
+            // Pinch: two touch pointers zoom around their midpoint. Capture-phase
+            // listeners see both pointers even while the scrub handler holds one;
+            // the shared tlPinching flag makes scrubbing yield for the duration.
+            const touches = new Map();
+            let pinchBase = null;
+            on(el, 'pointerdown', (e) => {
+                if (e.pointerType !== 'touch') return;
+                touches.set(e.pointerId, e.clientX);
+                if (touches.size === 2) { tlPinching = true; pinchBase = null; }
+            }, true);
+            on(el, 'pointermove', (e) => {
+                if (!touches.has(e.pointerId)) return;
+                touches.set(e.pointerId, e.clientX);
+                if (touches.size !== 2) return;
+                const [a, b] = [...touches.values()];
+                const dist = Math.abs(a - b);
+                if (pinchBase == null) { pinchBase = dist; return; }
+                if (dist > 20 && Math.abs(dist - pinchBase) > 12) {
+                    dotnetRef.invokeMethodAsync('OnTimelineZoom', fracAt((a + b) / 2), pinchBase / dist);
+                    pinchBase = dist;
+                }
+            }, true);
+            const lift = (e) => {
+                touches.delete(e.pointerId);
+                pinchBase = null;
+                if (touches.size < 2) tlPinching = false;
+            };
+            on(el, 'pointerup', lift, true);
+            on(el, 'pointercancel', lift, true);
+
+            // Day-overview strip: drag to move the zoomed view window.
+            const ov = el.querySelector('.tl-overview');
+            if (ov) {
+                const seek = (e) => {
+                    const r = ov.getBoundingClientRect();
+                    dotnetRef.invokeMethodAsync('OnOverviewSeek',
+                        Math.min(1, Math.max(0, (e.clientX - r.left) / r.width)));
+                };
+                on(ov, 'pointerdown', (e) => {
+                    e.stopPropagation();
+                    try { ov.setPointerCapture(e.pointerId); } catch { }
+                    seek(e);
+                    let last = 0;
+                    const move = (ev) => {
+                        const n = performance.now();
+                        if (n - last > 60) { last = n; seek(ev); }
+                    };
+                    const up = () => {
+                        ov.removeEventListener('pointermove', move);
+                        ov.removeEventListener('pointerup', up);
+                    };
+                    ov.addEventListener('pointermove', move);
+                    ov.addEventListener('pointerup', up);
+                });
+            }
+            zooms[elemId] = st;
+        },
+        tlZoomDispose(elemId) {
+            const st = zooms[elemId];
+            if (!st) return;
+            for (const [t, ev, fn, opts] of st.handlers) t.removeEventListener(ev, fn, opts);
+            st.el.querySelector('.tl-hover')?.remove();
+            delete zooms[elemId];
+        },
+
+        // Drag the divider to resize the timeline board. The height is applied
+        // here, live, so the tracks follow the pointer at screen rate instead of
+        // one SignalR round-trip per pixel; Blazor is told once, on release, and
+        // owns it from there (persisting it and rendering it back identically).
+        tlResizeInit(handleId, boardId, dotnetRef) {
+            this.tlResizeDispose(handleId);
+            const el = document.getElementById(handleId);
+            const board = document.getElementById(boardId);
+            if (!el || !board) return;
+            const down = (e) => {
+                if (e.button !== 0 && e.pointerType === 'mouse') return;
+                e.preventDefault();
+                const startY = e.clientY;
+                const startH = board.getBoundingClientRect().height;
+                // Which way is "bigger"? The board sits above the divider in the
+                // classic layout and below it in studio. Reading the live rects
+                // answers that per drag, so flipping layouts needs no re-init.
+                const dir = board.getBoundingClientRect().top < el.getBoundingClientRect().top ? 1 : -1;
+                try { el.setPointerCapture(e.pointerId); } catch { }
+                el.classList.add('dragging');
+                document.body.classList.add('tl-resizing');
+                // The floor keeps the ruler and a full track reachable; the
+                // ceiling keeps the monitors on screen. Matches the inline
+                // max-height Blazor renders, so nothing jumps on release.
+                const at = (ev) => Math.max(90, Math.min(window.innerHeight * 0.7,
+                    startH + dir * (ev.clientY - startY)));
+                const apply = (ev) => {
+                    board.style.height = at(ev) + 'px';
+                    board.style.maxHeight = '70vh'; // outranks studio's 34vh cap while dragging
+                };
+                const move = (ev) => apply(ev);
+                const up = (ev) => {
+                    el.removeEventListener('pointermove', move);
+                    el.removeEventListener('pointerup', up);
+                    el.removeEventListener('pointercancel', up);
+                    el.classList.remove('dragging');
+                    document.body.classList.remove('tl-resizing');
+                    apply(ev);
+                    dotnetRef.invokeMethodAsync('OnBoardResize', at(ev));
+                };
+                el.addEventListener('pointermove', move);
+                el.addEventListener('pointerup', up);
+                el.addEventListener('pointercancel', up);
+            };
+            el.addEventListener('pointerdown', down);
+            resizers[handleId] = { el, down };
+        },
+        tlResizeDispose(handleId) {
+            const r = resizers[handleId];
+            if (r) { r.el.removeEventListener('pointerdown', r.down); delete resizers[handleId]; }
+        },
+
+        // Drag the vertical divider between the program monitor and the
+        // thumbnail rail (focused studio): the rail's grid column follows the
+        // pointer live, and Blazor gets the width it landed on — the same
+        // split of labor as tlResizeInit. The template string written here
+        // must stay in step with GridStyle() in Timeline.razor.
+        tlColResizeInit(handleId, dotnetRef) {
+            this.tlColResizeDispose(handleId);
+            const el = document.getElementById(handleId);
+            const grid = el?.closest('.tl-grid');
+            if (!el || !grid) return;
+            const down = (e) => {
+                if (e.button !== 0 && e.pointerType === 'mouse') return;
+                const rail = grid.querySelector('.tl-tile-rail');
+                if (!rail) return;
+                e.preventDefault();
+                const startX = e.clientX;
+                const startW = rail.getBoundingClientRect().width;
+                try { el.setPointerCapture(e.pointerId); } catch { }
+                el.classList.add('dragging');
+                document.body.classList.add('tl-colresizing');
+                // The divider sits left of the rail, so dragging right shrinks
+                // it. Floor keeps thumbnails recognizable; the ceiling keeps
+                // the program monitor the bigger half. Matches Blazor's clamps.
+                const at = (ev) => Math.max(96, Math.min(grid.getBoundingClientRect().width * 0.45,
+                    startW - (ev.clientX - startX)));
+                const apply = (ev) => {
+                    grid.style.gridTemplateColumns = `minmax(0, 1fr) 10px ${at(ev)}px`;
+                };
+                const move = (ev) => apply(ev);
+                const up = (ev) => {
+                    el.removeEventListener('pointermove', move);
+                    el.removeEventListener('pointerup', up);
+                    el.removeEventListener('pointercancel', up);
+                    el.classList.remove('dragging');
+                    document.body.classList.remove('tl-colresizing');
+                    apply(ev);
+                    dotnetRef.invokeMethodAsync('OnRailResize', at(ev));
+                };
+                el.addEventListener('pointermove', move);
+                el.addEventListener('pointerup', up);
+                el.addEventListener('pointercancel', up);
+            };
+            el.addEventListener('pointerdown', down);
+            resizers[handleId] = { el, down };
+        },
+        tlColResizeDispose(handleId) {
+            const r = resizers[handleId];
+            if (r) { r.el.removeEventListener('pointerdown', r.down); delete resizers[handleId]; }
+        },
+
+        // NLE-style keyboard transport for the timeline page. Ignores keystrokes
+        // aimed at form fields, and Alt/Meta chords stay with the browser.
+        tlKeysInit(dotnetRef) {
+            this.tlKeysDispose();
+            tlKeyHandler = (e) => {
+                const t = e.target;
+                if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.tagName === 'SELECT' || t.isContentEditable)) return;
+                if (e.altKey || e.metaKey) return;
+                let action = null;
+                switch (e.key) {
+                    case ' ': case 'k': case 'K': action = 'playpause'; break;
+                    case 'ArrowLeft': action = 'step:' + (e.ctrlKey ? -0.1 : e.shiftKey ? -10 : -1); break;
+                    case 'ArrowRight': action = 'step:' + (e.ctrlKey ? 0.1 : e.shiftKey ? 10 : 1); break;
+                    case 'j': case 'J': action = 'step:-10'; break;
+                    case 'l': case 'L': action = 'step:10'; break;
+                    case ',': action = 'step:-0.1'; break;
+                    case '.': action = 'step:0.1'; break;
+                    case '[': action = 'event:-1'; break;
+                    case ']': action = 'event:1'; break;
+                    case '+': case '=': action = 'zoom:in'; break;
+                    case '-': case '_': action = 'zoom:out'; break;
+                    case '0': action = 'zoom:reset'; break;
+                    case 't': case 'T': action = 'clock'; break;
+                    case 's': case 'S': action = 'snap'; break;
+                    case 'b': case 'B': action = 'bookmark'; break;
+                }
+                if (!action) return;
+                e.preventDefault();
+                dotnetRef.invokeMethodAsync('OnTimelineKey', action).catch(() => { });
+            };
+            document.addEventListener('keydown', tlKeyHandler);
+        },
+        tlKeysDispose() {
+            if (tlKeyHandler) { document.removeEventListener('keydown', tlKeyHandler); tlKeyHandler = null; }
+        },
+
+        focusEl(id) {
+            const el = document.getElementById(id);
+            if (el) { el.focus(); el.select?.(); }
+        },
+
+        // Touch-first device? Drives server-side choices like the quick view
+        // defaulting to the lighter sub stream on phones.
+        isCoarse() {
+            return matchMedia('(pointer: coarse)').matches;
+        },
+
+        playerHostInit(ref) { playerHost = ref; },
+
+        attach(videoId, wsUrl) {
+            this.detach(videoId);
+            const video = document.getElementById(videoId);
+            if (video) players[videoId] = new Player(video, wsUrl);
+        },
+        detach(videoId) {
+            const p = players[videoId];
+            if (p) { p.destroy(); delete players[videoId]; }
+            this.statsClose(videoId);
+        },
+
+        // Is the tab hidden? Battery tiles ask on each poll tick: "keep awake" must
+        // not hold a camera awake for a dashboard nobody is looking at. The
+        // shell's own hide/show report counts too — a window in the tray is
+        // hidden even if the WebView never flipped document.hidden.
+        pageHidden() {
+            return liveHidden();
+        },
+
+        // Desktop-shell hooks; in a plain browser nothing ever calls them.
+        // The "pause video when hidden" setting, live from the tray menu:
+        shellPauseWhenHidden(on) {
+            shellPauseHidden = on === true;
+            syncLiveSleep();
+        },
+        // The shell saying the window was hidden or shown:
+        shellVisibility(hidden) {
+            shellHidden = hidden === true;
+            syncLiveSleep();
+        },
+
+        // Right-click on a single-camera view opens this instead of the tile's
+        // camera picker (on that view the tile IS the camera — nothing to pick).
+        // Toggles: a second right-click, the ✕, or leaving the view closes it.
+        statsToggle(videoId) {
+            if (statsPanels[videoId]) { this.statsClose(videoId); return false; }
+            const video = document.getElementById(videoId);
+            const host = video && video.parentElement;
+            if (!host) return false;
+            const el = document.createElement('div');
+            el.className = 'nerd-stats';
+            el.innerHTML =
+                '<div class="nerd-head">' +
+                    '<span class="nerd-title">stats for nerds</span>' +
+                    '<button type="button" class="nerd-btn" data-nerd-copy ' +
+                        'title="Copy this readout — paste it into a bug report">copy</button>' +
+                    '<button type="button" class="nerd-btn" data-nerd-close ' +
+                        'title="Close (or right-click the video again)">✕</button>' +
+                '</div>' +
+                '<div class="nerd-rows"></div>' +
+                '<div class="nerd-sparkwrap">' +
+                    '<svg class="nerd-spark" viewBox="0 0 160 28" preserveAspectRatio="none" aria-hidden="true">' +
+                        '<polyline class="nerd-sparkline" points=""/></svg>' +
+                    '<span class="nerd-sparklabel"></span>' +
+                '</div>' +
+                '<div class="nerd-verdict"></div>';
+            // The tile underneath reacts to clicks (maximize, drag, zoom) — the
+            // panel must swallow its own.
+            for (const ev of ['click', 'dblclick', 'pointerdown', 'wheel'])
+                el.addEventListener(ev, (e) => e.stopPropagation());
+            el.addEventListener('contextmenu', (e) => {
+                e.preventDefault(); e.stopPropagation(); this.statsClose(videoId);
+            });
+            el.querySelector('[data-nerd-close]').addEventListener('click', () => this.statsClose(videoId));
+            el.querySelector('[data-nerd-copy]').addEventListener('click', (e) => {
+                const st = statsPanels[videoId], btn = e.currentTarget;
+                if (!st) return;
+                const done = (word) => { btn.textContent = word; setTimeout(() => { btn.textContent = 'copy'; }, 1200); };
+                try {
+                    navigator.clipboard.writeText(st.text).then(() => done('copied'), () => done('blocked'));
+                } catch { done('blocked'); }
+            });
+            host.appendChild(el);
+            const st = { el, prev: null, spark: [], text: '' };
+            statsPanels[videoId] = st;
+            const tick = () => {
+                // A Blazor re-render can drop our node from the tile; re-attach
+                // rather than dying silently.
+                if (!st.el.isConnected) {
+                    const h = document.getElementById(videoId)?.parentElement;
+                    if (!h) { this.statsClose(videoId); return; }
+                    h.appendChild(st.el);
+                }
+                const p = players[videoId];
+                if (!p) {
+                    st.el.querySelector('.nerd-rows').innerHTML =
+                        '<div class="nerd-row"><span>stream</span><b class="warn">not playing</b></div>';
+                    return;
+                }
+                nerdRender(st, p.stats());
+            };
+            tick();
+            st.timer = setInterval(tick, 1000);
+            return true;
+        },
+        statsClose(videoId) {
+            const st = statsPanels[videoId];
+            if (!st) return;
+            clearInterval(st.timer);
+            st.el.remove();
+            delete statsPanels[videoId];
+        },
+        // Tells Blazor when browser fullscreen ends — Esc, the toggle button or
+        // the browser's own UI all land here — so the fullscreen sub→main
+        // stream switch can be reverted. Idempotent.
+        fsWatch(dotnetRef) {
+            if (document.body.dataset.fsWatch) return;
+            document.body.dataset.fsWatch = '1';
+            document.addEventListener('fullscreenchange', () => {
+                if (!document.fullscreenElement)
+                    dotnetRef.invokeMethodAsync('OnFullscreenExit').catch(() => { });
+            });
+        },
+
+        // Toggle: the same tile button enters and leaves browser fullscreen.
+        fullscreen(elementId) {
+            if (document.fullscreenElement) {
+                document.exitFullscreen().catch(() => { });
+                return;
+            }
+            const el = document.getElementById(elementId);
+            if (!el) return;
+            if (el.requestFullscreen) {
+                el.requestFullscreen().catch(() => { });
+                return;
+            }
+            if (el.webkitRequestFullscreen) { // older WebKit (iPad)
+                try { el.webkitRequestFullscreen(); } catch { }
+                return;
+            }
+            // iPhone: no element fullscreen exists AT ALL — only the <video>
+            // itself, through WebKit's native player. When it closes, bridge its
+            // proprietary event to a normal fullscreenchange so the existing
+            // fsWatch/glyph logic sees the exit like any other browser.
+            const v = el.querySelector('video');
+            if (v?.webkitEnterFullscreen) {
+                v.addEventListener('webkitendfullscreen',
+                    () => document.dispatchEvent(new Event('fullscreenchange')), { once: true });
+                try { v.webkitEnterFullscreen(); } catch { }
+            }
+        },
+        exitFullscreen() {
+            if (document.fullscreenElement) document.exitFullscreen().catch(() => { });
+        },
+        // ---------- two-way talk: microphone → camera speaker ----------
+        // One session at a time. Opens the /api/talk WebSocket, sends a JSON
+        // hello with the AudioContext's real sample rate (the server resamples
+        // to whatever the camera wants), then streams Int16 LE PCM chunks.
+        // State flows back to Blazor via OnTalkState("live"|"off"|"error"|"silent").
+        //
+        // The microphone is chosen per DEVICE (localStorage), because "the
+        // system default" is a hardware fact of one machine: a headset
+        // amplifier or virtual cable as Windows' default records pure silence,
+        // and no account-level setting can know which box has one.
+        micPref() { try { return localStorage.getItem('neolink.mic') || ''; } catch { return ''; } },
+        setMicPref(id) {
+            try { id ? localStorage.setItem('neolink.mic', id) : localStorage.removeItem('neolink.mic'); } catch { }
+        },
+        // Real microphones only — Chromium's "default"/"communications" rows are
+        // aliases of devices already in the list. Labels are blank until the
+        // mic permission is granted; unlock=true takes (and instantly releases)
+        // a capture so the names appear — only the settings Refresh button does
+        // that, never a mere tab open.
+        async micList(unlock) {
+            if (!(navigator.mediaDevices && navigator.mediaDevices.enumerateDevices)) return [];
+            let ins = (await navigator.mediaDevices.enumerateDevices()).filter(d => d.kind === 'audioinput');
+            if (unlock && ins.length && ins.every(d => !d.label) && navigator.mediaDevices.getUserMedia) {
+                try {
+                    const s = await navigator.mediaDevices.getUserMedia({ audio: true });
+                    s.getTracks().forEach(t => t.stop());
+                    ins = (await navigator.mediaDevices.enumerateDevices()).filter(d => d.kind === 'audioinput');
+                } catch { /* denied: ids without names still select */ }
+            }
+            return ins.filter(d => d.deviceId && d.deviceId !== 'default' && d.deviceId !== 'communications')
+                .map((d, i) => ({ id: d.deviceId, label: d.label || `Microphone ${i + 1}` }));
+        },
+        async talkStart(wsUrl, dotnetRef) {
+            this.talkStop();
+            const report = (state, detail) => {
+                try { dotnetRef.invokeMethodAsync('OnTalkState', state, detail || null).catch(() => { }); } catch { }
+            };
+            if (!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia)) {
+                report('error', 'microphone access needs HTTPS (or localhost)');
+                return;
+            }
+            const s = { ws: null, ctx: null, stream: null, src: null, proc: null, report, peak: 0, sampled: 0, warned: false };
+            this._talk = s;
+            let stream;
+            const micId = this.micPref();
+            const base = { echoCancellation: true, noiseSuppression: true, autoGainControl: true };
+            try {
+                stream = await navigator.mediaDevices.getUserMedia({
+                    audio: micId ? { ...base, deviceId: { exact: micId } } : base
+                });
+            } catch (err) {
+                // The chosen microphone can be gone (unplugged, another machine
+                // via the roaming profile): a call the default could carry must
+                // not fail over a stale preference.
+                if (micId && err && (err.name === 'OverconstrainedError' || err.name === 'NotFoundError')) {
+                    try { stream = await navigator.mediaDevices.getUserMedia({ audio: base }); } catch (err2) { err = err2; stream = null; }
+                }
+                if (!stream) {
+                    if (this._talk === s) this._talk = null;
+                    report('error', err && err.name === 'NotAllowedError'
+                        ? 'microphone permission denied'
+                        : 'microphone unavailable');
+                    return;
+                }
+            }
+            if (this._talk !== s) { stream.getTracks().forEach(t => t.stop()); return; } // stopped meanwhile
+            s.stream = stream;
+            const ctx = new (window.AudioContext || window.webkitAudioContext)();
+            s.ctx = ctx;
+            let ws;
+            try { ws = new WebSocket(wsUrl); } catch {
+                this._talkTeardown(false);
+                report('error', 'cannot open the talk connection');
+                return;
+            }
+            s.ws = ws;
+            ws.binaryType = 'arraybuffer';
+            ws.onopen = () => {
+                if (this._talk !== s) return;
+                s.opened = true;
+                ws.send(JSON.stringify({ sampleRate: ctx.sampleRate }));
+                // ScriptProcessor keeps this dependency-free; 2048 samples ≈ 43 ms
+                // per chunk at 48 kHz, plenty tight for voice.
+                const src = ctx.createMediaStreamSource(stream);
+                const proc = ctx.createScriptProcessor(2048, 1, 1);
+                proc.onaudioprocess = ev => {
+                    if (ws.readyState !== WebSocket.OPEN) return;
+                    const f32 = ev.inputBuffer.getChannelData(0);
+                    const i16 = new Int16Array(f32.length);
+                    for (let i = 0; i < f32.length; i++) {
+                        const v = Math.max(-1, Math.min(1, f32[i]));
+                        i16[i] = v < 0 ? v * 0x8000 : v * 0x7fff;
+                        const a = v < 0 ? -v : v;
+                        if (a > s.peak) s.peak = a;
+                    }
+                    ws.send(i16.buffer);
+                    // A dead input (a headset amp with nothing plugged in as the
+                    // system default) streams flawlessly and says nothing — the
+                    // one talk failure that shows no error anywhere. Warn once,
+                    // after enough audio that a quiet room can't false-positive
+                    // a working mic below this floor.
+                    if (!s.warned && (s.sampled += f32.length) > ctx.sampleRate * 2.5) {
+                        s.warned = true;
+                        if (s.peak < 0.001)
+                            report('silent', (stream.getTracks()[0] || {}).label || '');
+                    }
+                };
+                src.connect(proc);
+                proc.connect(ctx.destination); // processing needs a sink; output stays silent
+                s.src = src;
+                s.proc = proc;
+                report('live');
+            };
+            ws.onclose = ev => {
+                const t = this._talkTeardown(false);
+                if (!t) return; // already stopped locally
+                const reason = ev.reason || '';
+                if (reason && reason !== 'bye') t.report('error', reason);
+                // A handshake the server (or a proxy) refused closes with no
+                // reason at all — without naming it, the button just snaps back
+                // to idle and the failure is invisible.
+                else if (!t.opened) t.report('error', `the talk connection was refused (code ${ev.code})`);
+                else t.report('off');
+            };
+            ws.onerror = () => { /* onclose follows with the close reason */ };
+        },
+        talkStop() { this._talkTeardown(true); },
+        _talkTeardown(reportOff) {
+            const s = this._talk;
+            if (!s) return null;
+            this._talk = null;
+            try { if (s.proc) { s.proc.onaudioprocess = null; s.proc.disconnect(); } } catch { }
+            try { if (s.src) s.src.disconnect(); } catch { }
+            try { if (s.stream) s.stream.getTracks().forEach(t => t.stop()); } catch { }
+            try { if (s.ctx) s.ctx.close(); } catch { }
+            try { if (s.ws && s.ws.readyState <= 1) s.ws.close(1000, 'bye'); } catch { }
+            if (reportOff) s.report('off');
+            return s;
+        },
+
+        // ---------- monitor page: browser-side resource sampling ----------
+        // FPS is counted with a requestAnimationFrame loop (started on demand,
+        // stopped when the page stops sampling); JS heap comes from the
+        // non-standard performance.memory (Chromium only — -1 elsewhere).
+        perfStart() {
+            if (perf.raf) return;
+            perf.frames = 0;
+            perf.windowStart = performance.now();
+            perf.fps = 0;
+            const loop = (t) => {
+                perf.frames++;
+                if (t - perf.windowStart >= 1000) {
+                    perf.fps = Math.round(perf.frames * 1000 / (t - perf.windowStart));
+                    perf.frames = 0;
+                    perf.windowStart = t;
+                }
+                perf.raf = requestAnimationFrame(loop);
+            };
+            perf.raf = requestAnimationFrame(loop);
+        },
+        perfStop() {
+            if (perf.raf) cancelAnimationFrame(perf.raf);
+            perf.raf = 0;
+        },
+        perfSample() {
+            const m = performance.memory; // Chromium-only
+            return {
+                heap: m ? m.usedJSHeapSize : -1,
+                heapLimit: m ? m.jsHeapSizeLimit : -1,
+                fps: perf.raf ? perf.fps : -1,
+                domNodes: document.getElementsByTagName('*').length,
+            };
+        },
+        // No-op whose only purpose is to be awaited: the caller times the full
+        // Blazor circuit round-trip (browser → SignalR → server → back).
+        perfPing() { return 0; },
+
+        // ---------- monitor page: chart hover tooltip ----------
+        // Each MonChart body carries its series as JSON in data-hover; one
+        // delegated mousemove drives a shared tooltip + per-chart crosshair, so
+        // hovering costs zero circuit traffic. The crosshair snaps to the
+        // nearest sample of the primary series.
+        monHoverInit() {
+            if (document.body.dataset.monHover) return;
+            document.body.dataset.monHover = '1';
+            let tip = null, cross = null, curBody = null;
+            const hide = () => {
+                if (tip) tip.style.display = 'none';
+                if (cross) cross.remove();
+                cross = null;
+                curBody = null;
+            };
+            document.addEventListener('mousemove', (e) => {
+                const body = e.target instanceof Element
+                    ? e.target.closest('.mon-chart-body[data-hover]') : null;
+                if (!body) { hide(); return; }
+                // Re-parse only when the payload string actually changed (2s beat).
+                const raw = body.dataset.hover;
+                let data = body._monHover && body._monHover.raw === raw ? body._monHover.data : null;
+                if (!data) {
+                    try { data = JSON.parse(raw); } catch { hide(); return; }
+                    body._monHover = { raw, data };
+                }
+                if (!data.s || !data.s.length || !(data.b > data.a)) { hide(); return; }
+                const rect = body.getBoundingClientRect();
+                const frac = Math.min(1, Math.max(0, (e.clientX - rect.left) / rect.width));
+                const t = data.a + frac * (data.b - data.a);
+                let snapT = null;
+                const rows = [];
+                for (const s of data.s) {
+                    let best = null, bd = Infinity;
+                    for (const p of s.p) {
+                        const d = Math.abs(p[0] - t);
+                        if (d < bd) { bd = d; best = p; }
+                    }
+                    if (!best) continue;
+                    if (snapT === null) snapT = best[0]; // primary series sets the crosshair
+                    rows.push({ l: s.l, c: s.c, v: best[1] });
+                }
+                if (!rows.length || snapT === null) { hide(); return; }
+                if (!tip) {
+                    tip = document.createElement('div');
+                    tip.className = 'mon-tip';
+                    document.body.appendChild(tip);
+                }
+                const when = new Date(snapT).toLocaleTimeString(undefined, { hour12: false });
+                // Labels/units/colors are app constants, never user input.
+                tip.innerHTML = '<div class="mon-tip-time">' + when + '</div>' +
+                    rows.map(r => '<div class="mon-tip-row"><i style="background:' + r.c + '"></i>' +
+                        r.l + '<b>' + (Math.round(r.v * 100) / 100) + (data.u || '') + '</b></div>').join('');
+                tip.style.display = 'block';
+                let x = e.clientX + 14;
+                if (x + tip.offsetWidth > innerWidth - 8) x = e.clientX - tip.offsetWidth - 14;
+                let y = e.clientY - tip.offsetHeight - 12;
+                if (y < 8) y = e.clientY + 16;
+                tip.style.left = x + 'px';
+                tip.style.top = y + 'px';
+                // Crosshair lives inside the chart body; Blazor re-renders can
+                // drop it, so recreate whenever it's gone.
+                if (curBody !== body && cross) { cross.remove(); cross = null; }
+                curBody = body;
+                if (!cross || !cross.isConnected) {
+                    cross = document.createElement('div');
+                    cross.className = 'mon-cross';
+                    body.appendChild(cross);
+                }
+                cross.style.left = ((snapT - data.a) / (data.b - data.a) * rect.width).toFixed(1) + 'px';
+            }, { passive: true });
+            document.addEventListener('mouseleave', hide);
+            document.addEventListener('scroll', hide, { passive: true, capture: true });
+        },
+
+        // ---------- live server log tail (admin) ----------
+        // Lines are appended straight into the DOM here — routing every log line
+        // through the Blazor circuit would re-render the page per line. The view
+        // auto-follows while scrolled to the bottom; scrolling up freezes it.
+        logsAttach(containerId, httpUrl) {
+            this.logsDetach(containerId);
+            const el = document.getElementById(containerId);
+            if (!el) return;
+            const state = { alive: true, ws: null, timer: 0, lastSeq: 0, cam: '' };
+            logTails[containerId] = state;
+
+            const append = (e) => {
+                if (!e || e.seq <= state.lastSeq) return; // reconnect overlap: already shown
+                state.lastSeq = e.seq;
+                const pinned = el.scrollHeight - el.scrollTop - el.clientHeight < 48;
+                const line = document.createElement('div');
+                line.className = 'log-line log-' + String(e.lvl || 'inf').toLowerCase();
+                const time = document.createElement('span');
+                time.className = 'log-time';
+                time.textContent = new Date(e.t).toLocaleTimeString(undefined, { hour12: false });
+                const lvl = document.createElement('span');
+                lvl.className = 'log-lvl';
+                lvl.textContent = e.lvl;
+                const msg = document.createElement('span');
+                msg.className = 'log-msg';
+                msg.textContent = e.msg; // textContent: log content can never become markup
+                line.append(time, lvl, msg);
+                if (state.cam && !logCamHit(e.msg, state.cam)) line.classList.add('log-hide-cam');
+                el.appendChild(line);
+                while (el.childElementCount > 2000) el.firstElementChild.remove();
+                if (pinned) el.scrollTop = el.scrollHeight;
+            };
+            const retry = () => {
+                if (!state.alive) return;
+                clearTimeout(state.timer);
+                state.timer = setTimeout(connect, 3000);
+            };
+            const connect = () => {
+                if (!state.alive) return;
+                try { state.ws = new WebSocket(httpUrl.replace(/^http/, 'ws')); }
+                catch { retry(); return; }
+                state.ws.onmessage = (ev) => {
+                    try {
+                        const data = JSON.parse(ev.data); // backlog = array, live = single entry
+                        if (Array.isArray(data)) { data.forEach(append); el.scrollTop = el.scrollHeight; }
+                        else append(data);
+                    } catch { }
+                };
+                state.ws.onclose = () => retry();
+                state.ws.onerror = () => { try { state.ws.close(); } catch { } };
+            };
+            connect();
+        },
+        logsDetach(containerId) {
+            const s = logTails[containerId];
+            if (!s) return;
+            s.alive = false;
+            clearTimeout(s.timer);
+            try { s.ws && s.ws.close(); } catch { }
+            delete logTails[containerId];
+        },
+        logsClear(containerId) {
+            document.getElementById(containerId)?.replaceChildren();
+        },
+        // Events list: grow the page when the sentinel nears the viewport. The
+        // sentinel is also a real button, and a scroll fallback covers embedded
+        // webviews where IntersectionObserver never delivers.
+        evMoreObserve(el, dotnetRef) {
+            this.evMoreDetach();
+            if (!el) return;
+            let busy = false;
+            const fire = () => {
+                if (busy) return;
+                busy = true;
+                dotnetRef.invokeMethodAsync('LoadMoreEvents');
+                setTimeout(() => busy = false, 300);
+            };
+            evMoreObs = new IntersectionObserver(entries => {
+                if (entries.some(e => e.isIntersecting)) fire();
+            }, { rootMargin: '400px' });
+            evMoreObs.observe(el);
+            const sc = el.closest('.ev-list');
+            if (sc) {
+                evMoreScroll = { sc, fn: () => {
+                    if (sc.scrollTop + sc.clientHeight >= sc.scrollHeight - 400) fire();
+                } };
+                sc.addEventListener('scroll', evMoreScroll.fn, { passive: true });
+            }
+        },
+        evMoreDetach() {
+            if (evMoreObs) { evMoreObs.disconnect(); evMoreObs = null; }
+            if (evMoreScroll) { evMoreScroll.sc.removeEventListener('scroll', evMoreScroll.fn); evMoreScroll = null; }
+        },
+
+        // Per-camera filter: retags every kept line and steers future appends.
+        logsFilterCam(containerId, cam) {
+            cam = cam || '';
+            const s = logTails[containerId];
+            if (s) s.cam = cam;
+            const el = document.getElementById(containerId);
+            if (!el) return;
+            for (const line of el.children) {
+                const msg = line.querySelector('.log-msg');
+                line.classList.toggle('log-hide-cam',
+                    !!cam && !(msg && logCamHit(msg.textContent, cam)));
+            }
+            el.scrollTop = el.scrollHeight;
+        },
+
+        defaultServer() {
+            // The UI is served by Neolink.Server itself, so the API is on the same
+            // origin. Under a base-path proxy (e.g. Home Assistant ingress) the
+            // <base href> carries the prefix; fold it in so {server}/api/... and the
+            // stream/talk WebSockets stay inside the proxied scope. With <base href="/">
+            // the prefix is empty and this returns the bare origin, as before.
+            const prefix = new URL(document.baseURI).pathname.replace(/\/+$/, "");
+            return location.origin + prefix;
+        },
+
+        // Full-screen "server is restarting" overlay. Shown the instant the admin
+        // confirms a restart — the Blazor circuit is about to drop and the client
+        // gets NO further server messages until it is back, so this runs entirely
+        // in the browser: it owns its own DOM, waits for the server to actually go
+        // down and then come back (two phases, so it can't reload against the
+        // still-alive old process), and reloads the page when it answers again.
+        showRestarting(server) {
+            if (document.getElementById('neolink-restarting')) return;
+            const base = (server && server.length) ? server : this.defaultServer();
+
+            const el = document.createElement('div');
+            el.id = 'neolink-restarting';
+            el.setAttribute('role', 'alertdialog');
+            el.setAttribute('aria-label', 'Server restarting');
+            el.innerHTML =
+                '<div class="restarting-box">' +
+                  '<div class="reconnect-spinner" aria-hidden="true"></div>' +
+                  '<div class="restarting-title">Restarting the server…</div>' +
+                  '<div class="restarting-sub" id="neolink-restarting-sub">' +
+                    'Applying your changes. This page will reload automatically when the server is back.' +
+                  '</div>' +
+                  '<button class="chip" id="neolink-restarting-reload" style="display:none" ' +
+                    'onclick="location.reload()">Reload now</button>' +
+                '</div>';
+            document.body.appendChild(el);
+            // Cover Blazor's own reconnect modal so the user sees ONE clear message.
+            document.body.classList.add('is-restarting');
+
+            const sub = el.querySelector('#neolink-restarting-sub');
+            const reloadBtn = el.querySelector('#neolink-restarting-reload');
+            const t0 = Date.now();
+            let sawDown = false;
+
+            const ping = () =>
+                fetch(base + '/api/features', { cache: 'no-store' })
+                    .then(() => true)   // ANY HTTP response (even 401) = server is up
+                    .catch(() => false); // network failure = still down
+
+            const tick = async () => {
+                const up = await ping();
+                const elapsed = Date.now() - t0;
+                if (up && (sawDown || elapsed > 25000)) {
+                    // Back up (or it bounced so fast we never caught it down): reload.
+                    sub.textContent = 'Server is back — reloading…';
+                    location.reload();
+                    return;
+                }
+                if (!up) {
+                    sawDown = true;
+                    sub.textContent = 'The server is going down and coming back. Waiting for it…';
+                }
+                // After a while with no luck, offer a manual reload but keep trying.
+                if (elapsed > 30000) reloadBtn.style.display = '';
+                setTimeout(tick, 1000);
+            };
+            // A short grace period lets the shutdown begin before the first probe,
+            // so we don't immediately see the old (still-up) process and bail early.
+            setTimeout(tick, 1200);
+        },
+
+        // Remove the restarting overlay — used only when the restart was REFUSED
+        // (server still up), so the admin isn't stuck behind a screen forever.
+        hideRestarting() {
+            document.getElementById('neolink-restarting')?.remove();
+            document.body.classList.remove('is-restarting');
+        },
+        // Kicks off a browser download of a server-prepared file (the response's
+        // Content-Disposition names it) — used by the timeline's footage export.
+        download(url) {
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = '';
+            document.body.appendChild(a);
+            a.click();
+            a.remove();
+        },
+
+        // ---- Detection-zone editor ------------------------------------------
+        // A canvas painting the camera's watched/ignored cell grid over its
+        // latest snapshot. All paint interaction stays in the browser — the
+        // circuit only sees the final table string when the user saves.
+        zoneInit(canvas, cols, rows, table, imgUrl, noSnapLabel, mode) {
+            if (!canvas) return;
+            const st = {
+                cols, rows,
+                cells: Array.from(table, ch => ch === '1'),
+                img: null,
+                failed: false, // snapshot fetch failed: say so on the canvas
+                label: noSnapLabel || '',
+                painting: false,
+                // Block or watch is the TOGGLE's call, not the grid's: inferring
+                // it from the first cell under the pointer made every drag on a
+                // fine grid a coin toss, since which cell that was is invisible.
+                mode: mode === 'watch' ? 'watch' : 'block',
+                paint: false, // the value the pending box will apply
+                // The box being dragged, in cell coordinates. Shading cell by cell
+                // is unusable on a dense grid — a 4K camera reports ~23000 cells, so
+                // clearing a driveway would mean dragging over hundreds of them.
+                // A drag marks a RECTANGLE (a click is a 1x1 one) and any shape is
+                // composed from a few of those, which is how the camera's own app
+                // works too.
+                box: null, // {r0, c0, r1, c1} while dragging
+            };
+            canvas._zone = st;
+            const resize = () => {
+                const box = canvas.parentElement;
+                if (!box) return;
+                // Display aspect follows the snapshot; 16:9 until (unless) it loads.
+                const aspect = st.img ? st.img.naturalHeight / st.img.naturalWidth : 9 / 16;
+                // Fit the WHOLE frame in the space available: a painting surface you
+                // have to scroll is worse than a smaller one. Height is bounded by
+                // what's left of the body after the note below the canvas.
+                let w = box.clientWidth;
+                if (!w) return;
+                let h = w * aspect;
+                // clientHeight INCLUDES the box's own padding, which is not usable
+                // space — counting it would size the canvas a few pixels too tall
+                // and push the note under it out of a box that does not scroll.
+                const cs = getComputedStyle(box);
+                const gap = parseFloat(cs.rowGap) || 0;
+                let avail = box.clientHeight
+                    - (parseFloat(cs.paddingTop) || 0) - (parseFloat(cs.paddingBottom) || 0);
+                for (const sib of box.children)
+                    if (sib !== canvas) avail -= sib.offsetHeight + gap;
+                avail = Math.floor(avail);
+                if (avail > 80 && h > avail) { h = avail; w = h / aspect; }
+                const dpr = window.devicePixelRatio || 1;
+                canvas.style.width = Math.round(w) + 'px';
+                canvas.style.height = Math.round(h) + 'px';
+                canvas.width = Math.round(w * dpr);
+                canvas.height = Math.round(h * dpr);
+                buildBackdrop();
+                draw();
+            };
+
+            // The picture and the grid lines never change while painting, but
+            // rescaling a 4K snapshot and re-stroking every line on each pointer
+            // move is what made dragging crawl on high-resolution cameras. Both
+            // are rendered ONCE per resize into an offscreen layer; a paint then
+            // costs one blit plus the shaded runs.
+            const backdrop = document.createElement('canvas');
+            const buildBackdrop = () => {
+                const { width: w, height: h } = canvas;
+                if (!w || !h) return;
+                backdrop.width = w;
+                backdrop.height = h;
+                const ctx = backdrop.getContext('2d');
+                if (st.img) ctx.drawImage(st.img, 0, 0, w, h);
+                else {
+                    ctx.fillStyle = '#1a1d21';
+                    ctx.fillRect(0, 0, w, h);
+                    if (st.failed && st.label) {
+                        const dpr = window.devicePixelRatio || 1;
+                        ctx.fillStyle = 'rgba(255, 255, 255, 0.5)';
+                        ctx.font = `${Math.round(12 * dpr)}px system-ui, sans-serif`;
+                        ctx.fillText(st.label, Math.round(10 * dpr), Math.round(20 * dpr));
+                    }
+                }
+                // Fine grids turn a line-per-cell into visual noise (and cost);
+                // past that density the shading alone reads the boundaries.
+                const cw = w / st.cols, ch = h / st.rows;
+                if (Math.min(cw, ch) >= 4) {
+                    ctx.strokeStyle = 'rgba(255, 255, 255, 0.14)';
+                    ctx.lineWidth = 1;
+                    ctx.beginPath();
+                    for (let c = 1; c < st.cols; c++) { ctx.moveTo(c * cw, 0); ctx.lineTo(c * cw, h); }
+                    for (let r = 1; r < st.rows; r++) { ctx.moveTo(0, r * ch); ctx.lineTo(w, r * ch); }
+                    ctx.stroke();
+                }
+            };
+
+            const draw = () => {
+                const ctx = canvas.getContext('2d');
+                const { width: w, height: h } = canvas;
+                if (!w || !h) return;
+                ctx.clearRect(0, 0, w, h);
+                ctx.drawImage(backdrop, 0, 0);
+                // Shade whole RUNS of ignored cells: a row of 160 ignored cells is
+                // one rectangle, not 160 — the difference a 4K grid feels.
+                const cw = w / st.cols, ch = h / st.rows;
+                ctx.fillStyle = 'rgba(10, 10, 14, 0.62)';
+                for (let r = 0; r < st.rows; r++) {
+                    const row = r * st.cols;
+                    let start = -1;
+                    for (let c = 0; c <= st.cols; c++) {
+                        const off = c < st.cols && !st.cells[row + c];
+                        if (off && start < 0) start = c;
+                        else if (!off && start >= 0) {
+                            ctx.fillRect(start * cw, r * ch, (c - start) * cw + 0.5, ch + 0.5);
+                            start = -1;
+                        }
+                    }
+                }
+                // The box under the pointer, previewed but not yet committed.
+                if (st.box) {
+                    const { r0, c0, r1, c1 } = st.box;
+                    const x = Math.min(c0, c1) * cw, y = Math.min(r0, r1) * ch;
+                    const bw = (Math.abs(c1 - c0) + 1) * cw, bh = (Math.abs(r1 - r0) + 1) * ch;
+                    ctx.fillStyle = st.paint
+                        ? 'rgba(91, 157, 255, 0.25)'   // about to be watched again
+                        : 'rgba(10, 10, 14, 0.62)';    // about to be ignored
+                    ctx.fillRect(x, y, bw, bh);
+                    ctx.strokeStyle = 'rgba(91, 157, 255, 0.95)';
+                    ctx.lineWidth = 2;
+                    ctx.strokeRect(x, y, bw, bh);
+                }
+            };
+
+            // Coalesce to one paint per frame: a fast drag fires pointermove far
+            // more often than the display refreshes, and painting per event is
+            // work thrown away.
+            let frame = 0;
+            const scheduleDraw = () => {
+                if (frame) return;
+                frame = requestAnimationFrame(() => { frame = 0; draw(); });
+            };
+            st.draw = scheduleDraw;
+            // Cell under the pointer, CLAMPED to the grid: dragging past the edge
+            // should extend the box to it, not abandon the drag.
+            const cellAt = (e) => {
+                const rect = canvas.getBoundingClientRect();
+                if (!rect.width || !rect.height) return null;
+                const c = Math.floor(((e.clientX - rect.left) / rect.width) * st.cols);
+                const r = Math.floor(((e.clientY - rect.top) / rect.height) * st.rows);
+                return {
+                    c: Math.min(st.cols - 1, Math.max(0, c)),
+                    r: Math.min(st.rows - 1, Math.max(0, r)),
+                };
+            };
+            canvas.addEventListener('pointerdown', (e) => {
+                const p = cellAt(e);
+                if (!p) return;
+                st.painting = true;
+                st.paint = st.mode === 'watch';
+                st.box = { r0: p.r, c0: p.c, r1: p.r, c1: p.c };
+                try { canvas.setPointerCapture(e.pointerId); } catch { }
+                scheduleDraw();
+                e.preventDefault();
+            });
+            canvas.addEventListener('pointermove', (e) => {
+                if (!st.painting || !st.box) return;
+                const p = cellAt(e);
+                if (!p || (p.r === st.box.r1 && p.c === st.box.c1)) return;
+                st.box.r1 = p.r;
+                st.box.c1 = p.c;
+                scheduleDraw();
+            });
+            const commit = () => {
+                if (!st.painting) return;
+                st.painting = false;
+                if (st.box) {
+                    const { r0, c0, r1, c1 } = st.box;
+                    const ra = Math.min(r0, r1), rb = Math.max(r0, r1);
+                    const ca = Math.min(c0, c1), cb = Math.max(c0, c1);
+                    for (let r = ra; r <= rb; r++)
+                        for (let c = ca; c <= cb; c++) st.cells[r * st.cols + c] = st.paint;
+                    st.box = null;
+                }
+                scheduleDraw();
+            };
+            for (const evt of ['pointerup', 'pointercancel']) canvas.addEventListener(evt, commit);
+            // Re-fit when the dialog (or window) changes size; self-detaches with
+            // the canvas when the editor closes. Watch the BOX, not the canvas:
+            // the canvas sizes itself now, so observing it would never see the
+            // dialog grow and the size buttons would do nothing.
+            const ro = new ResizeObserver(() => {
+                if (!canvas.isConnected) { ro.disconnect(); return; }
+                resize();
+            });
+            ro.observe(canvas.parentElement || canvas);
+            resize();
+            if (imgUrl) {
+                const img = new Image();
+                img.onload = () => { if (canvas.isConnected) { st.img = img; resize(); } };
+                img.onerror = () => {
+                    if (!canvas.isConnected) return;
+                    st.failed = true;
+                    buildBackdrop(); // the "no snapshot" notice lives in that layer
+                    draw();
+                };
+                img.src = imgUrl;
+            } else {
+                st.failed = true;
+                buildBackdrop();
+                draw();
+            }
+        },
+        zoneRead(canvas) {
+            const st = canvas?._zone;
+            return st ? st.cells.map(b => (b ? '1' : '0')).join('') : null;
+        },
+        zoneMode(canvas, mode) {
+            const st = canvas?._zone;
+            if (st) st.mode = mode === 'watch' ? 'watch' : 'block';
+        },
+        zoneFill(canvas, watch) {
+            const st = canvas?._zone;
+            if (!st) return;
+            st.cells.fill(!!watch);
+            st.draw();
+        },
+
+        lsGet(key) { return localStorage.getItem(key); },
+        lsSet(key, value) { localStorage.setItem(key, value); },
+        // Session-scoped flags: things that must NOT survive to the next visit
+        // (e.g. dismissing the "no sign-in" security banner).
+        ssGet(key) { return sessionStorage.getItem(key); },
+        ssSet(key, value) { sessionStorage.setItem(key, value); },
+
+        // ---- UI language ----------------------------------------------------
+        // A cookie, not localStorage: the circuit that renders the page is created
+        // BEFORE any script of ours runs, and only a cookie rides along with that
+        // request — so this is what stops a French user seeing an English frame
+        // first. The <html lang> follows it live for spell-checkers and screen
+        // readers, which read the attribute rather than the text.
+        setLang(code) {
+            try {
+                const value = encodeURIComponent(code || 'en');
+                const secure = location.protocol === 'https:' ? '; Secure' : '';
+                document.cookie = `neolink_lang=${value}; Path=/; Max-Age=31536000; SameSite=Lax${secure}`;
+                document.documentElement.lang = code || 'en';
+            } catch (e) { }
+        },
+
+        // ---- Browser alerts (per-detection notifications) -------------------
+        // Notifications only work in secure contexts (HTTPS or localhost), but
+        // the browsers disagree on how to say no: Chrome removes the API
+        // entirely, while Firefox KEEPS it and auto-denies requestPermission
+        // without ever showing a prompt. Checking isSecureContext first is what
+        // turns the Firefox case into the honest "needs HTTPS" message instead
+        // of "blocked — re-allow in site settings", advice that cannot work
+        // there (field report: user allowed it manually, still "blocked").
+        notifState() {
+            if (!window.isSecureContext) return 'unsupported';
+            return ('Notification' in window) ? Notification.permission : 'unsupported';
+        },
+        // The desktop shell marks its WebView before any page script runs; the
+        // alerts panel words itself around the shell's native delivery then.
+        isShell() { return !!window.__neolinkShell; },
+        // Nudge the desktop shell (it listens on WebMessageReceived). In a plain
+        // browser there is no chrome.webview and this is a silent no-op.
+        shellPing(msg) { try { window.chrome?.webview?.postMessage(msg); } catch (e) { } },
+        async notifRequest() {
+            if (!window.isSecureContext || !('Notification' in window)) return 'unsupported';
+            try { return await Notification.requestPermission(); }
+            catch { return Notification.permission; }
+        },
+        // Raise via the service worker when available (survives tab minimize and
+        // renders richer on Android); plain Notification as the fallback. The tag
+        // (event id) collapses duplicates across open tabs.
+        async notifShow(o) {
+            if (!('Notification' in window) || Notification.permission !== 'granted') return false;
+            const url = o.url && o.url.startsWith('/') ? location.origin + o.url : o.url;
+            const opts = {
+                body: o.body || '', tag: o.tag || undefined,
+                icon: o.icon || undefined, image: o.image || undefined,
+                // A repeated tag silently REPLACES the earlier notification;
+                // renotify makes it alert again (the test button's second click).
+                renotify: !!(o.renotify && o.tag),
+                data: { url },
+            };
+            try {
+                const reg = await navigator.serviceWorker?.getRegistration();
+                if (reg) { await reg.showNotification(o.title, opts); return true; }
+            } catch { /* fall through to the plain API */ }
+            try {
+                const n = new Notification(o.title, opts);
+                n.onclick = () => { try { window.focus(); if (url) location.assign(url); } catch { } n.close(); };
+                return true;
+            } catch { return false; }
+        },
+    };
+
+    // Camera-settings dialog: draggable by its header, resizable by the native
+    // corner grip (CSS resize) — so staged changes (OSD, picture) can be watched
+    // applying on the video BENEATH the modal. Still a modal: only ✕ dismisses.
+    // Geometry lives as INLINE styles on the panel element, which Blazor throws
+    // away with the element on close — a reopened dialog is always back to the
+    // centered default. Delegated document-level handlers: no per-open init,
+    // and desktop-only (phones keep the fixed sheet).
+    (() => {
+        const desktop = () => matchMedia('(min-width: 701px)').matches;
+        const MARGIN = 8; // the usable area: never closer than this to any edge
+        const clampVal = (v, lo, hi) => Math.min(Math.max(v, lo), Math.max(lo, hi));
+
+        // Pull a MOVED panel back inside the viewport (a centered, untouched
+        // dialog can't be out of bounds and keeps its CSS centering).
+        const clampInto = (panel) => {
+            if (!panel.style.left) return;
+            const r = panel.getBoundingClientRect();
+            panel.style.left = clampVal(parseFloat(panel.style.left), MARGIN, innerWidth - r.width - MARGIN) + 'px';
+            panel.style.top = clampVal(parseFloat(panel.style.top), MARGIN, innerHeight - r.height - MARGIN) + 'px';
+        };
+
+        const drag = { panel: null, dx: 0, dy: 0 };
+        document.addEventListener('pointerdown', (e) => {
+            if (!desktop() || e.button !== 0) return;
+            const head = e.target instanceof Element ? e.target.closest('.campanel-head') : null;
+            const panel = head?.closest('.campanel');
+            if (!panel || getComputedStyle(panel).position !== 'fixed') return;
+            if (e.target.closest('button, select, input, a')) return; // the ✕ stays a click
+            const r = panel.getBoundingClientRect();
+            // First grab converts the CSS centering into explicit geometry.
+            panel.style.left = r.left + 'px';
+            panel.style.top = r.top + 'px';
+            panel.style.transform = 'none';
+            panel.style.margin = '0';
+            drag.panel = panel;
+            drag.dx = e.clientX - r.left;
+            drag.dy = e.clientY - r.top;
+            drag.observe?.(panel); // from now on, resizes re-clamp this panel
+            try { head.setPointerCapture(e.pointerId); } catch { /* synthetic events */ }
+            e.preventDefault(); // no text selection while dragging
+        });
+        document.addEventListener('pointermove', (e) => {
+            if (!drag.panel) return;
+            const r = drag.panel.getBoundingClientRect();
+            drag.panel.style.left = clampVal(e.clientX - drag.dx, MARGIN, innerWidth - r.width - MARGIN) + 'px';
+            drag.panel.style.top = clampVal(e.clientY - drag.dy, MARGIN, innerHeight - r.height - MARGIN) + 'px';
+        });
+        for (const evt of ['pointerup', 'pointercancel'])
+            document.addEventListener(evt, () => {
+                drag.panel = null;
+                // A native corner-grip resize ends in a pointerup too — re-clamp
+                // every moved panel here so growing it can't push it off-screen
+                // (the ResizeObserver below covers non-pointer size changes).
+                document.querySelectorAll('.campanel').forEach(clampInto);
+            });
+
+        // Growing the panel with the corner grip (or shrinking the window) can
+        // strand a MOVED panel outside the usable area — pull it back in. The
+        // observer attaches on the first drag (see pointerdown): until then the
+        // panel is centered and the CSS max-width/height caps keep it in view,
+        // and watching for panels via DOM mutations is unreliable (Blazor's
+        // insertion order). Detached panels (dialog closed) drop themselves.
+        const ro = new ResizeObserver(es => es.forEach(en => {
+            if (!en.target.isConnected) { ro.unobserve(en.target); return; }
+            clampInto(en.target);
+        }));
+        drag.observe = (panel) => ro.observe(panel); // idempotent per target
+        window.addEventListener('resize', () => document.querySelectorAll('.campanel').forEach(clampInto));
+    })();
+
+    // PWA service worker (see sw.js — install support + offline screen, no
+    // caching). Registered only when the app is served from the origin root:
+    // under a base-path proxy (HA ingress) the prefix is a rotating per-session
+    // token, so a worker registered there would just pile up dead scopes.
+    // The script lives under _content/, so claiming scope "/" needs the
+    // Service-Worker-Allowed header the server sets on this one file.
+    if ('serviceWorker' in navigator && new URL(document.baseURI).pathname === '/') {
+        navigator.serviceWorker
+            .register('/_content/Neolink.WebClient/sw.js', { scope: '/' })
+            .catch(() => { /* http on a LAN address: not a secure context — fine */ });
+    }
+})();

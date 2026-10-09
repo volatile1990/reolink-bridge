@@ -1,0 +1,330 @@
+﻿// Copyright (c) 2026 Oluwabori Olaleye
+// Licensed under the GNU Affero General Public License v3.0; see the LICENSE file
+// in the repository root.
+using System.Text.Json;
+
+namespace Neolink.Recording;
+
+/// <summary>
+/// One camera's runtime recording switches. Immutable — readers always see a
+/// consistent snapshot. Retention overrides are per recording type: null = use
+/// the server-wide default, 0 = keep forever, otherwise days. RecordStream picks
+/// which stream is taped ("mainStream"/"subStream"/"externStream"; null = the
+/// server default from the recording config). The capture schedule gates event
+/// recording by local wall-clock time, but ONLY while ScheduleEnabled — the
+/// explicit opt-in keeps "capture always" the safe default and lets a schedule
+/// be switched off without losing it. ScheduleDays lists the enabled days
+/// ("mon".."sun", null = every day) and ScheduleStart/ScheduleEnd bound the
+/// time of day ("HH:mm"; null = midnight, so both null = all day).
+///
+/// Archiving (requires recording.archive_path on the server) is a strict opt-in
+/// per camera and per recording type: with ArchiveEvents/ArchiveContinuous on,
+/// footage whose normal retention expires is MOVED to the archive instead of
+/// deleted — retention stays the single knob for when footage leaves the live
+/// tier; archiving only changes what happens then. Archived footage is deleted
+/// after ArchiveRetentionDays (null or 0 = keep forever). All these fields are
+/// absent from pre-existing settings.json files and default to the old
+/// delete-only behavior.
+/// </summary>
+public sealed record CameraRecordingSettings(bool Events, bool Continuous, List<string>? EventTypes,
+    int? EventRetentionDays = null, int? ContinuousRetentionDays = null,
+    string? RecordStream = null,
+    List<string>? ScheduleDays = null, string? ScheduleStart = null, string? ScheduleEnd = null,
+    bool ScheduleEnabled = false,
+    bool ArchiveEvents = false, bool ArchiveContinuous = false, int? ArchiveRetentionDays = null,
+    // Battery cameras only (sleep-friendly, where 24/7 taping is vetoed): tape
+    // the camera's self-wakes to the timeline as continuous segments — a passive
+    // tap of frames that are already flowing, so it costs the battery nothing.
+    // Default ON; footage follows the continuous retention/archive settings.
+    bool WakeTimeline = true,
+    // AI event descriptions: send this camera's event frames to the configured
+    // LLM. Strict opt-in, and inert unless the feature is also enabled globally
+    // (Settings → AI) — the global switch owns the endpoint.
+    bool AiDescribe = false,
+    // Owner's scene notes for the LLM ("faces the street — passing cars are
+    // routine; the white SUV belongs here"). Threat calls are mostly context,
+    // and this is the only place the model can get any. Null/blank = none.
+    string? AiContext = null,
+    // Email this camera's finished events (snapshots attached) to the server's
+    // notification recipient. Per-camera opt-in; inert until email is set up
+    // under Server settings → Notifications, which owns recipient and SMTP.
+    // The camera's event-type filter already decided what got recorded, so
+    // emails follow it for free — no second type matrix.
+    bool EmailEvents = false,
+    // Same opt-in for the webhook channel (Server settings → Notifications owns
+    // the endpoint and format).
+    bool WebhookEvents = false)
+{
+    /// <summary>Known detection labels (what the UI offers as event-type filters).</summary>
+    public static readonly string[] KnownLabels =
+    {
+        "person", "vehicle", "animal", "package", "doorbell",
+        // Crying-sound detection (indoor cams, enabled in the Reolink app).
+        "crying",
+        // Perimeter protection (line/zone crossing set up in the Reolink app):
+        // record on these INSTEAD of the plain detections, no non-detection
+        // zones needed — untick person/vehicle and keep these.
+        "line-crossing", "intrusion", "loitering",
+        "motion",
+    };
+
+    /// <summary>
+    /// What records when the user never touched the filter (EventTypes null).
+    /// The perimeter labels are OPT-IN: until ticked they'd only duplicate the
+    /// plain detections (a crossing is also motion+person), so an untouched
+    /// setup keeps recording exactly what it recorded before they existed.
+    /// Crying IS default: it's audio-only, so nothing else would catch the
+    /// moment, and the camera-side toggle in the Reolink app is the opt-in.
+    /// </summary>
+    public static readonly string[] DefaultLabels =
+        { "person", "vehicle", "animal", "package", "doorbell", "crying", "motion" };
+
+    /// <summary>A null EventTypes list means the default set (perimeter labels are opt-in).</summary>
+    public bool AllowsLabel(string label) =>
+        EventTypes != null ? EventTypes.Contains(label) : DefaultLabels.Contains(label);
+
+    /// <summary>Capture-schedule day tokens, in display order.</summary>
+    public static readonly string[] WeekDays = { "mon", "tue", "wed", "thu", "fri", "sat", "sun" };
+
+    /// <summary>
+    /// True when the capture schedule admits events at this LOCAL wall-clock
+    /// instant; always true while the schedule is switched off (the default).
+    /// Start > end wraps past midnight (22:00–06:00); the day check applies
+    /// to the day the event actually occurs on, so the small hours of an
+    /// overnight window belong to the following day. Start inclusive, end
+    /// exclusive; a degenerate window (start == end) means all day.
+    /// </summary>
+    public bool ScheduleAllows(DateTime local)
+    {
+        if (!ScheduleEnabled) return true;
+        if (ScheduleDays is { Count: > 0 } days && !days.Contains(DayToken(local.DayOfWeek)))
+            return false;
+        int s = ParseMinutes(ScheduleStart) ?? 0, e = ParseMinutes(ScheduleEnd) ?? 0;
+        if (s == e) return true;
+        int t = local.Hour * 60 + local.Minute;
+        return s < e ? t >= s && t < e : t >= s || t < e;
+    }
+
+    public static string DayToken(DayOfWeek day) => day switch
+    {
+        DayOfWeek.Monday => "mon",
+        DayOfWeek.Tuesday => "tue",
+        DayOfWeek.Wednesday => "wed",
+        DayOfWeek.Thursday => "thu",
+        DayOfWeek.Friday => "fri",
+        DayOfWeek.Saturday => "sat",
+        _ => "sun",
+    };
+
+    /// <summary>"HH:mm" → minutes since midnight; null on anything else.</summary>
+    public static int? ParseMinutes(string? hhmm) =>
+        TimeOnly.TryParseExact(hhmm, "HH\\:mm", out var t) ? t.Hour * 60 + t.Minute : null;
+}
+
+/// <summary>
+/// Per-camera recording switches changeable at runtime from the web UI, persisted
+/// as settings.json NEXT TO THE CONFIG FILE (in Docker: the /config mount), so
+/// static config and runtime settings live together. The config file only provides
+/// each camera's initial defaults; once a user flips a switch, this file wins.
+/// </summary>
+public sealed class RecordingSettings
+{
+    private static readonly JsonSerializerOptions JsonOpts = new()
+    {
+        PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
+        WriteIndented = true,
+    };
+
+    private static readonly CameraRecordingSettings Default =
+        new(Events: true, Continuous: false, EventTypes: null);
+
+    private readonly string _file;
+    private readonly object _gate = new();
+    private readonly object _saveGate = new();
+    // Copy-on-write: a published dictionary is never mutated, so Get — which the
+    // record pumps call per packet — reads it without the lock.
+    private volatile Dictionary<string, CameraRecordingSettings> _cameras = new(StringComparer.OrdinalIgnoreCase);
+
+    public RecordingSettings(string stateDir, params string?[] legacyDirs)
+    {
+        _file = Path.Combine(stateDir, "settings.json");
+        try
+        {
+            // Older versions kept settings.json in the config dir or the recordings
+            // root; a relocated state_dir migrates from whichever exists, once.
+            var source = _file;
+            foreach (var legacy in legacyDirs)
+            {
+                if (File.Exists(source) || legacy == null) break;
+                var candidate = Path.Combine(legacy, "settings.json");
+                if (File.Exists(candidate))
+                {
+                    source = candidate;
+                    Log.Info($"Recording settings: migrating {source} -> {_file}");
+                }
+            }
+            if (File.Exists(source))
+            {
+                var loaded = JsonSerializer.Deserialize<Dictionary<string, CameraRecordingSettings>>(
+                    File.ReadAllText(source), JsonOpts);
+                if (loaded != null)
+                    _cameras = new Dictionary<string, CameraRecordingSettings>(loaded, StringComparer.OrdinalIgnoreCase);
+                if (!ReferenceEquals(source, _file) && source != _file)
+                {
+                    Save();
+                    CopyMigrationMarkers(Path.GetDirectoryName(source) ?? ".");
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            Log.Warn($"Recording settings unreadable ({ex.Message}); starting from config defaults");
+        }
+    }
+
+    /// <summary>Registers a camera's config defaults without touching stored user choices.</summary>
+    public void Seed(string camera, bool eventsDefault)
+    {
+        lock (_gate)
+        {
+            if (_cameras.ContainsKey(camera)) return;
+            var next = new Dictionary<string, CameraRecordingSettings>(_cameras, StringComparer.OrdinalIgnoreCase)
+            {
+                [camera] = new CameraRecordingSettings(eventsDefault, Continuous: false, EventTypes: null),
+            };
+            _cameras = next;
+        }
+    }
+
+    /// <summary>The one-time migration that switches generic cameras' Detection
+    /// events on, now that they can detect (over ONVIF). See Program.</summary>
+    public const string OnvifEventsMigration = "onvif-events";
+
+    /// <summary>Whether a named one-time migration has not run yet on this state directory;
+    /// <see cref="CompleteMigration"/> records it in a marker file beside settings.json.</summary>
+    public bool MigrationDue(string name) => !File.Exists(MigrationMarker(name));
+
+    public void CompleteMigration(string name)
+    {
+        if (!MigrationDue(name)) return;
+        try { File.WriteAllText(MigrationMarker(name), DateTime.UtcNow.ToString("O")); }
+        catch (Exception ex) { Log.Warn($"Cannot record the '{name}' settings migration: {ex.Message}"); }
+    }
+
+    private string MigrationMarker(string name) =>
+        Path.Combine(Path.GetDirectoryName(_file) ?? ".", $"settings.migrated-{name}");
+
+    /// <summary>Brings the migration markers along with a settings.json moved from <paramref name="fromDir"/>.</summary>
+    private void CopyMigrationMarkers(string fromDir)
+    {
+        try
+        {
+            foreach (var marker in Directory.EnumerateFiles(fromDir, "settings.migrated-*"))
+            {
+                var to = Path.Combine(Path.GetDirectoryName(_file) ?? ".", Path.GetFileName(marker));
+                if (!File.Exists(to)) File.Copy(marker, to);
+            }
+        }
+        catch (Exception ex) { Log.Warn($"Cannot carry the settings migration markers over: {ex.Message}"); }
+    }
+
+    /// <summary>Sets a camera's Detection events switch to <paramref name="eventsDefault"/> when
+    /// the stored value differs. For a migration: the stored value was never the user's choice.</summary>
+    public void ResetEvents(string camera, bool eventsDefault)
+    {
+        bool changed;
+        lock (_gate)
+        {
+            if (!_cameras.TryGetValue(camera, out var cur) || cur.Events == eventsDefault) return;
+            _cameras = new Dictionary<string, CameraRecordingSettings>(_cameras, StringComparer.OrdinalIgnoreCase)
+            {
+                [camera] = cur with { Events = eventsDefault },
+            };
+            changed = true;
+        }
+        if (!changed) return;
+        Log.Info($"{camera}: Detection events switched {(eventsDefault ? "on" : "off")} — this camera can now " +
+                 "detect over ONVIF, and the stored setting predates that (turn it off in the camera's " +
+                 "Recording tab if that is not wanted)");
+        Save();
+    }
+
+    public CameraRecordingSettings Get(string camera) =>
+        _cameras.TryGetValue(camera, out var s) ? s : Default;
+
+    /// <summary>
+    /// Applies a partial update (null = leave unchanged; for the type filter and
+    /// the retention overrides, the matching set* flag distinguishes "set" — even
+    /// to null, meaning back to the server default — from "unchanged") and
+    /// persists the result.
+    /// </summary>
+    public CameraRecordingSettings Update(string camera, bool? events, bool? continuous,
+        List<string>? eventTypes, bool setEventTypes,
+        int? eventRetentionDays = null, bool setEventRetention = false,
+        int? continuousRetentionDays = null, bool setContinuousRetention = false,
+        string? recordStream = null, bool setRecordStream = false,
+        List<string>? scheduleDays = null, bool setScheduleDays = false,
+        string? scheduleStart = null, bool setScheduleStart = false,
+        string? scheduleEnd = null, bool setScheduleEnd = false,
+        bool? scheduleEnabled = null,
+        bool? archiveEvents = null, bool? archiveContinuous = null,
+        int? archiveRetentionDays = null, bool setArchiveRetention = false,
+        bool? wakeTimeline = null, bool? aiDescribe = null,
+        string? aiContext = null, bool setAiContext = false,
+        bool? emailEvents = null, bool? webhookEvents = null)
+    {
+        CameraRecordingSettings next;
+        lock (_gate)
+        {
+            var cur = _cameras.TryGetValue(camera, out var s) ? s : Default;
+            next = new CameraRecordingSettings(
+                events ?? cur.Events,
+                continuous ?? cur.Continuous,
+                setEventTypes ? eventTypes : cur.EventTypes,
+                setEventRetention ? eventRetentionDays : cur.EventRetentionDays,
+                setContinuousRetention ? continuousRetentionDays : cur.ContinuousRetentionDays,
+                setRecordStream ? recordStream : cur.RecordStream,
+                setScheduleDays ? scheduleDays : cur.ScheduleDays,
+                setScheduleStart ? scheduleStart : cur.ScheduleStart,
+                setScheduleEnd ? scheduleEnd : cur.ScheduleEnd,
+                scheduleEnabled ?? cur.ScheduleEnabled,
+                archiveEvents ?? cur.ArchiveEvents,
+                archiveContinuous ?? cur.ArchiveContinuous,
+                setArchiveRetention ? archiveRetentionDays : cur.ArchiveRetentionDays,
+                wakeTimeline ?? cur.WakeTimeline,
+                aiDescribe ?? cur.AiDescribe,
+                setAiContext ? aiContext : cur.AiContext,
+                emailEvents ?? cur.EmailEvents,
+                webhookEvents ?? cur.WebhookEvents);
+            _cameras = new Dictionary<string, CameraRecordingSettings>(_cameras, StringComparer.OrdinalIgnoreCase)
+            {
+                [camera] = next,
+            };
+        }
+        // Outside _gate: a stalled state volume must not hold the lock the
+        // record pumps and other updates need for the duration of a disk write.
+        Save();
+        return next;
+    }
+
+    private void Save()
+    {
+        // Serializes the CURRENT published snapshot under its own gate, so
+        // overlapping updates can never persist an older state last.
+        lock (_saveGate)
+        {
+            try
+            {
+                var tmp = _file + ".tmp";
+                File.WriteAllText(tmp, JsonSerializer.Serialize(_cameras, JsonOpts));
+                File.Move(tmp, _file, overwrite: true);
+            }
+            catch (Exception ex)
+            {
+                // Never let a broken state volume take the settings update down with
+                // it — the in-memory switch already applied; only persistence failed.
+                Log.Warn($"Cannot persist recording settings: {ex.Message}");
+            }
+        }
+    }
+}

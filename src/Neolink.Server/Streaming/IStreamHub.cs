@@ -1,0 +1,94 @@
+﻿// Copyright (c) 2026 Oluwabori Olaleye
+// Licensed under the GNU Affero General Public License v3.0; see the LICENSE file
+// in the repository root.
+using System.Threading.Channels;
+using Neolink.Media;
+
+namespace Neolink.Streaming;
+
+/// <summary>Video received from the existing upstream publisher. Counts encoded video payload only,
+/// not audio, RTP overhead or additional camera reads. Arrival timing is monotonic.</summary>
+public readonly record struct VideoDiagnostics(long IncomingFrames, long IncomingVideoBytes,
+    double? LastVideoAgeMs, double MaxArrivalGapMs, double UptimeSeconds);
+
+/// <summary>The publish side of a stream hub, fed by one camera stream.</summary>
+public interface IMediaSink
+{
+    void PublishInfo(MediaInfo info);
+    void PublishVideo(VideoFrame frame);
+    void PublishAac(AacFrame frame);
+    void PublishAdpcm(AdpcmFrame frame);
+    /// <summary>The publishing session ended (camera disconnected, parked to sleep,
+    /// or the pull dropped). Discards session-scoped state — the GOP cache — so a
+    /// viewer joining while the source is down isn't primed with stale frames that
+    /// play for a second and freeze.</summary>
+    void SourceStopped();
+    /// <summary>Headless bridge login was refused. Source stays parked until restart;
+    /// implementations without source status still discard any live session cache.</summary>
+    void SourceAuthenticationFailed() => SourceStopped();
+}
+
+/// <summary>
+/// The consume side of a stream hub: codec parameters for DESCRIBE/init plus
+/// a fan-out subscription of media packets. Used by the RTSP server and web API.
+/// </summary>
+public interface IStreamHub
+{
+    string Name { get; }
+    /// <summary>Every attached consumer, including the server's own recorders.</summary>
+    int SubscriberCount { get; }
+    /// <summary>External watchers only (RTSP sessions + web players) — what "viewers" means to a human.</summary>
+    int ViewerCount { get; }
+
+    /// <summary>True once codec parameters have been learned (DESCRIBE/init can be answered).</summary>
+    bool VideoReady { get; }
+
+    /// <summary>Whether a decodable group of pictures is buffered RIGHT NOW — i.e. a
+    /// publisher is live and a keyframe has been seen since it started. Unlike
+    /// <see cref="VideoReady"/>, which stays true for the rest of the run once codec
+    /// parameters are known, this goes false the moment the source stops. Anything
+    /// that wants a frame without waiting asks this first.</summary>
+    bool HasBufferedGop => false;
+
+    /// <summary>A publisher is sending video now (a keyframe seen since it started), even while its
+    /// group of pictures is too big to buffer; a frame from it means waiting for the next keyframe.</summary>
+    bool LiveVideo => HasBufferedGop;
+    /// <summary>A bridge source is parked after a credential refusal. Cleared by a fresh instance.</summary>
+    bool AuthenticationFailed => false;
+    VideoCodec? Codec { get; }
+    byte[]? Sps { get; }
+    byte[]? Pps { get; }
+    byte[]? Vps { get; }
+    uint Width { get; }
+    uint Height { get; }
+    AudioTrackInfo? Audio { get; }
+    /// <summary>A read-only snapshot; implementations without timing cannot claim freshness.</summary>
+    VideoDiagnostics GetVideoDiagnostics() => new(0, 0, null, 0, 0);
+
+    /// <summary>An Opus-consuming session arrived/left. The hub transcodes the
+    /// camera's audio to Opus (<see cref="HubAudioOpus"/> packets, alongside the
+    /// originals) only while at least one such session is playing — ffmpeg runs
+    /// on demand and stops with the last Opus listener. Defaults are no-ops so
+    /// hubs without a transcode path need nothing.</summary>
+    void AcquireOpus() { }
+    /// <inheritdoc cref="AcquireOpus"/>
+    void ReleaseOpus() { }
+
+    /// <param name="viewer">True for external watchers (RTSP/web); false for
+    /// internal consumers like the recorders, which don't count as viewers.</param>
+    (Guid id, ChannelReader<HubPacket> reader) Subscribe(bool viewer = false);
+    void Unsubscribe(Guid id);
+
+    /// <summary>
+    /// When a would-be viewer last asked for this stream (DESCRIBE/init wait).
+    /// Viewers only subscribe once video is ready, so a sleeping battery camera
+    /// uses this — not <see cref="ViewerCount"/> — as its wake-up signal.
+    /// </summary>
+    DateTime LastViewerAskUtc { get; }
+
+    /// <summary>
+    /// Waits until enough is known about the stream to answer a DESCRIBE:
+    /// video params present, plus a short grace period to detect audio.
+    /// </summary>
+    Task<bool> WaitForDescribeInfoAsync(TimeSpan timeout, CancellationToken ct);
+}

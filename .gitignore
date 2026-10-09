@@ -1,0 +1,28 @@
+# Build output and editor state
+**/bin/
+**/obj/
+artifacts/
+.vs/
+.vscode/
+*.user
+*.suo
+
+# Local deployment files, credentials and runtime state
+secrets/
+.env
+.env.*
+!.env.example
+compose.yaml
+compose.yml
+**/config.json
+**/config.toml
+**/users.json
+**/settings.json
+**/secret.key
+**/*.log
+diagnostics/
+recordings/
+snapshots/
+*.tar
+*.tar.gz
+*.zip

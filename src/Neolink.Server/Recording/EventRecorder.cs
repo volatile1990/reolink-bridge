@@ -1,0 +1,1069 @@
+﻿// Copyright (c) 2026 Oluwabori Olaleye
+// Licensed under the GNU Affero General Public License v3.0; see the LICENSE file
+// in the repository root.
+using System.Threading.Channels;
+using Neolink.Config;
+using Neolink.Media;
+using Neolink.Protocol;
+using Neolink.Streaming;
+
+namespace Neolink.Recording;
+
+/// <summary>
+/// Turns a camera's alarm pushes into stored, labeled events with video clips.
+///
+/// Two long-lived tasks cooperate:
+///  - the packet pump subscribes to the stream hub and either maintains a keyframe-
+///    aligned pre-roll buffer (idle) or feeds the active clip writer (recording);
+///  - the event loop consumes motion pushes and drives the event lifecycle.
+///
+/// Grouping: one event spans a burst of activity. It opens on the first detection,
+/// keeps extending while the camera reports activity (labels accumulate — a person
+/// walking to their car becomes one "person + vehicle" event, not five), and closes
+/// after PostSeconds of quiet or at the MaxClipSeconds cap. A thumbnail is captured
+/// via the camera's own JPEG snapshot command, so no server-side decoding is needed.
+/// </summary>
+public sealed class EventRecorder
+{
+    private readonly string _camera;
+    private readonly IStreamHub _hub;
+    private readonly IStreamHub? _previewHub;
+    private readonly IReadOnlyDictionary<string, IStreamHub>? _hubsByKind;
+    private readonly ICameraControl _control;
+    private readonly EventStore _store;
+    private readonly RecordingConfig _cfg;
+    private readonly RecordingSettings _settings;
+
+    private readonly Channel<MotionPush> _pushes = Channel.CreateUnbounded<MotionPush>(
+        new UnboundedChannelOptions { SingleReader = true });
+
+    /// <summary>Matches CameraService.WakeClipWindow; settable for tests.</summary>
+    internal TimeSpan WakeWindow = CameraService.WakeClipWindow;
+
+    // Pre-roll buffers and clip writers are handed between the pumps and the event
+    // loop under one gate; all touch them briefly (never blocking on disk).
+    // Each buffered packet carries its drop flag so a clip started later still
+    // knows where the stream was discontinuous. The optional preview capture
+    // records the sub stream into preview.mp4 alongside the full clip — that's
+    // what the review strip's ambient players use, keeping client decode cheap.
+    private readonly object _mediaGate = new();
+    private readonly List<(HubPacket Packet, bool Gap)> _preroll = new();
+    private readonly List<(HubPacket Packet, bool Gap)> _previewPreroll = new();
+    private ClipWriter? _writer;
+    private ClipWriter? _previewWriter;
+    // Writers closed AT a stream gap while their event stayed open: the close
+    // path must still await their finalize and read their WroteVideo verdict.
+    private ClipWriter? _gapClosedWriter;
+    private ClipWriter? _gapClosedPreview;
+    /// <summary>The hub the record pump is subscribed to RIGHT NOW — clips must
+    /// take their codec parameters from here, never from a just-changed selection.</summary>
+    private volatile IStreamHub? _activeRecordHub;
+
+    /// <param name="hubsByKind">The camera's streams by kind, enabling the per-camera
+    /// "record from main/sub" runtime choice; null pins recording to <paramref name="hub"/>.</param>
+    /// <param name="prerollWanted">Whether to keep a pre-roll now; null = always. A camera
+    /// that may never detect anything holds none (a clip it records starts at the next keyframe).</param>
+    public EventRecorder(string camera, IStreamHub hub, ICameraControl control,
+        EventStore store, RecordingConfig cfg, RecordingSettings settings,
+        IStreamHub? previewHub = null, IReadOnlyDictionary<string, IStreamHub>? hubsByKind = null,
+        Func<bool>? hasRoom = null, Action<string>? onWriteError = null,
+        Neolink.Ai.AiDescriber? ai = null, Func<bool>? prerollWanted = null)
+    {
+        _prerollWanted = prerollWanted;
+        _ai = ai;
+        _camera = camera;
+        _hub = hub;
+        _previewHub = previewHub;
+        _hubsByKind = hubsByKind;
+        _control = control;
+        _store = store;
+        _cfg = cfg;
+        _settings = settings;
+        _hasRoom = hasRoom;
+        _onWriteError = onWriteError;
+    }
+
+    private readonly Func<bool>? _prerollWanted;
+
+    /// <summary>Adds a packet to a pre-roll buffer, or empties it while none is wanted. Caller holds _mediaGate.</summary>
+    private void KeepForPreroll(List<(HubPacket Packet, bool Gap)> buffer, HubPacket packet, bool gap)
+    {
+        if (_prerollWanted?.Invoke() == false)
+        {
+            if (buffer.Count > 0) buffer.Clear();
+            return;
+        }
+        buffer.Add((packet, gap));
+        if (packet is HubVideo) TrimPreroll(buffer);
+    }
+
+    /// <summary>Free-space guard for the clips tier; null = never blocks.</summary>
+    private readonly Func<bool>? _hasRoom;
+    private readonly Action<string>? _onWriteError;
+    private bool _fullLogged;
+
+    /// <summary>AI event descriptions (opt-in per camera AND globally); null = feature absent.
+    /// Strictly fire-and-forget: captures sample the camera's own snapshot command
+    /// and jobs queue on the describer's bounded channel, so nothing here can
+    /// block or fail the event lifecycle.</summary>
+    private readonly Neolink.Ai.AiDescriber? _ai;
+
+    /// <summary>The hub clips are cut from right now: the user's per-camera stream
+    /// choice when set (and served), otherwise the configured default.</summary>
+    private IStreamHub RecordHub()
+    {
+        var kind = _settings.Get(_camera).RecordStream;
+        return kind != null && _hubsByKind != null && _hubsByKind.TryGetValue(kind, out var hub)
+            ? hub
+            : _hub;
+    }
+
+    public string Camera => _camera;
+
+    /// <summary>Called from the camera connection for every alarm push (any thread).</summary>
+    public void OnMotion(MotionPush push) => _pushes.Writer.TryWrite(push);
+
+    // ------------------------------------------------------------------ recording status
+
+    private volatile bool _eventActive;
+
+    /// <summary>True while an event (camera detection or on-demand) is being captured.</summary>
+    public bool EventInProgress => _eventActive;
+
+    /// <summary>Fires when event capture starts (true) / ends (false) — the MQTT
+    /// bridge mirrors it into the camera's "Recording" status sensor.</summary>
+    public event Action<bool>? RecordingChanged;
+
+    /// <summary>Fires the moment a detection event is created, before any media
+    /// work — the MQTT bridge forwards the id to HA so an automation firing on
+    /// the same trigger can deep-link to the exact clip (/events?event={id}).</summary>
+    public event Action<EventRecord>? EventStarted;
+
+    /// <summary>This camera's most recent stored detection event, or null if it has
+    /// none. Lets the MQTT bridge backfill the retained "last event" sensors at
+    /// startup so a newly-added sensor isn't stuck at "unknown" until the next
+    /// detection (its topic was never published, so nothing was retained).</summary>
+    public EventRecord? MostRecentEvent() => _store.List(_camera, limit: 1).FirstOrDefault();
+
+    // ------------------------------------------------------------------ on-demand recording
+
+    /// <summary>A running user-commanded recording (web UI record button / HA Record switch).</summary>
+    /// <summary>Fires once per finished (non-provisional) event, after the record,
+    /// clip and thumbnail have all settled on disk — the seam event emails ride.
+    /// Must not block: heavy work belongs on the handler's own task.</summary>
+    public Action<EventRecord>? OnEventClosed { get; set; }
+
+    public sealed record OnDemandSession(DateTime StartedUtc, DateTime EndsUtc)
+    {
+        public double RemainingSeconds => Math.Max(0, (EndsUtc - DateTime.UtcNow).TotalSeconds);
+    }
+
+    private readonly object _onDemandGate = new();
+    private CancellationTokenSource? _onDemandStop;
+    private volatile OnDemandSession? _onDemand;
+
+    /// <summary>Fires on start (the session) and on end (null), whatever the trigger
+    /// path — the MQTT bridge mirrors this onto the HA switch state.</summary>
+    public event Action<OnDemandSession?>? OnDemandChanged;
+
+    /// <summary>The on-demand recording in progress, if any.</summary>
+    public OnDemandSession? OnDemand => _onDemand;
+
+    /// <summary>On-demand capture needs the camera's master events switch on —
+    /// the event loop discards every push, external or not, while it is off.</summary>
+    public bool OnDemandAvailable => EventsEnabled;
+
+    /// <summary>The camera's "Detection events" master switch — the live setting
+    /// behind the web UI toggle; while off, every detection push is discarded.</summary>
+    public bool EventsEnabled => _settings.Get(_camera).Events;
+
+    /// <summary>Flips the master switch at runtime and persists it, exactly like
+    /// the web UI's Events toggle — the HA switch shares this one path.</summary>
+    public void SetEventsEnabled(bool on) =>
+        _settings.Update(_camera, events: on, continuous: null, eventTypes: null, setEventTypes: false);
+
+    // Per-camera notification opt-ins, the same stored settings as the web UI
+    // toggles — the HA switches share this path. Setting them while the channel
+    // is unconfigured is allowed and inert (delivery re-checks readiness).
+    public bool EmailEventsEnabled => _settings.Get(_camera).EmailEvents;
+    public bool WebhookEventsEnabled => _settings.Get(_camera).WebhookEvents;
+
+    public void SetEmailEvents(bool on) =>
+        _settings.Update(_camera, events: null, continuous: null, eventTypes: null,
+            setEventTypes: false, emailEvents: on);
+
+    public void SetWebhookEvents(bool on) =>
+        _settings.Update(_camera, events: null, continuous: null, eventTypes: null,
+            setEventTypes: false, webhookEvents: on);
+
+    /// <summary>The cap every on-demand session runs to (recording.max_clip_seconds).</summary>
+    public int OnDemandMaxSeconds => _cfg.MaxClipSeconds;
+
+    /// <summary>
+    /// Starts a user-commanded recording: synthetic "external" pushes open a normal
+    /// event right away and keep it alive, so the clip machinery, labels, retention
+    /// and HA event flow all behave exactly as for a camera detection. The session
+    /// stops itself so ONE clip lands at ~MaxClipSeconds total (see the loop).
+    /// Returns false when a session is already running or events are switched off.
+    /// </summary>
+    public bool StartOnDemand()
+    {
+        if (!OnDemandAvailable) return false;
+        CancellationTokenSource cts;
+        OnDemandSession session;
+        lock (_onDemandGate)
+        {
+            if (_onDemand != null) return false;
+            cts = new CancellationTokenSource();
+            _onDemandStop = cts;
+            var now = DateTime.UtcNow;
+            session = new OnDemandSession(now, now.AddSeconds(_cfg.MaxClipSeconds));
+            _onDemand = session;
+        }
+        Log.Info($"{_camera}: ⏺ on-demand recording started (up to {_cfg.MaxClipSeconds}s)");
+        OnDemandChanged?.Invoke(session);
+        _ = Task.Run(() => OnDemandLoopAsync(session, cts));
+        return true;
+    }
+
+    /// <summary>Ends the running session early; the event still gets its normal
+    /// post-roll. Returns false when nothing was running.</summary>
+    public bool StopOnDemand()
+    {
+        CancellationTokenSource? cts;
+        lock (_onDemandGate)
+        {
+            cts = _onDemandStop;
+            _onDemandStop = null;
+            if (cts != null) _onDemand = null; // state reads as "off" immediately
+        }
+        if (cts == null) return false;
+        cts.Cancel();
+        return true;
+    }
+
+    private async Task OnDemandLoopAsync(OnDemandSession session, CancellationTokenSource cts)
+    {
+        // Stop pulsing early enough that the post-roll closes the event just under
+        // the MaxClipSeconds hard stop. Pulsing right up to the cap would let the
+        // recorder cut the event at the cap while pulses keep coming — which would
+        // open a second event and produce a surprise extra clip.
+        var pulseUntil = session.StartedUtc.AddSeconds(
+            Math.Max(2, _cfg.MaxClipSeconds - _cfg.PostSeconds - 2));
+        bool stopped = false;
+        try
+        {
+            while (DateTime.UtcNow < pulseUntil)
+            {
+                OnMotion(new MotionPush("MD", new[] { "external" }, External: true));
+                await Task.Delay(TimeSpan.FromSeconds(3), cts.Token).ConfigureAwait(false);
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            stopped = true;
+        }
+        // One explicit all-clear arms the post-roll now instead of at quiet-timeout.
+        OnMotion(new MotionPush("none", Array.Empty<string>(), External: true));
+        if (!stopped)
+        {
+            // Ride out the post-roll: footage is still being written, so the UI
+            // indicator (driven by this session) must stay on until the cap.
+            var tail = session.EndsUtc - DateTime.UtcNow;
+            if (tail > TimeSpan.Zero)
+            {
+                try { await Task.Delay(tail, cts.Token).ConfigureAwait(false); }
+                catch (OperationCanceledException) { stopped = true; }
+            }
+        }
+        lock (_onDemandGate)
+        {
+            _onDemand = null;
+            if (ReferenceEquals(_onDemandStop, cts)) _onDemandStop = null;
+        }
+        cts.Dispose();
+        Log.Info($"{_camera}: on-demand recording {(stopped ? "stopped" : "reached its cap")} " +
+                 $"({(DateTime.UtcNow - session.StartedUtc).TotalSeconds:0}s)");
+        OnDemandChanged?.Invoke(null);
+    }
+
+    public async Task RunAsync(CancellationToken ct)
+    {
+        Log.Info($"{_camera}: event recording enabled ({_hub.Name}, pre={_cfg.PreSeconds}s, post={_cfg.PostSeconds}s" +
+                 $"{(_previewHub != null ? $", previews from {_previewHub.Name}" : "")})");
+        var pump = Task.Run(() => PumpRecordAsync(ct), CancellationToken.None);
+        var previewPump = _previewHub == null
+            ? Task.CompletedTask
+            : Task.Run(() => PumpPacketsAsync(_previewHub, preview: true, ct), CancellationToken.None);
+        try
+        {
+            await EventLoopAsync(ct).ConfigureAwait(false);
+        }
+        finally
+        {
+            ClipWriter? closing, closingPreview;
+            lock (_mediaGate)
+            {
+                closing = _writer;
+                closingPreview = _previewWriter;
+                _writer = null;
+                _previewWriter = null;
+            }
+            closing?.Dispose();
+            closingPreview?.Dispose();
+            try { await pump.ConfigureAwait(false); } catch { }
+            try { await previewPump.ConfigureAwait(false); } catch { }
+            // Give the writer threads a moment to finalize files on shutdown.
+            foreach (var w in new[] { closing, closingPreview })
+            {
+                if (w == null) continue;
+                try { await w.Completion.WaitAsync(TimeSpan.FromSeconds(10)).ConfigureAwait(false); }
+                catch { }
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------ packet pump
+
+    /// <summary>
+    /// The record pump follows the user's stream choice: it resubscribes when the
+    /// selection changes, but only while no clip is being written — one clip must
+    /// stay a single codec/resolution end to end.
+    /// </summary>
+    private async Task PumpRecordAsync(CancellationToken ct)
+    {
+        try
+        {
+            while (!ct.IsCancellationRequested)
+            {
+                var hub = RecordHub();
+                var (id, reader) = hub.Subscribe();
+                _activeRecordHub = hub;
+                try
+                {
+                    long lastIndex = -1;
+                    var lastPacketAt = DateTime.UtcNow;
+                    await foreach (var packet in reader.ReadAllAsync(ct).ConfigureAwait(false))
+                    {
+                        if (!ReferenceEquals(RecordHub(), hub) && TrySwitchWhileIdle(hub))
+                            break; // resubscribe to the newly selected stream
+
+                        // A quiet stretch (offline or suspended camera) stales the
+                        // pre-roll: frames from before the gap must not seed the
+                        // next clip (their timestamps would time-compress the gap).
+                        var now = DateTime.UtcNow;
+                        if (now - lastPacketAt > ContinuousRecorder.SilenceRoll)
+                        {
+                            bool closedAtGap = false;
+                            lock (_mediaGate)
+                            {
+                                _preroll.Clear();
+                                // A clip mid-write ends AT the gap (same rule as the
+                                // preview pump): gluing resumed footage in makes an
+                                // undecodable seam — the first frames back reference
+                                // pictures the clip never held — plus a time jump.
+                                // The event itself stays open; its clip is done.
+                                if (_writer != null)
+                                {
+                                    _writer.Dispose();
+                                    _gapClosedWriter = _writer;
+                                    _writer = null;
+                                    closedAtGap = true;
+                                }
+                            }
+                            if (closedAtGap)
+                                Log.Info($"{_camera}: stream gap while recording — the clip ends at the gap; the event continues");
+                            lastIndex = -1; // the drop flag is meaningless across a gap
+                        }
+                        lastPacketAt = now;
+
+                        bool gap = lastIndex >= 0 && packet.Index != lastIndex + 1;
+                        lastIndex = packet.Index;
+                        if (packet is not HubVideo and not HubAudioAac) continue;
+                        lock (_mediaGate)
+                        {
+                            if (_writer != null)
+                            {
+                                if (packet is HubVideo v) _writer.Add(v, gap);
+                                else _writer.AddAudio((HubAudioAac)packet);
+                                if (_writer.Faulted)
+                                {
+                                    Log.Warn($"{_camera}: clip writer failed; event continues without further video");
+                                    _writer.Dispose();
+                                    _writer = null;
+                                }
+                            }
+                            else
+                            {
+                                KeepForPreroll(_preroll, packet, gap);
+                            }
+                        }
+                    }
+                }
+                finally
+                {
+                    hub.Unsubscribe(id);
+                }
+            }
+        }
+        catch (OperationCanceledException) { }
+    }
+
+    /// <summary>Pre-roll of the old stream can't seed a clip of the new one — drop it on switch.</summary>
+    private bool TrySwitchWhileIdle(IStreamHub from)
+    {
+        lock (_mediaGate)
+        {
+            if (_writer != null) return false; // mid-event: finish the clip first
+            _preroll.Clear();
+        }
+        Log.Info($"{_camera}: event recording source {from.Name} → {RecordHub().Name}");
+        return true;
+    }
+
+    private async Task PumpPacketsAsync(IStreamHub hub, bool preview, CancellationToken ct)
+    {
+        var (id, reader) = hub.Subscribe();
+        try
+        {
+            // The hub index is global across video AND audio packets, so it must be
+            // tracked for every packet — a video-only view sees non-consecutive
+            // indices whenever audio is interleaved, and treating those as drops
+            // would discard all P-frames (0-second clips).
+            long lastIndex = -1;
+            var lastPacketAt = DateTime.UtcNow;
+            await foreach (var packet in reader.ReadAllAsync(ct).ConfigureAwait(false))
+            {
+                // Stale pre-roll across a quiet stretch — see the idle watcher.
+                var now = DateTime.UtcNow;
+                if (now - lastPacketAt > ContinuousRecorder.SilenceRoll)
+                {
+                    lock (_mediaGate)
+                    {
+                        (preview ? _previewPreroll : _preroll).Clear();
+                        // An event still open across the gap (its all-clear push died
+                        // with the connection) must not have resumed footage glued in:
+                        // the clip's media ends AT the gap. The event loop's own timers
+                        // still close the event; its disposal is null-safe.
+                        var open = preview ? _previewWriter : _writer;
+                        if (open != null)
+                        {
+                            open.Dispose();
+                            if (preview) { _previewWriter = null; _gapClosedPreview = open; }
+                            else { _writer = null; _gapClosedWriter = open; }
+                        }
+                    }
+                    lastIndex = -1;
+                }
+                lastPacketAt = now;
+
+                bool gap = lastIndex >= 0 && packet.Index != lastIndex + 1;
+                lastIndex = packet.Index;
+
+                if (packet is not HubVideo and not HubAudioAac) continue;
+                lock (_mediaGate)
+                {
+                    var writer = preview ? _previewWriter : _writer;
+                    if (writer != null)
+                    {
+                        // Add never blocks on disk (background writer thread); a dead
+                        // disk surfaces as Faulted and the event continues clip-less.
+                        if (packet is HubVideo v) writer.Add(v, gap);
+                        else writer.AddAudio((HubAudioAac)packet);
+                        if (writer.Faulted)
+                        {
+                            Log.Warn($"{_camera}: {(preview ? "preview" : "clip")} writer failed; " +
+                                     "event continues without further video");
+                            writer.Dispose();
+                            if (preview) _previewWriter = null;
+                            else _writer = null;
+                        }
+                    }
+                    else
+                    {
+                        KeepForPreroll(preview ? _previewPreroll : _preroll, packet, gap);
+                    }
+                }
+            }
+        }
+        catch (OperationCanceledException) { }
+        finally
+        {
+            hub.Unsubscribe(id);
+        }
+    }
+
+    /// <summary>
+    /// Keeps a pre-roll spanning at least PreSeconds while starting on a keyframe
+    /// (a clip must begin decodable): drop everything before the latest keyframe
+    /// that still preserves the wanted span. Only called right after a VIDEO
+    /// packet was appended; interleaved audio is trimmed along with its video.
+    /// </summary>
+    private void TrimPreroll(List<(HubPacket Packet, bool Gap)> buffer)
+    {
+        uint want = (uint)_cfg.PreSeconds * FMp4.Timescale;
+        uint last = ((HubVideo)buffer[^1].Packet).RtpTs;
+        int cut = -1;
+        for (int i = buffer.Count - 1; i >= 0; i--)
+        {
+            if (buffer[i].Packet is not HubVideo { Keyframe: true } kv) continue;
+            if (unchecked(last - kv.RtpTs) >= want)
+            {
+                cut = i;
+                break;
+            }
+        }
+        if (cut > 0)
+            buffer.RemoveRange(0, cut);
+        // Safety valve for streams with pathological keyframe intervals.
+        if (buffer.Count > 8192)
+            buffer.RemoveRange(0, buffer.Count - 8192);
+    }
+
+    /// <summary>Seconds of footage the pre-roll actually holds right now, measured
+    /// from its RTP timestamps. A steadily streaming camera holds at least
+    /// PreSeconds (TrimPreroll's floor); a freshly woken battery camera holds only
+    /// what arrived since the wake.</summary>
+    private double PrerollSpanSeconds()
+    {
+        lock (_mediaGate)
+        {
+            uint first = 0, last = 0;
+            bool any = false;
+            foreach (var (p, _) in _preroll)
+            {
+                if (p is not HubVideo v) continue;
+                if (!any) { first = v.RtpTs; any = true; }
+                last = v.RtpTs;
+            }
+            return any ? unchecked(last - first) / (double)FMp4.Timescale : 0;
+        }
+    }
+
+    // ------------------------------------------------------------------ event lifecycle
+
+    private async Task EventLoopAsync(CancellationToken ct)
+    {
+        while (!ct.IsCancellationRequested)
+        {
+            MotionPush push;
+            try
+            {
+                push = await _pushes.Reader.ReadAsync(ct).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException)
+            {
+                return;
+            }
+            if (!push.Active) continue; // stray all-clear with no open event
+
+            // Runtime switches (web UI): events off, outside the camera's capture
+            // schedule, or every label of this push filtered out by the camera's
+            // event-type selection → discard, SAYING SO (a detection that vanishes
+            // without a trace is undiagnosable — asked live: "person detection
+            // never got picked up", and the log had nothing to show for it).
+            // External pushes (the HA "Record" switch) are explicit user intent:
+            // only the master events switch can veto them — no schedule, no filter.
+            var settings = _settings.Get(_camera);
+            if (!settings.Events)
+            {
+                // Deliberately off is a quiet state — visible at debug only.
+                Log.Debug($"{_camera}: detection push ({string.Join("+", LabelsOf(push))}) ignored — " +
+                          "the camera's Detection events switch is off");
+                continue;
+            }
+            // The synthetic self-wake (wake-capture) is neither a detection nor a
+            // user command: it starts a PROVISIONAL recording that is kept only if
+            // a detection this camera is configured to record confirms it — the
+            // event-type selection in the camera's settings stays in charge of
+            // what actually becomes a stored video. The schedule applies too.
+            bool wakeProvisional = push.External && push.Status == "wake";
+            // A hint-opened wake: the camera's call home is itself the detection
+            // (some models never push one to a late session), so it starts
+            // announced as motion — sent only when Motion is ticked.
+            bool hintWake = push.External && push.Status == "hint";
+            List<string> labels;
+            if (wakeProvisional || hintWake)
+            {
+                if (!settings.ScheduleAllows(DateTime.Now)) continue;
+                labels = hintWake ? new List<string> { "motion" } : LabelsOf(push);
+            }
+            else if (push.External)
+            {
+                labels = LabelsOf(push);
+            }
+            else
+            {
+                if (!settings.ScheduleAllows(DateTime.Now)) // schedules are wall-clock local
+                {
+                    NoteDiscarded(push, "outside this camera's capture schedule");
+                    continue;
+                }
+                labels = LabelsOf(push).Where(settings.AllowsLabel).ToList();
+                if (labels.Count == 0)
+                {
+                    NoteDiscarded(push, "every label is unticked in this camera's event types");
+                    continue;
+                }
+            }
+
+            try
+            {
+                await RunEventAsync(labels, wakeProvisional, ct,
+                    hintWake ? " — hint-opened wake" : null,
+                    wakeOpened: wakeProvisional || hintWake).ConfigureAwait(false);
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                Log.Error($"{_camera}: event handling failed: {Log.Flatten(ex)}");
+            }
+        }
+    }
+
+    // One INF per distinct discard reason per minute: cameras re-push ongoing
+    // motion every few seconds, and the point is a visible breadcrumb, not a flood.
+    private string? _lastDiscardReason;
+    private DateTime _lastDiscardLog;
+
+    private void NoteDiscarded(MotionPush push, string reason)
+    {
+        var now = DateTime.UtcNow;
+        if (reason == _lastDiscardReason && now - _lastDiscardLog < TimeSpan.FromSeconds(60))
+            return;
+        _lastDiscardReason = reason;
+        _lastDiscardLog = now;
+        Log.Info($"{_camera}: detection push ({string.Join("+", LabelsOf(push))}) NOT recorded — {reason}");
+    }
+
+    private async Task RunEventAsync(List<string> initialLabels, bool provisional,
+        CancellationToken ct, string? startNote = null, bool wakeOpened = false)
+    {
+        // The stored start reaches back only as far as footage actually exists.
+        // A battery camera's wake event has almost nothing buffered — its stream
+        // began at the wake — and stamping start-minus-PreSeconds there promises
+        // footage that never left the camera: the tile claims a time half a
+        // minute before the clip's first frame, and the duration counts the
+        // fiction too (reported live from a Video Doorbell as "missing" video).
+        var rec = _store.Create(_camera,
+            DateTime.UtcNow - TimeSpan.FromSeconds(Math.Min(_cfg.PreSeconds, PrerollSpanSeconds())),
+            initialLabels);
+        if (provisional)
+        {
+            // A self-wake: footage is being captured, but nothing is announced —
+            // no HA trigger, no browser alert, no "event started". Promotion (a
+            // detection this camera records) announces; otherwise it all vanishes.
+            Log.Info($"{_camera}: self-wake — recording tentatively (kept only if a detection " +
+                     "this camera's event types allow arrives)");
+        }
+        else
+        {
+            Log.Info($"{_camera}: ⚡ event started ({string.Join("+", rec.Labels)}{startNote})");
+            EventStarted?.Invoke(rec); // id out first: HA sees it with the trigger
+        }
+        // Tentative wakes stay invisible: the MQTT bridge both listens for the
+        // edge AND polls EventInProgress on its refresh sweep.
+        if (!provisional)
+        {
+            _eventActive = true;
+            RecordingChanged?.Invoke(true);
+        }
+        try
+        {
+            await RunEventCoreAsync(rec, provisional, wakeOpened, ct).ConfigureAwait(false);
+        }
+        finally
+        {
+            _eventActive = false;
+            RecordingChanged?.Invoke(false);
+        }
+    }
+
+    private async Task RunEventCoreAsync(EventRecord rec, bool provisional, bool wakeOpened,
+        CancellationToken ct)
+    {
+        // The pre-roll buffers hold the trigger moment itself — the seconds the
+        // live snapshot burst can never reach. StartClip is about to drain them
+        // into the clip writer, so the AI's copy (packet refs only) goes first.
+        var aiPreroll = !provisional && _ai?.WantsCapture(_camera) == true
+            ? SnapshotPrerollForAi() : null;
+        StartClip(rec);
+        var thumbTask = CaptureThumbAsync(rec, ct);
+        // The AI frames ride the event: with ffmpeg and a flowing stream, a
+        // passive tap of the recording's own keyframes (zero camera cost);
+        // otherwise one low-res snapshot per second via the camera's command.
+        // A tentative self-wake captures nothing until promoted — its footage
+        // usually gets discarded, and every shot would cost the battery camera
+        // awake-time for nothing.
+        var aiCapture = provisional ? null
+            : _ai?.TryBeginCapture(_camera, _control, ct, aiPreroll, PickAiStreamHub(),
+                _cfg.PostSeconds);
+
+        var hardStop = DateTime.UtcNow.AddSeconds(_cfg.MaxClipSeconds);
+        var quietUntil = DateTime.UtcNow.AddSeconds(_cfg.PostSeconds);
+        bool active = true; // the camera currently reports detection
+        // While a wake-opened event waits for the late push, a camera all-clear
+        // must not cut the window short; only the synthetic (External) closer can.
+        var wakeHold = wakeOpened ? DateTime.UtcNow + WakeWindow : DateTime.MinValue;
+
+        while (!ct.IsCancellationRequested)
+        {
+            var now = DateTime.UtcNow;
+            if (now >= hardStop) break;
+            var deadline = active ? hardStop : (quietUntil < hardStop ? quietUntil : hardStop);
+            if (!active && now >= deadline) break;
+
+            MotionPush push;
+            using var waitCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            waitCts.CancelAfter(deadline - now);
+            try
+            {
+                push = await _pushes.Reader.ReadAsync(waitCts.Token).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) when (!ct.IsCancellationRequested)
+            {
+                continue; // a deadline fired; loop re-evaluates
+            }
+
+            if (push.Active)
+            {
+                // Our own synthetic self-wake marker proves nothing inside a
+                // running event: a new park's wake push must never CONFIRM a
+                // still-tentative recording (only a real detection may), never
+                // re-add the wake label, and never extend the event. (Seen live:
+                // back-to-back wake sessions promoted a lingering tentative event
+                // with no labels at all — "event started ( — confirmed…".)
+                if (push.Status is "wake" or "hint")
+                {
+                    // A marker means a NEW wake session, so this event's own session
+                    // is gone: end it here and let the re-queued marker open its own.
+                    if (wakeOpened)
+                    {
+                        active = false;
+                        quietUntil = DateTime.UtcNow;
+                        OnMotion(push);
+                    }
+                    continue;
+                }
+                // Filtered-out detection types don't extend the event either —
+                // as far as recording is concerned, they never happened.
+                // External holds always extend: the switch is still on.
+                var allowed = push.External
+                    ? LabelsOf(push)
+                    : LabelsOf(push).Where(_settings.Get(_camera).AllowsLabel).ToList();
+                if (allowed.Count == 0)
+                {
+                    // Inside a TENTATIVE wake recording this is the line that
+                    // explains a "vanished" detection: the push arrived, but a
+                    // filtered label cannot confirm the wake, so the footage
+                    // gets discarded as if nothing happened.
+                    NoteDiscarded(push, provisional
+                        ? "every label is unticked in this camera's event types, so it cannot confirm the wake recording"
+                        : "every label is unticked in this camera's event types (event not extended)");
+                    continue;
+                }
+                active = true;
+                wakeHold = DateTime.MinValue; // a real detection takes over the lifecycle
+                var fresh = allowed.Where(l => !rec.Labels.Contains(l)).ToList();
+                if (fresh.Count > 0)
+                {
+                    // Reassign, never mutate: search/API threads enumerate Labels
+                    // outside the store gate.
+                    rec.Labels = rec.Labels.Concat(fresh).ToList();
+                    rec.EndUtc = DateTime.UtcNow;
+                    _store.Save(rec);
+                }
+                if (provisional)
+                {
+                    // A detection this camera records arrived: the tentative wake
+                    // recording becomes a real event, announced only NOW — with
+                    // the footage reaching back to the wake itself. The wake tag
+                    // comes off: from here this is an ordinary detection event
+                    // ("Human detected", never "Wake") — wakes as such belong to
+                    // the timeline, not the events list.
+                    provisional = false;
+                    aiCapture ??= _ai?.TryBeginCapture(_camera, _control, ct,
+                        streamHub: PickAiStreamHub(), postSeconds: _cfg.PostSeconds);
+                    if (rec.Labels.Contains("wake"))
+                    {
+                        rec.Labels = rec.Labels.Where(l => l != "wake").ToList();
+                        _store.Save(rec);
+                    }
+                    Log.Info($"{_camera}: ⚡ event started ({string.Join("+", rec.Labels)} — " +
+                             "confirmed self-wake, footage from the wake onward)");
+                    EventStarted?.Invoke(rec);
+                    _eventActive = true;
+                    RecordingChanged?.Invoke(true);
+                }
+                else if (fresh.Count > 0)
+                {
+                    Log.Info($"{_camera}: event escalated (+{string.Join("+", fresh)})");
+                }
+            }
+            else if (active)
+            {
+                if (!push.External && DateTime.UtcNow < wakeHold) continue;
+                // Arm the post-roll ONLY on the active→quiet transition. Cameras
+                // repeat all-clear pushes while idle, and re-arming on every one
+                // kept events open until the MaxClipSeconds hard stop (the
+                // suspicious wall of exactly-max-length clips in busy setups).
+                active = false;
+                quietUntil = DateTime.UtcNow.AddSeconds(_cfg.PostSeconds);
+            }
+        }
+
+        ClipWriter? closingWriter, closingPreview;
+        lock (_mediaGate)
+        {
+            // A writer closed early at a stream gap still owes this event its
+            // finalize wait and its WroteVideo verdict.
+            closingWriter = _writer ?? _gapClosedWriter;
+            closingPreview = _previewWriter ?? _gapClosedPreview;
+            _writer = null;
+            _previewWriter = null;
+            _gapClosedWriter = null;
+            _gapClosedPreview = null;
+        }
+        closingWriter?.Dispose();
+        closingPreview?.Dispose();
+        rec.EndUtc = DateTime.UtcNow;
+        // Ongoing=false is every consumer's cue that clip.mp4 is complete (the
+        // browser may cache it as immutable; a delay-0 email samples it whole),
+        // and the store serves this same instance — so the finalize must land
+        // before the flag flips. Bounded: a dead disk faults the writer and
+        // completes it early.
+        foreach (var w in new[] { closingWriter, closingPreview })
+        {
+            if (w == null) continue;
+            try { await w.Completion.WaitAsync(TimeSpan.FromSeconds(10)).ConfigureAwait(false); }
+            catch { }
+        }
+        // An empty capture (a stream that never delivered a frame) is not a
+        // playable artifact — the record must not send players to it. Only
+        // trusted when the writer actually finished (a timed-out wait proves
+        // nothing about what landed).
+        if (closingWriter is { } cw && cw.Completion.IsCompletedSuccessfully && !cw.WroteVideo)
+            rec.HasClip = false;
+        if (closingPreview is { } cp && cp.Completion.IsCompletedSuccessfully && !cp.WroteVideo)
+            rec.HasPreview = false;
+        rec.Ongoing = false;
+
+        if (provisional)
+        {
+            // Still tentative at the end: nothing this camera is configured to
+            // record happened. The footage is deleted, not kept — the event-type
+            // selection decides what becomes a stored video, and a bare wake is
+            // not on the list. (The thumbnail task must finish before the tree
+            // goes, or its write recreates the directory.)
+            aiCapture?.Cancel(); // nothing to describe about a discarded recording
+            try { await thumbTask.ConfigureAwait(false); } catch { }
+            _store.DeleteEvent(rec.Id);
+            Log.Info($"{_camera}: self-wake ended with no matching detection " +
+                     $"({(rec.EndUtc - rec.StartUtc).TotalSeconds:0}s) — footage discarded, as this " +
+                     "camera's event types direct");
+            return;
+        }
+
+        _store.Save(rec);
+        if (aiCapture != null) _ai!.Submit(aiCapture, rec); // queue only; never blocks
+        try { await thumbTask.ConfigureAwait(false); } catch { }
+        Log.Info($"{_camera}: event ended ({string.Join("+", rec.Labels)}, " +
+                 $"{(rec.EndUtc - rec.StartUtc).TotalSeconds:0}s{(rec.HasClip ? ", clip saved" : "")})");
+        // After the thumb settles, so an email fallback has something to attach.
+        // The handler (event emails) detaches its own work; a throw here must
+        // not end the event pump.
+        try { OnEventClosed?.Invoke(rec); } catch (Exception ex) { Log.Warn($"{_camera}: event-closed hook failed: {Log.Flatten(ex)}"); }
+    }
+
+    private void StartClip(EventRecord rec)
+    {
+        lock (_mediaGate)
+        {
+            // Free-space guard: a full clips volume records the event's metadata
+            // only (still visible in the strip) instead of failing mid-write.
+            if (_hasRoom?.Invoke() == false)
+            {
+                if (!_fullLogged)
+                {
+                    Log.Error($"{_camera}: clips storage is FULL — events are stored without video until space is freed");
+                    _fullLogged = true;
+                }
+                _preroll.Clear();
+                _previewPreroll.Clear();
+                return;
+            }
+            if (_fullLogged)
+            {
+                Log.Info($"{_camera}: storage has room again — event clips resume");
+                _fullLogged = false;
+            }
+            _gapClosedWriter = null;
+            _gapClosedPreview = null;
+            try
+            {
+                _writer = ClipWriter.TryCreate(Path.Combine(_store.EventDir(rec), "clip.mp4"),
+                    _activeRecordHub ?? _hub);
+                if (_writer == null)
+                {
+                    Log.Warn($"{_camera}: stream not ready; event stored without a clip");
+                }
+                else
+                {
+                    // Audio before the first keyframe is ignored by the writer,
+                    // so both tracks start on the same instant.
+                    foreach (var (p, gap) in _preroll)
+                    {
+                        if (p is HubVideo v) _writer.Add(v, gap);
+                        else if (p is HubAudioAac a) _writer.AddAudio(a);
+                    }
+                    _preroll.Clear();
+                }
+            }
+            catch (Exception ex)
+            {
+                Log.Warn($"{_camera}: cannot start clip: {ex.Message}");
+                _onWriteError?.Invoke(_camera);
+                _writer?.Dispose();
+                _writer = null;
+            }
+
+            // The low-res twin from the sub stream, for the review strip's previews.
+            if (_previewHub != null)
+            {
+                try
+                {
+                    _previewWriter = ClipWriter.TryCreate(Path.Combine(_store.EventDir(rec), "preview.mp4"), _previewHub);
+                    if (_previewWriter != null)
+                    {
+                        foreach (var (p, gap) in _previewPreroll)
+                        {
+                            if (p is HubVideo v) _previewWriter.Add(v, gap);
+                            else if (p is HubAudioAac a) _previewWriter.AddAudio(a);
+                        }
+                        _previewPreroll.Clear();
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Log.Warn($"{_camera}: cannot start preview clip: {ex.Message}");
+                    _previewWriter?.Dispose();
+                    _previewWriter = null;
+                }
+            }
+        }
+        rec.HasClip = _writer != null;
+        rec.HasPreview = _previewWriter != null;
+        if (rec.HasClip || rec.HasPreview)
+            _store.Save(rec);
+    }
+
+    /// <summary>The hub the AI stream tap should listen to: the sub-stream twin
+    /// when it's flowing (model-sized frames), else the record stream, else null
+    /// — and always null without ffmpeg, since compressed keyframes would be
+    /// undecodable; the snapshot burst then carries the event as before.</summary>
+    private IStreamHub? PickAiStreamHub()
+    {
+        if (Neolink.Ai.AiPreroll.FfmpegPath == null) return null;
+        if (_previewHub is { VideoReady: true }) return _previewHub;
+        var hub = _activeRecordHub ?? _hub;
+        if (hub.VideoReady) return hub;
+        // ffmpeg is there but no stream is decodable yet — say so, or this
+        // event's snapshot sampling looks like the feature silently not working.
+        Log.Info($"{_camera}: AI stream sampling unavailable for this event (no live " +
+                 "stream at its start) — using camera snapshots");
+        return null;
+    }
+
+    /// <summary>A frozen copy of the pre-roll for the AI describer, taken under
+    /// the media gate BEFORE StartClip consumes the buffers. Prefers the
+    /// sub-stream twin (small frames, same size class as the snapshot burst);
+    /// falls back to the record stream. Packet byte arrays are shared refs — the
+    /// copy costs a list, not a re-buffer — and they live only until the event's
+    /// describe job finishes.</summary>
+    private Neolink.Ai.AiPrerollVideo? SnapshotPrerollForAi()
+    {
+        lock (_mediaGate)
+        {
+            List<(HubPacket Packet, bool Gap)> buffer;
+            IStreamHub hub;
+            if (_previewHub != null && _previewPreroll.Count > 0)
+            {
+                buffer = _previewPreroll;
+                hub = _previewHub;
+            }
+            else
+            {
+                buffer = _preroll;
+                hub = _activeRecordHub ?? _hub;
+            }
+            if (hub.Codec is not { } codec) return null;
+            var packets = buffer.Select(x => x.Packet).OfType<HubVideo>()
+                .Select(v => (v.AnnexB, v.Keyframe, v.RtpTs)).ToList();
+            return packets.Count == 0
+                ? null
+                : new Neolink.Ai.AiPrerollVideo(codec, hub.Vps, hub.Sps, hub.Pps, packets);
+        }
+    }
+
+    /// <summary>Best-effort thumbnail via the camera's own JPEG snapshot command.</summary>
+    private async Task CaptureThumbAsync(EventRecord rec, CancellationToken ct)
+    {
+        try
+        {
+            var jpeg = await _control.SnapshotAsync(ct).ConfigureAwait(false);
+            // A non-Reolink camera may have no snapshot command at all, or one that
+            // came back empty; its only other picture is the stream this very event
+            // is being cut from. A Reolink camera keeps its own snap, full stop —
+            // decoding video here is not something its event path has ever paid.
+            // From whichever stream is carrying video right now: the sub stream when it is
+            // (a small frame decodes fastest), else the one being recorded.
+            if (!IsJpeg(jpeg) && _control.OnvifOnly
+                && (_previewHub is { HasBufferedGop: true } ? _previewHub
+                    : (_activeRecordHub ?? _hub) is { HasBufferedGop: true } buffered ? buffered
+                    : _previewHub is { LiveVideo: true } ? _previewHub
+                    : (_activeRecordHub ?? _hub) is { LiveVideo: true } live ? live : null) is { } hub)
+                jpeg = await Neolink.Media.FrameGrab.FromHubAsync(hub, 720, ct).ConfigureAwait(false);
+            if (!IsJpeg(jpeg))
+                return; // not a JPEG (or camera doesn't support snapshots)
+            await FootageVault.WriteAllBytesAsync(Path.Combine(_store.EventDir(rec), "thumb.jpg"), jpeg!, ct)
+                .ConfigureAwait(false);
+            rec.HasThumb = true;
+            _store.Save(rec);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            Log.Debug($"{_camera}: event snapshot failed: {Log.Flatten(ex)}");
+        }
+    }
+
+    private static bool IsJpeg(byte[]? b) => Neolink.Media.FrameGrab.IsJpeg(b);
+
+    /// <summary>Camera AI classifications → normalized event labels.</summary>
+    internal static List<string> LabelsOf(MotionPush push)
+    {
+        var labels = push.AiTypes.Select(t => t switch
+        {
+            "people" or "person" or "face" => "person",
+            "vehicle" or "car" => "vehicle",
+            "dog_cat" or "animal" or "pet" => "animal",
+            "package" => "package",
+            // "other" is Reolink's own vocabulary for "motion, no AI class" (their
+            // HTTP AI-state API uses exactly people/vehicle/dog_cat/other). Battery
+            // cameras (Argus Solar, live 2026-07-22) report PIR wake detections as
+            // it — left unmapped it became a raw "other" label no filter allows,
+            // so every wake-capture recording on those models was discarded even
+            // though the default event types include "motion".
+            "other" => "motion",
+            "visitor" or "doorbell" => "doorbell", // video doorbells: the button was pressed
+            // Crying-sound detection (indoor cams listen for it through the mic;
+            // "cry" confirmed from an E1 Pro, the others are spelling guesses).
+            "cry" or "baby_cry" or "babycry" => "crying",
+            // Perimeter protection (smart events configured in the Reolink app).
+            // Token spellings vary by firmware; extend as captures come in.
+            "crossline" or "cross_line" or "tripwire" => "line-crossing",
+            "intrude" or "intrusion" or "region" or "perimeter" => "intrusion",
+            "linger" or "loiter" or "loitering" => "loitering",
+            _ => t,
+        }).Distinct().ToList();
+        return labels.Count > 0 ? labels : new List<string> { "motion" };
+    }
+}

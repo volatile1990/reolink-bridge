@@ -1,0 +1,24 @@
+<Project Sdk="Microsoft.NET.Sdk.Razor">
+
+  <!-- Razor class library: the Blazor web UI, hosted in-process by Neolink.Server.
+       Static assets are served under _content/Neolink.WebClient/. -->
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <RootNamespace>Neolink.WebClient</RootNamespace>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <FrameworkReference Include="Microsoft.AspNetCore.App" />
+  </ItemGroup>
+
+  <!-- Translation catalogues travel inside the assembly, so a language works the
+       same from a published folder, the docker image and the HA add-on without a
+       file to mount or a path to configure. English needs no catalogue: it is the
+       source language, kept in the components themselves. -->
+  <ItemGroup>
+    <EmbeddedResource Include="Localization\*.json" />
+  </ItemGroup>
+
+</Project>

@@ -1,0 +1,191 @@
+@page "/logs"
+@using System.Text.Json
+@inject NavigationManager Nav
+@inject HttpClient Http
+@inject IJSRuntime JS
+@inject LocalApiInfo Local
+@inject Translator T
+@implements IAsyncDisposable
+
+@* Full-page live tail of the server log (admin only). The lines are appended
+   straight into the DOM by neolink.js — see logsAttach — so a chatty server
+   never churns the Blazor circuit. *@
+
+<PageTitle>@T["Neolink.NET — Logs"]</PageTitle>
+
+<div class="logs-page">
+    <div class="toolbar">
+        <a class="tool-btn" href="" title="@T["Back to live view"]">‹ @T["Live"]</a>
+        <a class="tool-btn" href="monitor" title="@T["Resource monitor"]">@UiIcon.Render("activity", 14) <span class="tool-name">@T["Monitor"]</span></a>
+        <span class="tool-label">@T["SERVER LOGS"]</span>
+        @if (_admin)
+        {
+            <span class="mon-pulse" title="@T["Streaming live"]"></span>
+            <span class="tool-sep"></span>
+            <span class="tool-label">@T["SHOW"]</span>
+            @foreach (var lvl in LogLevelChips)
+            {
+                <button class="chip @(_hiddenLevels.Contains(lvl) ? "chip-off" : "chip-active")"
+                        title="@(_hiddenLevels.Contains(lvl) ? T["Hidden — click to show"] : T["Shown — click to hide"])"
+                        @onclick="() => ToggleLevel(lvl)">@lvl</button>
+            }
+            @if (_cameras.Count > 0)
+            {
+                <span class="tool-sep"></span>
+                <span class="tool-label">@T["CAMERA"]</span>
+                <select class="event-filter" @bind="_camFilter" @bind:after="ApplyCamFilterAsync"
+                        title="@T["Show one camera's lines, or all of them"]">
+                    <option value="">@T["all cameras"]</option>
+                    @foreach (var c in _cameras)
+                    {
+                        <option value="@c">@c</option>
+                    }
+                </select>
+            }
+            <span class="tile-spacer"></span>
+            <button class="tool-btn" title="@T["Empty the view (the server keeps its backlog)"]"
+                    @onclick="ClearAsync">@T["Clear"]</button>
+        }
+    </div>
+
+    @if (_admin)
+    {
+        <div class="event-sub logs-hint">
+            @T["Scroll up to freeze the view, scroll back to the bottom to follow. The newest ~500 lines are kept server-side, so a fresh page starts with history."]
+        </div>
+        <div id="logs-view" class="mon-logs logs-full @HiddenClasses()"></div>
+    }
+    else if (_checked && !_authEnabled)
+    {
+        <div class="notice">
+            @T["Live server logs are admin-only — and with authentication off there is no admin yet. Create the admin account from the live view, then come back here."]
+        </div>
+    }
+    else if (_checked)
+    {
+        <div class="notice">@T["Live server logs are visible to the admin account only."]</div>
+    }
+</div>
+
+@code {
+    // DBG also covers TRC lines
+    private static readonly string[] LogLevelChips = { "DBG", "INF", "WRN", "ERR" };
+
+    private string _server = "";
+    private string _origin = "";
+    private string? _token;
+    private bool _checked;      // auth status fetched (before that, render nothing judgmental)
+    private bool _authEnabled;
+    private bool _admin;
+    private bool _attached;
+    private readonly HashSet<string> _hiddenLevels = new();
+    private readonly List<string> _cameras = new();
+    private string _camFilter = "";
+
+    protected override async Task OnAfterRenderAsync(bool firstRender)
+    {
+        if (!firstRender)
+        {
+            // The container only exists once _admin is known (a later render).
+            if (_admin && !_attached)
+            {
+                _attached = true;
+                // This URL is fetched by the BROWSER (neolink.js), not the circuit —
+                // it keeps the page origin so it flows through any reverse proxy.
+                var url = $"{_server.TrimEnd('/')}/api/system/logs" +
+                          (string.IsNullOrEmpty(_token) ? "" : $"?token={Uri.EscapeDataString(_token)}");
+                await JS.InvokeVoidAsync("neolink.logsAttach", "logs-view", url);
+            }
+            return;
+        }
+
+        // Server + session are shared with the live view's persisted settings.
+        try
+        {
+            var json = await JS.InvokeAsync<string?>("neolink.lsGet", "neolink.view");
+            if (json != null)
+                _server = JsonSerializer.Deserialize<PersistedView>(json)?.Server ?? "";
+            var auth = await JS.InvokeAsync<string?>("neolink.lsGet", "neolink.auth");
+            if (!string.IsNullOrWhiteSpace(auth))
+            {
+                var el = JsonSerializer.Deserialize<JsonElement>(auth);
+                if (el.TryGetProperty("token", out var t)) _token = t.GetString();
+            }
+        }
+        catch { }
+        try { _origin = await JS.InvokeAsync<string>("neolink.defaultServer"); } catch { }
+        if (string.IsNullOrWhiteSpace(_server))
+            _server = _origin;
+
+        try
+        {
+            var req = new HttpRequestMessage(HttpMethod.Get, $"{ApiBase}/api/auth/status");
+            if (!string.IsNullOrEmpty(_token))
+                req.Headers.Authorization = new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", _token);
+            using var res = await Http.SendAsync(req);
+            if (res.IsSuccessStatusCode)
+            {
+                var status = await res.Content.ReadFromJsonAsync<ApiAuthStatus>();
+                _authEnabled = status?.Enabled ?? false;
+                _admin = status?.Admin ?? false;
+                // Auth on but no session: bounce to sign-in and come back here.
+                // A signed-in non-admin stays and sees the admin-only notice.
+                if (_authEnabled && string.IsNullOrEmpty(status?.User))
+                {
+                    Nav.NavigateTo("/?return=" + Uri.EscapeDataString("/" + Nav.ToBaseRelativePath(Nav.Uri)));
+                    return;
+                }
+            }
+        }
+        catch { }
+        if (_admin)
+        {
+            try
+            {
+                var req = new HttpRequestMessage(HttpMethod.Get, $"{ApiBase}/api/cameras");
+                if (!string.IsNullOrEmpty(_token))
+                    req.Headers.Authorization = new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", _token);
+                using var res = await Http.SendAsync(req);
+                if (res.IsSuccessStatusCode)
+                {
+                    var cams = await res.Content.ReadFromJsonAsync<List<ApiCamera>>();
+                    if (cams != null) _cameras.AddRange(cams.Select(c => c.Name));
+                }
+            }
+            catch { }
+        }
+        _checked = true;
+        StateHasChanged();
+    }
+
+    private Task ApplyCamFilterAsync() =>
+        JS.InvokeVoidAsync("neolink.logsFilterCam", "logs-view", _camFilter).AsTask();
+
+    /// <summary>Where the auth-status fetch goes. It runs SERVER-side (Blazor circuit),
+    /// so when the configured server is the page's own origin it uses loopback
+    /// instead of dialing back out through a reverse proxy's public URL.</summary>
+    private string ApiBase => _origin.Length > 0
+        && string.Equals(_server.TrimEnd('/'), _origin.TrimEnd('/'), StringComparison.OrdinalIgnoreCase)
+        ? Local.BaseUrl.TrimEnd('/')
+        : _server.TrimEnd('/');
+
+    private void ToggleLevel(string lvl)
+    {
+        if (!_hiddenLevels.Remove(lvl)) _hiddenLevels.Add(lvl);
+    }
+
+    /// <summary>Container classes; CSS hides the matching .log-* lines (DBG also hides TRC).</summary>
+    private string HiddenClasses() =>
+        string.Join(' ', _hiddenLevels.Select(l => $"log-hide-{l.ToLowerInvariant()}"));
+
+    private Task ClearAsync() => JS.InvokeVoidAsync("neolink.logsClear", "logs-view").AsTask();
+
+    public async ValueTask DisposeAsync()
+    {
+        if (_attached)
+        {
+            try { await JS.InvokeVoidAsync("neolink.logsDetach", "logs-view"); }
+            catch { /* circuit already gone */ }
+        }
+    }
+}

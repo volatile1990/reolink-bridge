@@ -1,0 +1,47 @@
+{
+  "bind": "0.0.0.0",
+  "bind_port": 8554,
+  "web_port": 0,
+  "webui": false,
+  "ptz_port": 0,
+  "users": [
+    {
+      "name": "protect",
+      "pass": "REPLACE_WITH_A_SEPARATE_BRIDGE_PASSWORD"
+    }
+  ],
+  "cameras": [
+    {
+      "name": "pilot",
+      "username": "admin",
+      "password": "REPLACE_WITH_THE_CAMERA_PASSWORD",
+      "address": "10.30.0.79:9000",
+      "stream": "mainStream",
+      "always_on": true,
+      "udp": false,
+      "udp_probe": false,
+      "record": false,
+      "permitted_users": ["protect"]
+    }
+  ],
+  "onvif": {
+    "port": 8080,
+    "bind": "0.0.0.0",
+    "advertised_host": "10.30.0.113",
+    "mac": "02:42:0a:1e:00:71",
+    "uuid": "44615fe5-0636-4288-9d53-46c611727b65",
+    "name": "Baichuan Pilot",
+    "model": "B1200",
+    "discovery": true,
+    "profiles": [
+      {
+        "stream": "mainStream",
+        "codec": "H265",
+        "width": 4512,
+        "height": 2512,
+        "fps": 20,
+        "bitrate": 10240
+      }
+    ]
+  }
+}
