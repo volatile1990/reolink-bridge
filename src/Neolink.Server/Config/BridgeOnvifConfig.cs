@@ -26,6 +26,12 @@ public sealed class BridgeOnvifConfig
     public string Name { get; set; } = "Reolink Bridge";
     public string Model { get; set; } = "Baichuan camera";
     public bool Discovery { get; set; } = true;
+    /// <summary>Forward actual camera alarm pushes through authenticated ONVIF PullPoint events.</summary>
+    public bool Events { get; set; } = true;
+    /// <summary>ONVIF motion forwards all activity, only camera classifications, or none. Class events and raw replay are unchanged.</summary>
+    public string MotionEventPolicy { get; set; } = "all";
+    /// <summary>Clear an active alarm if the camera stops sending alarm state, without interrupting video.</summary>
+    public int EventStaleSeconds { get; set; } = 120;
     /// <summary>Opt-in complete-GOP lookahead and video-only outbound RTP normalization.</summary>
     public bool GopPlayout { get; set; }
     /// <summary>Additional startup reserve when GopPlayout is enabled.</summary>
@@ -51,6 +57,9 @@ public sealed class BridgeOnvifConfig
                 case "name": result.Name = property.Value.GetString() ?? ""; break;
                 case "model": result.Model = property.Value.GetString() ?? ""; break;
                 case "discovery": result.Discovery = property.Value.GetBoolean(); break;
+                case "events": result.Events = property.Value.GetBoolean(); break;
+                case "motioneventpolicy": result.MotionEventPolicy = property.Value.GetString() ?? ""; break;
+                case "eventstaleseconds": result.EventStaleSeconds = property.Value.GetInt32(); break;
                 case "playoutdelayms": result.PlayoutDelayMs = property.Value.GetInt32(); break;
                 case "gopplayout": result.GopPlayout = property.Value.GetBoolean(); break;
                 case "profiles":
@@ -82,6 +91,9 @@ public sealed class BridgeOnvifConfig
     {
         if (Port is < 1 or > 65535) throw new FormatException("onvif.port must be between 1 and 65535");
         if (PlayoutDelayMs is < 0 or > 5000) throw new FormatException("onvif.playout_delay_ms must be between 0 and 5000");
+        if (EventStaleSeconds is < 5 or > 600) throw new FormatException("onvif.event_stale_seconds must be between 5 and 600");
+        if (MotionEventPolicy is not ("all" or "classified" or "none"))
+            throw new FormatException("onvif.motion_event_policy must be all, classified or none");
         if (!IPAddress.TryParse(Bind, out var bind) || bind.AddressFamily != System.Net.Sockets.AddressFamily.InterNetwork)
             throw new FormatException("onvif.bind must be an IPv4 address");
         if (!IPAddress.TryParse(AdvertisedHost, out var host) || host.AddressFamily != System.Net.Sockets.AddressFamily.InterNetwork

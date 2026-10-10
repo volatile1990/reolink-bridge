@@ -1,4 +1,4 @@
-// Snapshot-only HTTP Digest for clients which do not implement Basic challenges.
+// HTTP Digest for snapshot and camera-event GETs which do not implement Basic challenges.
 // Licensed under AGPL-3.0; see LICENSE.
 using System.Globalization;
 using System.Security.Cryptography;
@@ -6,7 +6,7 @@ using System.Text;
 
 namespace Neolink.Onvif;
 
-/// <summary>Bounded, short-lived MD5/qop=auth HTTP Digest state. SOAP and metrics do not use it.</summary>
+/// <summary>Bounded, short-lived MD5/qop=auth HTTP Digest state for snapshots and event replay. SOAP and metrics do not use it.</summary>
 internal sealed class SnapshotDigestAuthentication(IReadOnlyDictionary<string, string> users, TimeProvider clock)
 {
     internal const string Realm = "reolink-bridge";

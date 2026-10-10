@@ -24,6 +24,11 @@ public sealed partial class ProtectOnvifServer
     public const string NsMedia = "http://www.onvif.org/ver10/media/wsdl";
     public const string NsMedia2 = "http://www.onvif.org/ver20/media/wsdl";
     public const string NsSchema = "http://www.onvif.org/ver10/schema";
+    public const string NsEvents = "http://www.onvif.org/ver10/events/wsdl";
+    public const string NsWsnt = "http://docs.oasis-open.org/wsn/b-2";
+    public const string NsWsa = "http://www.w3.org/2005/08/addressing";
+    public const string NsTopics = "http://www.onvif.org/ver10/topics";
+    public const string NsAi = "urn:reolink-bridge:events:ai:1";
     private const int MaxHeader = 16 * 1024, MaxBody = 256 * 1024, MaxSnapshotBytes = 4 * 1024 * 1024;
     private readonly BridgeOnvifConfig _config;
     private readonly IReadOnlyDictionary<string, string> _users;
@@ -31,13 +36,14 @@ public sealed partial class ProtectOnvifServer
     private readonly int _rtspPort;
     private readonly IProtectSnapshotProvider? _snapshots;
     private readonly SnapshotDigestAuthentication _snapshotDigest;
+    public ProtectEventBroker? Events { get; }
     private readonly long _startedTimestamp = System.Diagnostics.Stopwatch.GetTimestamp();
     private readonly Dictionary<string, DateTime> _nonces = new(StringComparer.Ordinal);
     private readonly Dictionary<string, int> _connections = new(StringComparer.Ordinal);
 
     public ProtectOnvifServer(BridgeOnvifConfig config, IReadOnlyDictionary<string, string> users,
         IReadOnlyList<ProtectOnvifStream> streams, int rtspPort, IProtectSnapshotProvider? snapshots = null,
-        TimeProvider? snapshotAuthClock = null)
+        TimeProvider? snapshotAuthClock = null, ProtectEventBroker? events = null)
     {
         config.Validate();
         if (rtspPort is < 1 or > 65535 || config.Port == rtspPort)
@@ -52,6 +58,8 @@ public sealed partial class ProtectOnvifServer
         _rtspPort = rtspPort;
         _snapshots = snapshots;
         _snapshotDigest = new SnapshotDigestAuthentication(users, snapshotAuthClock ?? TimeProvider.System);
+        Events = config.Events ? events ?? new ProtectEventBroker(config.EventStaleSeconds,
+            motionEventPolicy: config.MotionEventPolicy) : null;
     }
 
     public bool Healthy => _streams.All(s => !s.Hub.AuthenticationFailed
@@ -64,6 +72,7 @@ public sealed partial class ProtectOnvifServer
     private string MetricsJson() => JsonSerializer.Serialize(new
     {
         status = SourceStatus(Healthy),
+        events = Events?.Diagnostics(),
         uptimeSeconds = System.Diagnostics.Stopwatch.GetElapsedTime(_startedTimestamp).TotalSeconds,
         streams = _streams.Select(stream =>
         {
@@ -155,6 +164,7 @@ public sealed partial class ProtectOnvifServer
         finally
         {
             listener.Stop();
+            Events?.Stop();
             await Task.WhenAll(clients).ConfigureAwait(false);
             try { await discovery.ConfigureAwait(false); } catch (OperationCanceledException) { }
         }
@@ -191,6 +201,11 @@ public sealed partial class ProtectOnvifServer
             { await RespondAsync(stream, 400, "", true, ct); return; }
             if (request[0] == "GET")
             {
+                if (request[1] == "/events" || request[1].StartsWith("/events?", StringComparison.Ordinal))
+                {
+                    await EventReplayAsync(stream, request[1], headers.GetValueOrDefault("Authorization"), ct).ConfigureAwait(false);
+                    return;
+                }
                 if (request[1].StartsWith("/snapshot/", StringComparison.Ordinal))
                 {
                     await SnapshotAsync(stream, request[1], headers.GetValueOrDefault("Authorization"), ct).ConfigureAwait(false);
@@ -211,7 +226,8 @@ public sealed partial class ProtectOnvifServer
                 return;
             }
             if (request[0] != "POST") { await RespondAsync(stream, 405, "", true, ct); return; }
-            if (request[1] is not ("/onvif/device_service" or "/onvif/media_service" or "/onvif/media2_service"))
+            if (request[1] is not ("/onvif/device_service" or "/onvif/media_service" or "/onvif/media2_service" or "/onvif/events_service")
+                && !ValidSubscriptionPath(request[1]))
             { await RespondAsync(stream, 404, "", true, ct); return; }
             if (headers.ContainsKey("Transfer-Encoding") || !int.TryParse(headers.GetValueOrDefault("Content-Length"),
                     NumberStyles.None, CultureInfo.InvariantCulture, out var length))
@@ -234,8 +250,8 @@ public sealed partial class ProtectOnvifServer
             }
             bool close = request[2] != "HTTP/1.1" || headers.GetValueOrDefault("Connection")?.Equals("close", StringComparison.OrdinalIgnoreCase) == true;
             using var work = CancellationTokenSource.CreateLinkedTokenSource(ct);
-            work.CancelAfter(TimeSpan.FromSeconds(15));
-            var reply = await HandleAsync(Encoding.UTF8.GetString(bodyBytes), headers.GetValueOrDefault("Authorization"), work.Token).ConfigureAwait(false);
+            work.CancelAfter(TimeSpan.FromSeconds(ProtectEventBroker.MaxPullSeconds + 5));
+            var reply = await HandleAsync(Encoding.UTF8.GetString(bodyBytes), headers.GetValueOrDefault("Authorization"), work.Token, request[1]).ConfigureAwait(false);
             await RespondAsync(stream, reply.Status, reply.Body, close, ct).ConfigureAwait(false);
             if (close) return;
         }
@@ -305,7 +321,8 @@ public sealed partial class ProtectOnvifServer
         await connection.WriteAsync(jpeg, outputDeadline.Token).ConfigureAwait(false);
     }
 
-    public async Task<(int Status, string Body)> HandleAsync(string soap, string? authorization, CancellationToken ct)
+    public async Task<(int Status, string Body)> HandleAsync(string soap, string? authorization, CancellationToken ct,
+        string? requestPath = null)
     {
         ct.ThrowIfCancellationRequested();
         await Task.CompletedTask.ConfigureAwait(false);
@@ -327,6 +344,12 @@ public sealed partial class ProtectOnvifServer
                 case "GetServiceCapabilities": return Ok(DeviceServiceCapabilities());
             }
         if (!Authenticated(envelope, authorization)) return Fault(401, "ter:NotAuthorized", "Authentication required");
+        if (service is NsEvents or NsWsnt)
+        {
+            string? owner = AuthenticatedOwner(envelope, authorization);
+            if (owner == null) return Fault(401, "ter:NotAuthorized", "Authentication required");
+            return await HandleEventAsync(envelope, op, owner, requestPath, ct).ConfigureAwait(false);
+        }
         if (service == NsDevice)
             return action switch
             {

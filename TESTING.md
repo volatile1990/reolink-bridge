@@ -1,6 +1,6 @@
 # Tests und Pilotstand
 
-Stand: 9. Oktober 2026. Zum lokalen Ausführen wird das .NET-10-SDK benötigt; die folgenden Befehle laufen im Repository-Verzeichnis.
+Stand der lokalen Prüfungen: 10. Oktober 2026. Die Betriebsmessungen unten sind jeweils datierte Pilotbefunde. Zum lokalen Ausführen wird das .NET-10-SDK benötigt; die folgenden Befehle laufen im Repository-Verzeichnis.
 
 ## Automatische Prüfungen
 
@@ -10,13 +10,30 @@ dotnet run --project src/Neolink.Server/Neolink.Server.csproj --configuration Re
 dotnet run --project tests/Neolink.ProtectTests/Neolink.ProtectTests.csproj --configuration Release
 ```
 
-Die lokalen Prüfungen umfassen **159 Upstream-Selbsttests und 68 ONVIF-/RTSP-/Snapshot-Vertragstests**. Der Release-Build wird einschließlich der GOP-Ausgabe ohne Fehler oder Warnungen geprüft.
+Die lokalen Prüfungen umfassen **159 Upstream-Selbsttests und 82 ONVIF-/RTSP-/Snapshot-/Ereignis-Vertragstests**. Am 10. Oktober 2026 bestanden alle Prüfungen; der Release-Build wurde einschließlich der GOP-Ausgabe ohne Fehler oder Warnungen geprüft.
 
 Die zusätzlichen Vertragstests starten den tatsächlichen HTTP-Listener auf Loopback und verwenden synthetische Zugangsdaten und Medienzustände. Sie prüfen Geräteidentität und stabile UUID/MAC, Media1/Media2, ehrliche H.265-/H.264-Profile, RTSP-URLs, WSSE-/Basic-Anmeldung, Zeitabweichung und Replay-Schutz, Bereitschaft des Streams, XML-/XXE-Abweisung sowie die strenge Pilot-Konfiguration. Sie verbinden sich mit keiner echten Kamera. Details stehen im [Testprojekt](tests/Neolink.ProtectTests/README.md).
 
 Die GOP-Tests prüfen zusätzlich den tatsächlichen RTSP-TCP-Pfad: beide Mount-Aliase, einzelne RTP-Marker und Zeitstempel pro Bild, unveränderte codierte NAL-Inhalte auch nach FU-Fragmentierung, die unveränderte Standardausgabe sowie Audio-Abweisung im ausdrücklich aktivierten Video-Modus. Deterministische Uhren prüfen Drift, Wrap, begrenzte GOP-Puffer, Metadaten und Wiederaufnahme nach einer Lücke. PAUSE, TEARDOWN, Source-Wechsel und die echte DropOldest-Subscriberqueue sind ebenfalls abgedeckt. Die ergänzten Regressionen erhalten reale Bilder trotz eines zwölfsekündigen Raw-Clock-Sprungs, wiederholter oder rückläufiger RTP-Werte und gebündelter Access Units; sie prüfen zugleich plausible variable Kadenz und die Zuordnung des nächsten Schlüsselbilds.
 
 Die Snapshot-Tests prüfen Media1/Media2-URIs, Anmeldung vor dem nativen Abruf, binäre JPEG-Ausgabe, Frische und Source-Wechsel, begrenzte Antwortgröße und Fristen. HTTP Digest wird mit echter Challenge-Verhandlung, Bindung an GET und Anfragepfad, Replay-Zählern, begrenztem Nonce-Cache und monotoner Ablaufzeit geprüft; vorab gesendetes Basic bleibt verfügbar. Der native Cache wird mit monotoner Uhr geprüft; parallele Aufrufer teilen eine Anforderung, deren Arbeit durch einen einzelnen abgebrochenen HTTP-Aufruf nicht beendet wird. Synthetische Baichuan-Peers prüfen den Befehl 109 einschließlich FullAES, Reassembly-Limits und verspäteter Antworten nach Abbruch. Nach dem vollständigen 201-Abschluss wird der binäre Snapshot-Modus freigegeben; ein später wiederverwendeter Nachrichtenzähler muss erneut eine XML-Bestätigung lesen können. Andere Videotransfers behalten ihren Modus. Diese Tests belegen noch keine Unterstützung durch eine konkrete Kamerafirmware.
+
+### Kameraereignisse und Bewegungsfilter
+
+Die Ereignisprüfungen verwenden den tatsächlichen HTTP-Listener und den
+Baichuan-Alarmparser mit synthetischen Kamerapushes. Sie prüfen Anmeldung,
+Subscription-Eigentümer, Topic-Filter, begrenzte Queues, Replay-Cursor und
+kurze KI-Pulse. Die Modi `all`, `classified` und `none` erhalten das echte
+Roh-Replay; bei `none` bleiben normale ONVIF-Bewegungszustände inaktiv,
+während Klassenbeginn, Klassenende, Synchronisation und Wiederverbindung
+weiter geprüft werden. Stale-Clears und Sitzungsresets erzeugen keine
+künstlichen Kameraereignisse im Replay.
+
+Diese Offlineprüfung belegt nicht, dass jede Kamerafirmware Klassen liefert
+oder dass Protect daraus native Smart-Detection-Ereignisse erzeugt. Der neue
+Modus `none` setzt für sichtbare Protect-Klassenereignisse eine getrennte,
+bereits geprüfte Integration voraus; die Bridge erzeugt diese Einträge selbst
+nicht. Details stehen in [docs/onvif-events.md](docs/onvif-events.md).
 
 ## Echter NAS-Pilot
 

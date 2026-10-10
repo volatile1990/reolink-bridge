@@ -58,6 +58,27 @@ monotonic nonce expiry, bounded nonce/replay state, atomic request-count advance
 wrong credentials and malformed or duplicate directives. Preemptive Basic remains
 available; SOAP and metrics retain their existing authentication contracts.
 
+Event contracts use the actual HTTP listener and Baichuan alarm XML parser.
+They cover authenticated event discovery, camera-originated motion and AI state,
+subscription ownership, WSSE replay refusal, topic filters, synchronization,
+renewal, unsubscribe, long-poll wake/cancel, monotonic expiry, stale/source-loss
+clears, bounded subscriptions and queue overflow resynchronization. No AI class
+is advertised before a real camera push has supplied that class.
+
+The protected JSON replay checks retain a short AI-only start/stop pulse,
+preserve bounded raw alarm tokens and status, reject invalid cursors, verify
+Basic/Digest authentication, report ring gaps and distinguish process restarts.
+Bridge housekeeping and outside controls never enter the camera replay ring.
+These checks do not prove that a particular camera emits alarm pushes or that
+Protect turns a specific class into a native smart detection.
+
+Motion-policy checks exercise `all`, `classified` and `none`. The default keeps
+ordinary movement; `classified` gates it on real camera verdicts; `none` keeps
+ordinary ONVIF motion false while preserving class topics and the complete raw
+camera replay. Wire checks cover synchronization, repeated activity, real class
+endings, stale clears, source resets and connection epochs without fabricated
+replay entries.
+
 These checks establish protocol behavior only. They do not establish that a
 specific camera's Baichuan video is decodable, that UniFi Protect will render
 H.265 in a particular browser, or that an actual deployment sustains recording.

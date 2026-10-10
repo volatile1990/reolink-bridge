@@ -8,7 +8,7 @@ using Neolink.Rtsp;
 namespace Neolink.Streaming;
 
 /// <summary>Minimal Protect bridge: one camera login/stream, local RTSP and ONVIF only.
-/// Does not initialize camera controls, UI, state, recording, MQTT, notifications or discovery probes.</summary>
+/// Does not initialize camera controls, UI, recording, MQTT, notifications or discovery probes.</summary>
 public static class ProtectBridgeHost
 {
     public static async Task<int> RunAsync(NeolinkConfig config)
@@ -31,14 +31,18 @@ public static class ProtectBridgeHost
             () => !hub.AuthenticationFailed && hub.LiveVideo && hub.VideoReady
                 && hub.GetVideoDiagnostics().LastVideoAgeMs is >= 0 and <= 5000,
             () => hub.SourceEpoch, lifetime: shutdown.Token);
-        var endpoint = new ProtectOnvifServer(onvif, users, [new ProtectOnvifStream("main", path, hub)], config.BindPort, snapshots);
+        var eventBroker = onvif.Events ? new ProtectEventBroker(onvif.EventStaleSeconds, channel: camera.ChannelId,
+            motionEventPolicy: onvif.MotionEventPolicy) : null;
+        var endpoint = new ProtectOnvifServer(onvif, users, [new ProtectOnvifStream("main", path, hub)], config.BindPort, snapshots, events: eventBroker);
+        if (endpoint.Events is { } events) source.MotionSink = events.Publish;
         var tasks = new[]
         {
             RunCameraAsync(source, shutdown.Token),
             rtsp.RunAsync(config.BindAddr, config.BindPort, shutdown.Token),
-            endpoint.RunAsync(shutdown.Token)
+            endpoint.RunAsync(shutdown.Token),
+            WatchEventsAsync(endpoint.Events, hub, shutdown.Token)
         };
-        Log.Info("Reolink Bridge starting: one upstream stream, TCP RTSP, read-only ONVIF; camera settings are unchanged");
+        Log.Info("Reolink Bridge starting: one upstream stream, TCP RTSP, read-only ONVIF and camera alarm events; camera settings are unchanged");
         int result = 0;
         try
         {
@@ -61,6 +65,27 @@ public static class ProtectBridgeHost
             AppDomain.CurrentDomain.ProcessExit -= exit;
         }
         return result;
+    }
+
+    private static async Task WatchEventsAsync(ProtectEventBroker? events, IStreamHub hub, CancellationToken ct)
+    {
+        if (events == null) { await Task.Delay(Timeout.Infinite, ct).ConfigureAwait(false); return; }
+        long epoch = hub.SourceEpoch;
+        bool live = hub.LiveVideo;
+        using var timer = new PeriodicTimer(TimeSpan.FromSeconds(1));
+        try
+        {
+            while (await timer.WaitForNextTickAsync(ct).ConfigureAwait(false))
+            {
+                long currentEpoch = hub.SourceEpoch;
+                bool currentLive = hub.LiveVideo;
+                if ((epoch > 0 && currentEpoch != epoch) || (live && !currentLive)) events.ResetActive();
+                epoch = currentEpoch; live = currentLive;
+                events.Tick();
+            }
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested) { }
+        finally { events.ResetActive(); }
     }
 
     /// <summary>Both path aliases share one source and the same optional video playout policy.</summary>

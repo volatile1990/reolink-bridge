@@ -309,7 +309,7 @@ internal static class ContractTests
                 var endpoint = Success(await Call("GetEndpointReference"), "GetEndpointReferenceResponse", Device);
                 Assert(Node(endpoint, "GUID").Value == config.EndpointReference, "published UUID differs from persistent identity");
             });
-            await Test("service advertisement exposes Media1 and Media2 without phantom PTZ or events", async () =>
+            await Test("service advertisement exposes Media1 Media2 and real PullPoint events without phantom PTZ", async () =>
             {
                 var xml = Success(await Call("GetServices", extra: "<m:IncludeCapability>false</m:IncludeCapability>"), "GetServicesResponse", Device);
                 var services = xml.Descendants().Where(x => x.Name.LocalName == "Service").ToArray();
@@ -318,10 +318,25 @@ internal static class ContractTests
                 foreach (var service in services)
                 {
                     string advertised = Node(service, "Namespace").Value;
-                    Assert(!advertised.Contains("events") && !advertised.Contains("ptz"), "unsupported feature advertised");
+                    Assert(!advertised.Contains("ptz"), "unsupported feature advertised");
                     Assert(new Uri(Node(service, "XAddr").Value).Host == "127.0.0.1", "incorrect advertised address");
                 }
+                Assert(services.Any(x => Node(x, "Namespace").Value == ProtectOnvifServer.NsEvents), "event service missing");
             });
+            await Test("events discovery and capabilities advertise only observed camera classes", ProtectEventContractTests.DiscoveryAndClasses);
+            await Test("Baichuan alarm XML becomes authenticated motion and truthful class notifications", ProtectEventContractTests.CameraPushToWire);
+            await Test("event subscriptions require authentication and are isolated by owner", ProtectEventContractTests.AuthenticationAndOwnership);
+            await Test("event filtering limits synchronization renew and unsubscribe follow wire contracts", ProtectEventContractTests.LifecycleAndFilters);
+            await Test("event long polls wake cancel and reject overlapping pulls without losing later events", ProtectEventContractTests.LongPollAndCancellation);
+            await Test("event leases use monotonic time and camera state clears after loss or staleness", ProtectEventContractTests.LeasesAndStaleState);
+            await Test("event queues and subscription resources are bounded and overflow resynchronizes state", ProtectEventContractTests.BoundsAndOverflow);
+            await Test("disabled events preserve the original media-only endpoint", ProtectEventContractTests.DisabledEvents);
+            await Test("ONVIF motion policy defaults to all and rejects unsupported configuration", ProtectEventContractTests.MotionPolicyConfiguration);
+            await Test("classified ONVIF motion suppresses generic spam but retains real raw and class evidence", ProtectEventContractTests.ClassifiedMotionWireAndReplay);
+            await Test("classified motion synchronization stale clear and reconnect retain truthful replay", ProtectEventContractTests.ClassifiedMotionStaleResetAndSynchronization);
+            await Test("disabled ONVIF motion retains class transitions and complete source replay", ProtectEventContractTests.NoMotionWireAndReplay);
+            await Test("disabled ONVIF motion preserves class stale clears source resets and epochs", ProtectEventContractTests.NoMotionStaleResetAndReplay);
+            await Test("authenticated JSON replay retains short camera AI pulses with bounded resumable cursors", ProtectEventContractTests.JsonReplay);
             await Test("Media1 has two distinct correctly described profiles", async () => CheckProfiles(Success(await Call("GetProfiles", Media1), "GetProfilesResponse", Media1), 4512, 2512));
             await Test("Media2 has H265 main and H264 sub with valid configurations", async () => CheckProfiles(Success(await Call("GetProfiles", Media2), "GetProfilesResponse", Media2), 4512, 2512));
             await Test("both media versions return exact credential-free main and sub RTSP URIs", async () =>

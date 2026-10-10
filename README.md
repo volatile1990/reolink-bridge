@@ -28,6 +28,9 @@ Bearbeite `.env` und `secrets/bridge-config.json`:
 - `onvif.profiles`: tatsächlichen Codec, Auflösung, Bilderrate und Bitrate in kbit/s eintragen. Die Beispieleinstellungen sind keine Transcodierung.
 - `onvif.gop_playout`: optionale Glättung und Normalisierung der Video-Zeitbasis; Standard `false`.
 - `onvif.playout_delay_ms`: zusätzliche Startreserve im GOP-Modus, in Millisekunden; Standard `0`, zulässig `0` bis `5000`.
+- `onvif.events`: authentifizierte Kameraereignisse und `/events`-Replay; Standard `true`.
+- `onvif.motion_event_policy`: `all` (Standard), `classified` oder `none`; steuert den gewöhnlichen ONVIF-Bewegungszustand, nicht die echten Klassen oder das Roh-Replay.
+- `onvif.event_stale_seconds`: lokale Ablaufzeit für nicht mehr aktualisierte ONVIF-Zustände; Standard `120`, zulässig `5` bis `600`.
 
 Mit `gop_playout: true` wartet die Bridge bis zum nächsten Schlüsselbild, verteilt gebündelte Bilder auf einzelne RTP-Bildgruppen und bildet die Kamera-Zeitbasis auf die gemessene Dauer der vollständigen Bildgruppe ab. Bei gebündelten Bildern oder auffälligen Kamera-Zeitstempeln verteilt sie die tatsächlich vorhandenen Bilder gleichmäßig über diese Dauer; bei plausiblen Zeitstempeln einzelner Bilder erhält sie deren relative Abstände. Danach sendet sie diese Bilder nach der normalisierten RTP-Zeitbasis. Codierte NAL-Inhalte, Auflösung und Codec bleiben erhalten; die ausgehenden RTP-Zeitstempel werden bewusst angepasst. Es werden keine zusätzlichen Bilder erzeugt. Der Modus bietet ausschließlich Video und erhöht die Live-Verzögerung um etwa eine Bildgruppe plus Startreserve. Eine Reserve von `2500` Millisekunden dient dem kontrollierten B1200-Versuch. Der normale Modus bleibt ohne diese ausdrückliche Konfiguration unverändert.
 
@@ -62,7 +65,14 @@ Bei der Anmeldung den Bridge-Benutzer verwenden. Unter **Protect → Advanced Ad
 
 Für diesen Pilot müssen Protect und Bridge sich im Netz erreichen können; die Bridge benötigt außerdem TCP-Zugriff auf die echte Kamera an Port `9000`. RTSP läuft an `8554/TCP`, ONVIF an `8080/TCP` und lokale Erkennung an `3702/UDP`. Macvlan gibt dem Container eine eigene Adresse und MAC; der NAS-Host selbst erreicht seine Macvlan-Container standardmäßig nicht direkt. Der interne Healthcheck und Tests von Protect oder einem anderen LAN-Gerät funktionieren unabhängig davon.
 
-Der Pilot bietet Video-Profile, Erkennung und einen authentifizierten Snapshot-Endpunkt. Bewegungsereignisse, PTZ und Audio-Transcodierung sind keine zugesicherten Pilot-Funktionen. Der direkte Baichuan-Abruf aller drei B1200 und der RLC-1212A gelang im NAS-Pilot ohne den Reolink-NVR als Streamquelle. Die Übertragbarkeit auf andere Kamerafirmwares muss jeweils geprüft werden.
+Der Pilot bietet Video-Profile, Geräteerkennung, einen authentifizierten Snapshot-Endpunkt und Kameraereignisse. Er übernimmt Bewegung sowie vorhandene KI-Klassen über die bestehende Baichuan-Sitzung, ohne eigene Bildanalyse. Protect 7.3.70 verarbeitet die ONVIF-Bewegung, übernimmt diese Klassen-Topics aber nicht als native Smart-Detections; eine getrennte Integration muss dafür das geschützte Replay verwenden. PTZ und Audio-Transcodierung sind keine zugesicherten Pilot-Funktionen. Der direkte Baichuan-Abruf aller drei B1200 und der RLC-1212A gelang im NAS-Pilot ohne den Reolink-NVR als Streamquelle. Die Übertragbarkeit auf andere Kamerafirmwares muss jeweils geprüft werden.
+
+Die [Ereignisdokumentation](docs/onvif-events.md) beschreibt Anmeldung, Topic-Filter,
+Replay-Cursor und die Bewegungsmodi. `classified` filtert gewöhnliche Bewegung
+ohne echte Kameraklasse. `none` verhindert zusätzliche gewöhnliche
+ONVIF-Bewegungsereignisse für eine bereits funktionierende getrennte
+Klassenintegration; echte Klasseinträge, Klassenaustritte und das Roh-Replay
+bleiben verfügbar.
 
 ## Vorschaubilder
 

@@ -9,7 +9,9 @@ public sealed partial class ProtectOnvifServer
     private static string Esc(string text) => SecurityElement.Escape(text) ?? "";
     private static string Envelope(string body) => "<?xml version=\"1.0\" encoding=\"utf-8\"?>" +
         $"<s:Envelope xmlns:s=\"{NsSoap}\" xmlns:tt=\"{NsSchema}\" xmlns:tds=\"{NsDevice}\" xmlns:trt=\"{NsMedia}\" " +
-        $"xmlns:tr2=\"{NsMedia2}\" xmlns:ter=\"http://www.onvif.org/ver10/error\"><s:Body>{body}</s:Body></s:Envelope>";
+        $"xmlns:tr2=\"{NsMedia2}\" xmlns:tev=\"{NsEvents}\" xmlns:wsnt=\"{NsWsnt}\" xmlns:wsa=\"{NsWsa}\" " +
+        $"xmlns:tns1=\"{NsTopics}\" xmlns:tnsre=\"{NsAi}\" xmlns:wstop=\"http://docs.oasis-open.org/wsn/t-1\" " +
+        "xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:ter=\"http://www.onvif.org/ver10/error\"><s:Body>" + body + "</s:Body></s:Envelope>";
     private static (int Status, string Body) Ok(string body) => (200, Envelope(body));
     private static (int Status, string Body) Fault(int status, string subcode, string reason) => (status, Envelope(
         $"<s:Fault><s:Code><s:Value>s:Sender</s:Value><s:Subcode><s:Value>{subcode}</s:Value></s:Subcode></s:Code>" +
@@ -31,7 +33,8 @@ public sealed partial class ProtectOnvifServer
             $"<tds:Service><tds:Namespace>{ns}</tds:Namespace><tds:XAddr>http://{_config.AdvertisedHost}:{_config.Port}{path}</tds:XAddr>" +
             $"<tds:Version><tt:Major>{major}</tt:Major><tt:Minor>{minor}</tt:Minor></tds:Version></tds:Service>";
         return "<tds:GetServicesResponse>" + Service(NsDevice, "/onvif/device_service", 2, 0) +
-            Service(NsMedia, "/onvif/media_service", 2, 0) + Service(NsMedia2, "/onvif/media2_service", 2, 0) + "</tds:GetServicesResponse>";
+            Service(NsMedia, "/onvif/media_service", 2, 0) + Service(NsMedia2, "/onvif/media2_service", 2, 0) +
+            (Events == null ? "" : Service(NsEvents, "/onvif/events_service", 2, 0)) + "</tds:GetServicesResponse>";
     }
 
     private string Capabilities() => "<tds:GetCapabilitiesResponse><tds:Capabilities>" +
@@ -41,6 +44,8 @@ public sealed partial class ProtectOnvifServer
         "<tt:Security><tt:TLS1.1>false</tt:TLS1.1><tt:TLS1.2>false</tt:TLS1.2><tt:OnboardKeyGeneration>false</tt:OnboardKeyGeneration>" +
         "<tt:AccessPolicyConfig>false</tt:AccessPolicyConfig><tt:X.509Token>false</tt:X.509Token><tt:SAMLToken>false</tt:SAMLToken><tt:KerberosToken>false</tt:KerberosToken><tt:RELToken>false</tt:RELToken></tt:Security></tt:Device>" +
         $"<tt:Media><tt:XAddr>http://{_config.AdvertisedHost}:{_config.Port}/onvif/media_service</tt:XAddr><tt:StreamingCapabilities><tt:RTPMulticast>false</tt:RTPMulticast><tt:RTP_TCP>true</tt:RTP_TCP><tt:RTP_RTSP_TCP>true</tt:RTP_RTSP_TCP></tt:StreamingCapabilities></tt:Media>" +
+        (Events == null ? "" : $"<tt:Events><tt:XAddr>{EventsUrl}</tt:XAddr><tt:WSSubscriptionPolicySupport>false</tt:WSSubscriptionPolicySupport>" +
+            "<tt:WSPullPointSupport>true</tt:WSPullPointSupport><tt:WSPausableSubscriptionManagerInterfaceSupport>false</tt:WSPausableSubscriptionManagerInterfaceSupport></tt:Events>") +
         "</tds:Capabilities></tds:GetCapabilitiesResponse>";
 
     private static string DeviceServiceCapabilities() => "<tds:GetServiceCapabilitiesResponse><tds:Capabilities>" +
