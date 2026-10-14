@@ -112,7 +112,10 @@ def safe_metrics(data):
     queue = select(source.get("mediaInputQueue"), ("Bytes", "PeakBytes", "Items", "PeakItems", "OldestAgeMs", "Overflows"))
     result["source"] = {"alarmSubscription": alarm, "mediaInputQueue": queue}
     result["lowQualityEncoder"] = select(data.get("lowQualityEncoder"), ("encodedFrames", "failures", "outputFps", "sourceFps"),
-                                         ("softwareFallback", "captureSynchronizationVerified"), ("state", "backend"))
+                                         ("softwareFallback", "captureSynchronizationVerified"), ("state", "backend", "decoder"))
+    result["lowQualityDecoder"] = select(data.get("lowQualityDecoder"),
+                                         boolean=("hardwareDecodeRequested", "runtimeHardwareDecodeVerified", "noSilentFallback"),
+                                         states=("backend", "decoderHardwareFormat"))
     result["nativeTalk"] = select(data.get("nativeTalk"), ("acceptedAac", "acceptedRtp", "rejected", "decoderErrors", "decoderRecoveries"), ("ready",))
     result["gopAudio"] = select(data.get("gopAudio"), ("activeSessions",), ("captureSynchronizationVerified",))
     event_data = data.get("events") if isinstance(data.get("events"), dict) else {}

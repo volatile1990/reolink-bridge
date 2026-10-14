@@ -84,3 +84,21 @@ specific camera's Baichuan video is decodable, that UniFi Protect will render
 H.265 in a particular browser, or that an actual deployment sustains recording.
 The Synology pilot must verify those separately, including whether each camera's
 firmware supports native snapshots and Protect accepts the advertised JPEG URI.
+
+The Intel VAAPI media regression is explicit and requires a Linux host with
+`/dev/dri/renderD128`, the Intel media driver, and FFmpeg with `libx264` and
+`hevc_vaapi`:
+
+```sh
+dotnet run --project tests/Neolink.ProtectTests/Neolink.ProtectTests.csproj --configuration Release -- --hardware-low-quality-only
+```
+
+It fails if the GPU path cannot run. Synthetic H.264 pictures pass through the
+actual pipe decoder/filter/HEVC encoder. Checks count I and P pictures at 20-to-20
+and 20-to-10 fps, exercise unchanged and scaled geometry, verify fragmented
+Annex-B assembly and actual HEVC decoding, and compare every decoded pixel hash
+with the previous software-decoder path at unchanged geometry. A debug run must
+confirm that FFmpeg's H.264 decoder selected VAAPI surfaces. The live converter
+checks preserve the main stream, source reconnect and bounded shutdown; they also
+retain the 12.5-fps night duration, original AAC bytes/sample clock, and positive
+native millisecond timestamps through a simulated TCP burst. No camera is used.

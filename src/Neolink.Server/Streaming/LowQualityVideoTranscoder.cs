@@ -22,7 +22,7 @@ public sealed class LowQualityVideoTranscoder
     private readonly CancellationToken _lifetime;
     private readonly int _frameRate, _bitrateKbps, _sourceFrameRate;
     private readonly int _outputWidth, _outputHeight;
-    private readonly string _encoder, _device;
+    private readonly string _encoder, _device, _decoder;
     private string _state = "waiting-for-source";
     private string? _lastFailure;
     private string[] _encoderErrorCategories = [];
@@ -32,22 +32,24 @@ public sealed class LowQualityVideoTranscoder
 
     public LowQualityVideoTranscoder(string name, IStreamHub source, StreamHub output,
         CancellationToken lifetime, int frameRate = 10, int bitrateKbps = 512, int sourceFrameRate = 20,
-        int outputWidth = 0, int outputHeight = 0, string encoder = "software", string device = "/dev/dri/renderD128")
+        int outputWidth = 0, int outputHeight = 0, string encoder = "software", string device = "/dev/dri/renderD128",
+        string decoder = "software")
     {
         ArgumentNullException.ThrowIfNull(source);
         ArgumentNullException.ThrowIfNull(output);
         if (frameRate is < 1 or > 30 || sourceFrameRate is < 1 or > 60 || bitrateKbps is < 64 or > 8192)
             throw new ArgumentOutOfRangeException(nameof(frameRate), "Invalid low-quality encoder rates");
-        ValidateOutput(outputWidth, outputHeight, encoder, device);
+        ValidateOutput(outputWidth, outputHeight, encoder, device, decoder);
         _name = name; _source = source; _output = output; _lifetime = lifetime;
         _frameRate = frameRate; _bitrateKbps = bitrateKbps; _sourceFrameRate = sourceFrameRate;
-        _outputWidth = outputWidth; _outputHeight = outputHeight; _encoder = encoder; _device = device;
+        _outputWidth = outputWidth; _outputHeight = outputHeight; _encoder = encoder; _device = device; _decoder = decoder;
     }
 
     public object Diagnostics() => new
     {
         backend = _encoder,
         encoder = _encoder == "vaapi" ? "hevc_vaapi" : "libx265",
+        decoder = _decoder,
         state = Volatile.Read(ref _state),
         outputWidth = _outputWidth, outputHeight = _outputHeight,
         outputFps = _frameRate, sourceFps = _sourceFrameRate,
@@ -58,6 +60,18 @@ public sealed class LowQualityVideoTranscoder
         lastFailure = Volatile.Read(ref _lastFailure),
         encoderErrorCategories = Volatile.Read(ref _encoderErrorCategories).ToArray(),
         softwareFallback = false
+    };
+
+    // These fields describe the requested input options and failure policy, not a measured
+    // FFmpeg runtime backend. Proving hardware decoding requires an independent media probe.
+    public object DecoderDiagnostics() => new
+    {
+        backend = _decoder,
+        hardwareDecodeRequested = _decoder == "vaapi",
+        decoderHardwareFormat = _decoder == "vaapi" ? "vaapi" : null,
+        selectionEvidence = "configured-ffmpeg-input-options",
+        runtimeHardwareDecodeVerified = false,
+        noSilentFallback = true
     };
 
     public async Task RunAsync(CancellationToken cancellationToken)
@@ -113,9 +127,9 @@ public sealed class LowQualityVideoTranscoder
         try
         {
             var psi = StartInfo(exe, codec, _frameRate, _bitrateKbps, _sourceFrameRate,
-                _outputWidth, _outputHeight, _encoder, _device);
+                _outputWidth, _outputHeight, _encoder, _device, _decoder);
             Volatile.Write(ref _state, "starting");
-            Log.Info($"{_name}: starting low-quality {_encoder} encoder at {_frameRate} fps; backend fallback disabled");
+            Log.Info($"{_name}: starting low-quality {_decoder} decoder and {_encoder} encoder at {_frameRate} fps; backend fallback disabled");
             process = Process.Start(psi) ?? throw new InvalidOperationException("ffmpeg would not start");
             var proc = process;
             // Cancellation closes pipes too: older platform pipe implementations can ignore ReadAsync cancellation.
@@ -168,9 +182,9 @@ public sealed class LowQualityVideoTranscoder
 
     internal static ProcessStartInfo StartInfo(string exe, VideoCodec inputCodec,
         int frameRate, int bitrateKbps, int sourceFrameRate, int outputWidth = 0, int outputHeight = 0,
-        string encoder = "software", string device = "/dev/dri/renderD128")
+        string encoder = "software", string device = "/dev/dri/renderD128", string decoder = "software")
     {
-        ValidateOutput(outputWidth, outputHeight, encoder, device);
+        ValidateOutput(outputWidth, outputHeight, encoder, device, decoder);
         var psi = new ProcessStartInfo(exe)
         {
             UseShellExecute = false, CreateNoWindow = true,
@@ -184,17 +198,27 @@ public sealed class LowQualityVideoTranscoder
             psi.Environment["LIBVA_DRIVER_NAME"] = "iHD";
             Add("-init_hw_device", "vaapi=low:" + device, "-filter_hw_device", "low");
         }
+        if (decoder == "vaapi")
+            Add("-hwaccel", "vaapi", "-hwaccel_device", "low", "-hwaccel_output_format", "vaapi", "-extra_hw_frames", "8");
         Add(
             "-probesize", "4096", "-analyzeduration", "0", "-threads", "1",
             "-f", inputCodec == VideoCodec.H265 ? "hevc" : "h264", "-framerate", Number(sourceFrameRate), "-i", "pipe:0",
             "-map", "0:v:0", "-an", "-sn", "-dn", "-threads", "1", "-filter_threads", "1");
         string filter = "fps=" + Number(frameRate);
-        if (outputWidth > 0) filter += ",scale=" + Number(outputWidth) + ":" + Number(outputHeight) + ":flags=fast_bilinear,setsar=1";
+        if (decoder == "vaapi")
+        {
+            // Keep decoded surfaces on the selected device through filtering and encoding.
+            // A software frame cannot enter scale_vaapi: hardware failure stops this path.
+            filter += ",scale_vaapi=" + (outputWidth > 0
+                ? "w=" + Number(outputWidth) + ":h=" + Number(outputHeight) + ":" : "") + "format=nv12,setsar=1";
+        }
+        else if (outputWidth > 0)
+            filter += ",scale=" + Number(outputWidth) + ":" + Number(outputHeight) + ":flags=fast_bilinear,setsar=1";
         if (encoder == "vaapi")
         {
-            // Software decode permits the fps filter before upload, so only selected pictures enter the GPU.
             // Explicit encoder/device selection cannot silently revert to libx265. GLK uses EncSlice, not low_power.
-            Add("-vf", filter + ",format=nv12,hwupload", "-c:v", "hevc_vaapi", "-profile:v", "main",
+            // The default software decoder retains the previous fps-before-upload path.
+            Add("-vf", decoder == "vaapi" ? filter : filter + ",format=nv12,hwupload", "-c:v", "hevc_vaapi", "-profile:v", "main",
                 "-rc_mode", "CBR", "-bf", "0", "-g", Number(frameRate), "-idr_interval", "0",
                 // FFmpeg 6.1's VAAPI HEVC AUD packing can swallow P-picture boundaries on GLK.
                 // first_slice_segment_in_pic_flag provides the same framing without those broken AUDs.
@@ -214,10 +238,12 @@ public sealed class LowQualityVideoTranscoder
         return psi;
     }
 
-    private static void ValidateOutput(int width, int height, string encoder, string device)
+    private static void ValidateOutput(int width, int height, string encoder, string device, string decoder)
     {
         if (encoder is not ("software" or "vaapi") || !Regex.IsMatch(device, "^/dev/dri/renderD[0-9]{1,4}$"))
             throw new ArgumentException("Invalid low-quality encoder backend or DRM device");
+        if (decoder is not ("software" or "vaapi") || (decoder == "vaapi" && encoder != "vaapi"))
+            throw new ArgumentException("Invalid low-quality decoder backend; VAAPI decoding requires VAAPI encoding");
         if ((width != 0 || height != 0) && (width is < 2 or > 16384 || height is < 2 or > 16384
             || width % 2 != 0 || height % 2 != 0))
             throw new ArgumentOutOfRangeException(nameof(width), "Output resolution must have two even dimensions");

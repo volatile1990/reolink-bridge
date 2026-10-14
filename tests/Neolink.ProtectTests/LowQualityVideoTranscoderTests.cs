@@ -66,6 +66,39 @@ internal static class LowQualityVideoTranscoderTests
             "hardware output lacks decoder-friendly GOP boundaries or bounded buffering");
         Check(args.Count(a => a == "pipe:0") == 1 && args.Count(a => a == "pipe:1") == 1
             && !args.Any(a => a.Contains("rtsp://", StringComparison.OrdinalIgnoreCase)), "hardware encoder exposes camera access");
+        Check(!args.Contains("-hwaccel"), "existing VAAPI encoder configuration silently changed the decoder");
+        foreach (var (width, height, filter) in new[]
+        {
+            (896, 512, "fps=20,scale_vaapi=w=896:h=512:format=nv12,setsar=1"),
+            (672, 384, "fps=20,scale_vaapi=w=672:h=384:format=nv12,setsar=1"),
+            (0, 0, "fps=20,scale_vaapi=format=nv12,setsar=1")
+        })
+        {
+            var pipeline = LowQualityVideoTranscoder.StartInfo("synthetic-ffmpeg", VideoCodec.H264, 20, 1024, 20,
+                width, height, "vaapi", "/dev/dri/renderD128", "vaapi").ArgumentList.ToArray();
+            int input = Array.IndexOf(pipeline, "-i");
+            string Option(string name) => pipeline[Array.IndexOf(pipeline, name) + 1];
+            Check(Option("-hwaccel") == "vaapi" && Option("-hwaccel_device") == "low"
+                && Option("-hwaccel_output_format") == "vaapi"
+                && Option("-extra_hw_frames") == "8"
+                && new[] { "-hwaccel", "-hwaccel_device", "-hwaccel_output_format", "-extra_hw_frames" }
+                    .All(option => Array.IndexOf(pipeline, option) < input),
+                "hardware decoding was selected for the output instead of the pipe input");
+            Check(Option("-vf") == filter && Option("-c:v") == "hevc_vaapi"
+                && !pipeline.Any(arg => arg.Contains("hwupload", StringComparison.Ordinal)
+                    || arg.Contains("hwdownload", StringComparison.Ordinal)),
+                "GPU decode/filter/encode pipeline crosses software surfaces or changes output geometry");
+            Check(Option("-aud") == "0" && Option("-async_depth") == "1" && Option("-bf") == "0",
+                "GPU decoder changed the established predictive-picture framing or buffering contract");
+        }
+        foreach (var (encoder, decoder) in new[] { ("vaapi", "auto"), ("software", "vaapi"), ("vaapi", "VAAPI") })
+        {
+            bool rejected = false;
+            try { LowQualityVideoTranscoder.StartInfo("synthetic-ffmpeg", VideoCodec.H264, 20, 1024, 20,
+                896, 512, encoder, "/dev/dri/renderD128", decoder); }
+            catch (ArgumentException) { rejected = true; }
+            Check(rejected, "invalid decoder or an implicit GPU-to-software pipeline was accepted");
+        }
         var software = LowQualityVideoTranscoder.StartInfo("synthetic-ffmpeg", VideoCodec.H265, 10, 384, 20, 160, 90);
         Check(software.ArgumentList.Contains("fps=10,scale=160:90:flags=fast_bilinear,setsar=1")
             && software.ArgumentList.Contains("libx265") && !software.ArgumentList.Contains("hevc_vaapi"),
@@ -99,10 +132,16 @@ internal static class LowQualityVideoTranscoderTests
         Check(source.Length > 0 && sourceErrors.Length == 0
             && RtpAccessUnitSplitter.Split(VideoCodec.H264, source).Count(u => u.HasVcl) == 120,
             "GPU regression source did not contain 120 actual H264 pictures");
-        foreach (int fps in new[] { 10, 20 })
+        string[]? softwareFrameHashes = null;
+        foreach (var (decoder, fps, width, height) in new[]
+        {
+            ("software", 10, 896, 512), ("software", 20, 896, 512),
+            ("vaapi", 10, 896, 512), ("vaapi", 20, 896, 512),
+            ("vaapi", 20, 0, 0), ("vaapi", 20, 672, 384)
+        })
         {
             var settings = LowQualityVideoTranscoder.StartInfo(ffmpeg, VideoCodec.H264, fps, 1024, 20,
-                896, 512, "vaapi", "/dev/dri/renderD128");
+                width, height, "vaapi", "/dev/dri/renderD128", decoder);
             var (encoded, encodeErrors) = await Ffmpeg.RunAsync(ffmpeg, settings.ArgumentList.ToArray(), [source],
                 TimeSpan.FromSeconds(20), ct);
             Check(encoded.Length > 0 && encodeErrors.Length == 0, "actual VAAPI encoder failed: " + encodeErrors);
@@ -120,7 +159,8 @@ internal static class LowQualityVideoTranscoderTests
                 Check(frames.Count == expected && frames[0].Keyframe,
                     $"VAAPI {fps}fps incremental parser emitted {frames.Count}/{expected} pictures at chunk {chunkSize}");
                 foreach (var key in frames.Where(frame => frame.Keyframe))
-                    LowQualityVideoTranscoder.CheckFirstOutput(H26x.SplitNals(key.Data), 896, 512, true);
+                    LowQualityVideoTranscoder.CheckFirstOutput(H26x.SplitNals(key.Data),
+                        (uint)(width == 0 ? 896 : width), (uint)(height == 0 ? 512 : height), true);
             }
             var (progress, decodeErrors) = await Ffmpeg.RunAsync(ffmpeg,
                 ["-hide_banner", "-loglevel", "error", "-threads", "1", "-f", "hevc", "-i", "pipe:0",
@@ -128,14 +168,38 @@ internal static class LowQualityVideoTranscoderTests
             string text = System.Text.Encoding.UTF8.GetString(progress);
             Check(decodeErrors.Length == 0 && text.Split('\n').Select(line => line.Trim()).Contains("frame=" + expected),
                 $"VAAPI {fps}fps did not decode all {expected} pictures: " + decodeErrors);
-            Console.WriteLine($"PASS GPU VAAPI {fps}fps: {expected} actual encoded/assembled/decoded pictures including P frames");
+            if (fps == 20 && width == 896 && height == 512)
+            {
+                var (checksums, checksumErrors) = await Ffmpeg.RunAsync(ffmpeg,
+                    ["-hide_banner", "-loglevel", "error", "-threads", "1", "-f", "hevc", "-i", "pipe:0",
+                     "-an", "-pix_fmt", "yuv420p", "-f", "framemd5", "pipe:1"], [encoded], TimeSpan.FromSeconds(15), ct);
+                var hashes = System.Text.Encoding.UTF8.GetString(checksums).Split('\n')
+                    .Where(line => line.Length > 0 && !line.StartsWith('#'))
+                    .Select(line => line.Split(',').Last().Trim()).ToArray();
+                Check(checksumErrors.Length == 0 && hashes.Length == expected, "decoded-frame checksums are incomplete");
+                if (decoder == "software") softwareFrameHashes = hashes;
+                else Check(softwareFrameHashes != null && hashes.SequenceEqual(softwareFrameHashes),
+                    "GPU decoding changed the pixels of the established same-size HEVC output");
+            }
+            Console.WriteLine($"PASS GPU VAAPI decoder={decoder} {fps}fps {width}x{height}: {expected} actual encoded/assembled/decoded pictures including P frames");
         }
+
+        var debug = LowQualityVideoTranscoder.StartInfo(ffmpeg, VideoCodec.H264, 20, 1024, 20,
+            0, 0, "vaapi", "/dev/dri/renderD128", "vaapi").ArgumentList.ToArray();
+        debug[Array.IndexOf(debug, "-loglevel") + 1] = "debug";
+        var (verifiedOutput, decoderLog) = await Ffmpeg.RunAsync(ffmpeg, debug, [source], TimeSpan.FromSeconds(20), ct);
+        Check(verifiedOutput.Length > 0 && decoderLog.Contains("Format vaapi chosen by get_format()", StringComparison.Ordinal),
+            "actual H264 decoder did not confirm a VAAPI surface in the FFmpeg runtime log");
+        Check(!decoderLog.Contains("Failed setup for format vaapi", StringComparison.Ordinal)
+            && !decoderLog.Contains("Error while", StringComparison.Ordinal), "hardware decoder encountered an FFmpeg setup/output failure");
+        Console.WriteLine("PASS GPU H264 runtime format: vaapi surfaces confirmed by FFmpeg get_format");
     }
 
     public static Task RealFfmpegReconnectAndShutdown() => RealFfmpegReconnectAndShutdownCore(scaled: false);
     public static Task RealFfmpegScaledReconnectAndShutdown() => RealFfmpegReconnectAndShutdownCore(scaled: true);
+    public static Task HardwareFfmpegReconnectAndShutdown() => RealFfmpegReconnectAndShutdownCore(scaled: true, hardware: true);
 
-    private static async Task RealFfmpegReconnectAndShutdownCore(bool scaled)
+    private static async Task RealFfmpegReconnectAndShutdownCore(bool scaled, bool hardware = false)
     {
         if (Ffmpeg.ExePath is not { } ffmpeg)
         {
@@ -160,7 +224,8 @@ internal static class LowQualityVideoTranscoderTests
         var low = new StreamHub("synthetic-low-output");
         int expectedWidth = scaled ? 160 : 320, expectedHeight = scaled ? 90 : 180;
         var transcoder = new LowQualityVideoTranscoder("synthetic-low", source, low, ct, 10, 256, 20,
-            scaled ? expectedWidth : 0, scaled ? expectedHeight : 0);
+            scaled ? expectedWidth : 0, scaled ? expectedHeight : 0, hardware ? "vaapi" : "software",
+            "/dev/dri/renderD128", hardware ? "vaapi" : "software");
         using var stop = CancellationTokenSource.CreateLinkedTokenSource(ct);
         var running = transcoder.RunAsync(stop.Token);
         var outputPackets = new List<HubVideo>();
@@ -205,7 +270,8 @@ internal static class LowQualityVideoTranscoderTests
                 "HEVC SPS did not independently prove the encoded low dimensions/conformance crop");
             var diagnostics = System.Text.Json.JsonSerializer.SerializeToElement(transcoder.Diagnostics());
             Check(diagnostics.GetProperty("state").GetString() == "active"
-                && diagnostics.GetProperty("encoder").GetString() == "libx265"
+                && diagnostics.GetProperty("encoder").GetString() == (hardware ? "hevc_vaapi" : "libx265")
+                && diagnostics.GetProperty("decoder").GetString() == (hardware ? "vaapi" : "software")
                 && !diagnostics.GetProperty("softwareFallback").GetBoolean(), "live encoder diagnostics misreport the backend");
             while (reader.TryRead(out var packet)) if (packet is HubVideo video) outputPackets.Add(video);
             Check(outputPackets.Count >= 8 && outputPackets[0].Keyframe, "low stream was not keyframe-first");

@@ -71,7 +71,10 @@ internal static class LowQualityCadenceTests
         return Task.CompletedTask;
     }
 
-    public static async Task RealNightEncoderAndAacPreservation()
+    public static Task RealNightEncoderAndAacPreservation() => RealNightEncoderAndAacPreservationCore(hardware: false);
+    public static Task HardwareNightEncoderAndAacPreservation() => RealNightEncoderAndAacPreservationCore(hardware: true);
+
+    private static async Task RealNightEncoderAndAacPreservationCore(bool hardware)
     {
         if (Ffmpeg.ExePath is not { } ffmpeg) { Console.WriteLine("SKIP real night cadence: ffmpeg absent"); return; }
         using var deadline = new CancellationTokenSource(TimeSpan.FromSeconds(25));
@@ -88,7 +91,8 @@ internal static class LowQualityCadenceTests
         var low = new StreamHub("synthetic-night-low");
         var sink = new ProtectBridgeHost.LowQualitySourceSink(source, low);
         using var stop = CancellationTokenSource.CreateLinkedTokenSource(ct);
-        var converter = new LowQualityVideoTranscoder("synthetic-night", source, low, ct, 20, 256, 20, 160, 90);
+        var converter = new LowQualityVideoTranscoder("synthetic-night", source, low, ct, 20, 256, 20, 160, 90,
+            hardware ? "vaapi" : "software", "/dev/dri/renderD128", hardware ? "vaapi" : "software");
         var running = converter.RunAsync(stop.Token);
         var (id, reader) = low.Subscribe();
         byte[] adts = [0xff, 0xf1, 0x60, 0x40, 0x01, 0x9f, 0xfc, 1, 2, 3, 4, 5]; // AAC-LC 16 kHz mono
@@ -175,7 +179,10 @@ internal static class LowQualityCadenceTests
         }
     }
 
-    public static async Task RealTcpBurstEncoderAndNativeMilliseconds()
+    public static Task RealTcpBurstEncoderAndNativeMilliseconds() => RealTcpBurstEncoderAndNativeMillisecondsCore(hardware: false);
+    public static Task HardwareTcpBurstEncoderAndNativeMilliseconds() => RealTcpBurstEncoderAndNativeMillisecondsCore(hardware: true);
+
+    private static async Task RealTcpBurstEncoderAndNativeMillisecondsCore(bool hardware)
     {
         if (Ffmpeg.ExePath is not { } ffmpeg) throw new InvalidOperationException("ffmpeg required for TCP burst regression");
         using var deadline = new CancellationTokenSource(TimeSpan.FromSeconds(25)); var ct = deadline.Token;
@@ -193,7 +200,8 @@ internal static class LowQualityCadenceTests
         var sink = new ProtectBridgeHost.LowQualitySourceSink(source, low);
         sink.PublishVideo(new(VideoCodec.H264, true, 0, null, RtpAccessUnitSplitter.AnnexB(pictures[0].Nals)));
         using var stop = CancellationTokenSource.CreateLinkedTokenSource(ct);
-        var converter = new LowQualityVideoTranscoder("synthetic-tcp-burst", source, low, ct, 20, 256, 20, 160, 90);
+        var converter = new LowQualityVideoTranscoder("synthetic-tcp-burst", source, low, ct, 20, 256, 20, 160, 90,
+            hardware ? "vaapi" : "software", "/dev/dri/renderD128", hardware ? "vaapi" : "software");
         Task running = converter.RunAsync(stop.Token); var (id, reader) = low.Subscribe();
         var listener = new TcpListener(IPAddress.Loopback, 0); listener.Start();
         using var sender = new TcpClient();

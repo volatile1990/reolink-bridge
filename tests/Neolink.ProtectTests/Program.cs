@@ -96,7 +96,10 @@ if (args.SequenceEqual(new[] { "--hardware-low-quality-only" }))
     try
     {
         await LowQualityVideoTranscoderTests.HardwareFfmpegPictureCompleteness();
-        Console.WriteLine("GPU low-quality picture-completeness regression passed; only synthetic media processed.");
+        await LowQualityVideoTranscoderTests.HardwareFfmpegReconnectAndShutdown();
+        await LowQualityCadenceTests.HardwareNightEncoderAndAacPreservation();
+        await LowQualityCadenceTests.HardwareTcpBurstEncoderAndNativeMilliseconds();
+        Console.WriteLine("4 GPU low-quality regressions passed: picture completeness, reconnect/shutdown, night/AAC cadence and TCP bursts; only synthetic media processed.");
         return 0;
     }
     catch (Exception error)

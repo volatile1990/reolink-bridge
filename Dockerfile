@@ -8,7 +8,7 @@ COPY src/Neolink.WebClient/Neolink.WebClient.csproj src/Neolink.WebClient/
 RUN dotnet restore src/Neolink.Server/Neolink.Server.csproj
 
 COPY src/ ./src/
-ARG BRIDGE_VERSION=1.2.0
+ARG BRIDGE_VERSION=1.3.0
 ARG BRIDGE_SOURCE_REVISION=unknown
 RUN dotnet publish src/Neolink.Server/Neolink.Server.csproj \
     --configuration Release --no-restore --output /out \
@@ -25,7 +25,7 @@ RUN sed -i '/^Components:/ { / universe/! s/$/ universe/; / multiverse/! s/$/ mu
 WORKDIR /app
 COPY --from=build /out/ ./
 COPY LICENSE UPSTREAM.md ./
-ARG BRIDGE_VERSION=1.2.0
+ARG BRIDGE_VERSION=1.3.0
 ARG BRIDGE_SOURCE_REVISION=unknown
 LABEL org.opencontainers.image.source="https://github.com/volatile1990/reolink-bridge" \
       org.opencontainers.image.version="${BRIDGE_VERSION}" \

@@ -52,7 +52,9 @@ public sealed class BridgeOnvifConfig
     public int LowQualitySourceFps { get; set; } = 20;
     /// <summary>Explicit low-quality encoder backend. Hardware failure never selects software implicitly.</summary>
     public string LowQualityEncoder { get; set; } = "software";
-    /// <summary>DRM render node used only by the explicitly selected VAAPI encoder.</summary>
+    /// <summary>Explicit low-quality decoder backend. VAAPI requires the VAAPI encoder and never falls back silently.</summary>
+    public string LowQualityDecoder { get; set; } = "software";
+    /// <summary>DRM render node used by the explicitly selected VAAPI decoder and encoder.</summary>
     public string LowQualityDevice { get; set; } = "/dev/dri/renderD128";
     /// <summary>Optional native H264 LQ VUI display ratio; encoded pictures remain unchanged.</summary>
     public string? LowQualitySampleAspectRatio { get; set; }
@@ -97,6 +99,7 @@ public sealed class BridgeOnvifConfig
                 case "lowqualitytranscode": result.LowQualityTranscode = property.Value.GetString(); break;
                 case "lowqualitysourcefps": result.LowQualitySourceFps = property.Value.GetInt32(); break;
                 case "lowqualityencoder": result.LowQualityEncoder = property.Value.GetString() ?? ""; break;
+                case "lowqualitydecoder": result.LowQualityDecoder = property.Value.GetString() ?? ""; break;
                 case "lowqualitydevice": result.LowQualityDevice = property.Value.GetString() ?? ""; break;
                 case "lowqualitysampleaspectratio": result.LowQualitySampleAspectRatio = property.Value.GetString(); break;
                 case "profiles":
@@ -186,6 +189,10 @@ public sealed class BridgeOnvifConfig
             throw new FormatException("onvif.low_quality_source_fps must be between 1 and 120");
         if (LowQualityEncoder is not ("software" or "vaapi"))
             throw new FormatException("onvif.low_quality_encoder must be software or vaapi");
+        if (LowQualityDecoder is not ("software" or "vaapi"))
+            throw new FormatException("onvif.low_quality_decoder must be software or vaapi");
+        if (LowQualityDecoder == "vaapi" && (LowQualityEncoder != "vaapi" || LowQualityTranscode != "H265"))
+            throw new FormatException("VAAPI decoding requires explicit VAAPI H265 low-quality conversion");
         if (!Regex.IsMatch(LowQualityDevice, "^/dev/dri/renderD[0-9]{1,4}$"))
             throw new FormatException("onvif.low_quality_device must be an absolute DRM render node");
         if (LowQualityEncoder == "vaapi" && LowQualityTranscode == null)

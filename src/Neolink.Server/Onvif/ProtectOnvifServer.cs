@@ -41,6 +41,8 @@ public sealed partial class ProtectOnvifServer
     public ProtectEventBroker? Events { get; }
     /// <summary>Safe, authenticated diagnostics from the optional low-quality encoder.</summary>
     public Func<object>? LowQualityEncoderDiagnostics { get; set; }
+    /// <summary>Safe, authenticated decoder selection and policy; not a runtime hardware verification.</summary>
+    public Func<object>? LowQualityDecoderDiagnostics { get; set; }
     public Func<object>? NativeTalkDiagnostics { get; set; }
     public Func<object>? GopAudioDiagnostics { get; set; }
     private readonly long _startedTimestamp = System.Diagnostics.Stopwatch.GetTimestamp();
@@ -90,6 +92,7 @@ public sealed partial class ProtectOnvifServer
         source = SourceDiagnostics?.Invoke(),
         events = Events?.Diagnostics(),
         lowQualityEncoder = LowQualityEncoderDiagnostics?.Invoke(),
+        lowQualityDecoder = LowQualityDecoderDiagnostics?.Invoke(),
         nativeTalk = NativeTalkDiagnostics?.Invoke(),
         gopAudio = GopAudioDiagnostics?.Invoke(),
         uptimeSeconds = System.Diagnostics.Stopwatch.GetElapsedTime(_startedTimestamp).TotalSeconds,

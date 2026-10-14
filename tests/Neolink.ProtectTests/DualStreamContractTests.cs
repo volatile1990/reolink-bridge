@@ -24,19 +24,30 @@ internal static class DualStreamContractTests
         Check(native.Onvif!.LowQualityTranscode == null, "native H264 route unexpectedly converts video");
         Check(converted.Onvif!.LowQualityTranscode == "H265" && converted.Onvif.LowQualitySourceFps == 20,
             "H265 conversion parameters were lost while parsing");
-        Check(converted.Onvif.LowQualityEncoder == "software" && converted.Onvif.LowQualityDevice == "/dev/dri/renderD128",
-            "existing configurations changed encoder backend");
+        Check(converted.Onvif.LowQualityEncoder == "software" && converted.Onvif.LowQualityDecoder == "software"
+            && converted.Onvif.LowQualityDevice == "/dev/dri/renderD128",
+            "existing configurations changed encoder or decoder backend");
         var hardware = Load(example, input =>
         {
             AddLow(input, "H265", true);
             input["onvif"]!["low_quality_encoder"] = "vaapi";
+            input["onvif"]!["low_quality_decoder"] = "vaapi";
             input["onvif"]!["low_quality_device"] = "/dev/dri/renderD129";
             input["onvif"]!["profiles"]![1]!["width"] = 672;
             input["onvif"]!["profiles"]![1]!["height"] = 384;
         });
-        Check(hardware.Onvif!.LowQualityEncoder == "vaapi" && hardware.Onvif.LowQualityDevice == "/dev/dri/renderD129"
+        Check(hardware.Onvif!.LowQualityEncoder == "vaapi" && hardware.Onvif.LowQualityDecoder == "vaapi"
+            && hardware.Onvif.LowQualityDevice == "/dev/dri/renderD129"
             && hardware.Onvif.Profiles[1].Width == 672 && hardware.Onvif.Profiles[1].Height == 384,
             "hardware backend/device/output resolution were lost while parsing");
+        using var lifetime = new CancellationTokenSource();
+        var pipeline = ProtectBridgeHost.CreateStreams(hardware.Cameras[0], hardware.Onvif!, lifetime.Token);
+        var decoder = System.Text.Json.JsonSerializer.SerializeToElement(pipeline.Transcoder!.DecoderDiagnostics());
+        Check(decoder.GetProperty("backend").GetString() == "vaapi"
+            && decoder.GetProperty("hardwareDecodeRequested").GetBoolean()
+            && !decoder.GetProperty("runtimeHardwareDecodeVerified").GetBoolean()
+            && decoder.GetProperty("noSilentFallback").GetBoolean(),
+            "bridge failed to pass the configured GPU decoder to the actual media pipeline or overstated runtime evidence");
         Load(example, input => { AddLow(input, "H264", false); input["cameras"]![0]!["stream"] = "both"; });
         return Task.CompletedTask;
     }
@@ -54,6 +65,9 @@ internal static class DualStreamContractTests
         Reject(example, input => input["cameras"]![0]!["stream"] = "both");
         Reject(example, input => { AddLow(input, "H264", false); input["onvif"]!["profiles"]![0]!["codec"] = "H265"; });
         Reject(example, input => { AddLow(input, "H265", true); input["onvif"]!["low_quality_encoder"] = "auto"; });
+        Reject(example, input => { AddLow(input, "H265", true); input["onvif"]!["low_quality_decoder"] = "auto"; });
+        Reject(example, input => { AddLow(input, "H265", true); input["onvif"]!["low_quality_decoder"] = "vaapi"; });
+        Reject(example, input => { AddLow(input, "H264", false); input["onvif"]!["low_quality_decoder"] = "vaapi"; });
         Reject(example, input => { AddLow(input, "H264", false); input["onvif"]!["low_quality_encoder"] = "vaapi"; });
         Reject(example, input => { AddLow(input, "H265", true); input["onvif"]!["low_quality_device"] = "/tmp/renderD128"; });
         Reject(example, input => { AddLow(input, "H265", true); input["onvif"]!["profiles"]![1]!["width"] = 895; });

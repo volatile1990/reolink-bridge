@@ -53,7 +53,11 @@ public static class ProtectBridgeHost
         if (cameraControls != null) cameraControls.ListenMetadata = endpoint.ListenMetadata;
         endpoint.SourceDiagnostics = source.SourceDiagnostics;
         if (onvif.GopAudio) endpoint.GopAudioDiagnostics = rtsp.GopAudioDiagnostics;
-        if (pipeline.Transcoder is { } lowEncoder) endpoint.LowQualityEncoderDiagnostics = lowEncoder.Diagnostics;
+        if (pipeline.Transcoder is { } lowEncoder)
+        {
+            endpoint.LowQualityEncoderDiagnostics = lowEncoder.Diagnostics;
+            endpoint.LowQualityDecoderDiagnostics = lowEncoder.DecoderDiagnostics;
+        }
         if (endpoint.Events is { } events) source.MotionSink = events.Publish;
         var tasks = new List<Task>
         {
@@ -147,7 +151,7 @@ public static class ProtectBridgeHost
         var transcoder = onvif.LowQualityTranscode == "H265"
             ? new LowQualityVideoTranscoder(camera.Name, nativeSub, lowHub, lifetime, profile.Fps, profile.Bitrate,
                 onvif.LowQualitySourceFps, profile.Width, profile.Height, onvif.LowQualityEncoder,
-                onvif.LowQualityDevice) : null;
+                onvif.LowQualityDevice, onvif.LowQualityDecoder) : null;
         streams.Add(new("sub", "/" + camera.Name + "/subStream", lowHub, RequiredForHealth: false));
         return new(mainSource, mainHub, nativeSub, lowHub, transcoder, streams);
     }
