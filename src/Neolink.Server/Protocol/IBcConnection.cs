@@ -18,6 +18,8 @@ public interface IBcConnection : IAsyncDisposable
 {
     EncryptionState Encryption { get; }
     BcSubscription Subscribe(uint msgId);
+    /// <summary>Route one command's replies/media by message number. Legacy transports retain single-stream behavior.</summary>
+    BcSubscription Subscribe(uint msgId, ushort messageNumber) => Subscribe(msgId);
     Task SendAsync(BcMessage msg, CancellationToken ct);
 
     /// <summary>The camera's resolved IP once connected — used for the non-waking

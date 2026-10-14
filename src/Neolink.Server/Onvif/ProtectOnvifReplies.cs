@@ -9,7 +9,7 @@ public sealed partial class ProtectOnvifServer
     private static string Esc(string text) => SecurityElement.Escape(text) ?? "";
     private static string Envelope(string body) => "<?xml version=\"1.0\" encoding=\"utf-8\"?>" +
         $"<s:Envelope xmlns:s=\"{NsSoap}\" xmlns:tt=\"{NsSchema}\" xmlns:tds=\"{NsDevice}\" xmlns:trt=\"{NsMedia}\" " +
-        $"xmlns:tr2=\"{NsMedia2}\" xmlns:tev=\"{NsEvents}\" xmlns:wsnt=\"{NsWsnt}\" xmlns:wsa=\"{NsWsa}\" " +
+        $"xmlns:tr2=\"{NsMedia2}\" xmlns:tptz=\"{NsPtz}\" xmlns:tev=\"{NsEvents}\" xmlns:wsnt=\"{NsWsnt}\" xmlns:wsa=\"{NsWsa}\" " +
         $"xmlns:tns1=\"{NsTopics}\" xmlns:tnsre=\"{NsAi}\" xmlns:wstop=\"http://docs.oasis-open.org/wsn/t-1\" " +
         "xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:ter=\"http://www.onvif.org/ver10/error\"><s:Body>" + body + "</s:Body></s:Envelope>";
     private static (int Status, string Body) Ok(string body) => (200, Envelope(body));
@@ -34,6 +34,7 @@ public sealed partial class ProtectOnvifServer
             $"<tds:Version><tt:Major>{major}</tt:Major><tt:Minor>{minor}</tt:Minor></tds:Version></tds:Service>";
         return "<tds:GetServicesResponse>" + Service(NsDevice, "/onvif/device_service", 2, 0) +
             Service(NsMedia, "/onvif/media_service", 2, 0) + Service(NsMedia2, "/onvif/media2_service", 2, 0) +
+            (NativePtzAvailable ? Service(NsPtz, "/onvif/ptz_service", 2, 0) : "") +
             (Events == null ? "" : Service(NsEvents, "/onvif/events_service", 2, 0)) + "</tds:GetServicesResponse>";
     }
 
@@ -44,6 +45,7 @@ public sealed partial class ProtectOnvifServer
         "<tt:Security><tt:TLS1.1>false</tt:TLS1.1><tt:TLS1.2>false</tt:TLS1.2><tt:OnboardKeyGeneration>false</tt:OnboardKeyGeneration>" +
         "<tt:AccessPolicyConfig>false</tt:AccessPolicyConfig><tt:X.509Token>false</tt:X.509Token><tt:SAMLToken>false</tt:SAMLToken><tt:KerberosToken>false</tt:KerberosToken><tt:RELToken>false</tt:RELToken></tt:Security></tt:Device>" +
         $"<tt:Media><tt:XAddr>http://{_config.AdvertisedHost}:{_config.Port}/onvif/media_service</tt:XAddr><tt:StreamingCapabilities><tt:RTPMulticast>false</tt:RTPMulticast><tt:RTP_TCP>true</tt:RTP_TCP><tt:RTP_RTSP_TCP>true</tt:RTP_RTSP_TCP></tt:StreamingCapabilities></tt:Media>" +
+        (NativePtzAvailable ? $"<tt:PTZ><tt:XAddr>http://{_config.AdvertisedHost}:{_config.Port}/onvif/ptz_service</tt:XAddr></tt:PTZ>" : "") +
         (Events == null ? "" : $"<tt:Events><tt:XAddr>{EventsUrl}</tt:XAddr><tt:WSSubscriptionPolicySupport>false</tt:WSSubscriptionPolicySupport>" +
             "<tt:WSPullPointSupport>true</tt:WSPullPointSupport><tt:WSPausableSubscriptionManagerInterfaceSupport>false</tt:WSPausableSubscriptionManagerInterfaceSupport></tt:Events>") +
         "</tds:Capabilities></tds:GetCapabilitiesResponse>";
@@ -54,7 +56,7 @@ public sealed partial class ProtectOnvifServer
         "</tds:Capabilities></tds:GetServiceCapabilitiesResponse>";
 
     private string DeviceInformation() => "<tds:GetDeviceInformationResponse><tds:Manufacturer>Reolink Bridge</tds:Manufacturer>" +
-        $"<tds:Model>{Esc(_config.Model)}</tds:Model><tds:FirmwareVersion>bridge-0.1</tds:FirmwareVersion>" +
+            $"<tds:Model>{Esc(_config.Model)}</tds:Model><tds:FirmwareVersion>{Esc(BridgeBuildInfo.Version)}</tds:FirmwareVersion>" +
         $"<tds:SerialNumber>{_config.SerialNumber}</tds:SerialNumber><tds:HardwareId>{Esc(_config.Uuid)}</tds:HardwareId></tds:GetDeviceInformationResponse>";
 
     private string NetworkInterfaces() => "<tds:GetNetworkInterfacesResponse><tds:NetworkInterfaces token=\"bridge0\"><tt:Enabled>true</tt:Enabled>" +
@@ -113,8 +115,10 @@ public sealed partial class ProtectOnvifServer
 
     private string Profile(string element, ProtectOnvifStream stream, bool media2) =>
         $"<{element} token=\"{Esc(stream.Token)}\" fixed=\"true\"><" + (media2 ? "tr2" : "tt") + $":Name>{Esc(_config.Name)} {Esc(stream.Token)}</" + (media2 ? "tr2" : "tt") + ":Name>" +
-        (media2 ? "<tr2:Configurations>" + Source("tt:VideoSource", stream) + Encoder("tt:VideoEncoder", stream, true) + "</tr2:Configurations>"
-            : Source("tt:VideoSourceConfiguration", stream) + Encoder("tt:VideoEncoderConfiguration", stream, false)) + $"</{element}>";
+        (media2 ? "<tr2:Configurations>" + Source("tt:VideoSource", stream) + Encoder("tt:VideoEncoder", stream, true) +
+            AudioSource("tt:AudioSource", stream) + AudioEncoder("tt:AudioEncoder", stream, true) + NativePtzConfiguration("tt:PTZ") + "</tr2:Configurations>"
+            : Source("tt:VideoSourceConfiguration", stream) + AudioSource("tt:AudioSourceConfiguration", stream) +
+            Encoder("tt:VideoEncoderConfiguration", stream, false) + AudioEncoder("tt:AudioEncoderConfiguration", stream, false) + NativePtzConfiguration("tt:PTZConfiguration")) + $"</{element}>";
 
     private string VideoSources(string prefix)
     {

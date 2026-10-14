@@ -13,6 +13,152 @@ using Neolink.Media;
 using Neolink.Onvif;
 using Neolink.Streaming;
 
+if (args.SequenceEqual(new[] { "--lq-cadence-only" }))
+{
+    try
+    {
+        await LowQualityCadenceTests.SourceCadenceAndBurstClock();
+        await LowQualityCadenceTests.RealNightEncoderAndAacPreservation();
+        await LowQualityCadenceTests.RealTcpBurstEncoderAndNativeMilliseconds();
+        Console.WriteLine("3 source-cadence LQ contracts passed; only synthetic media and loopback peers used."); return 0;
+    }
+    catch (Exception error) { Console.Error.WriteLine("FAIL LQ cadence: " + error); return 1; }
+}
+
+if (args.SequenceEqual(new[] { "--gop-aac-only" }))
+{
+    try
+    {
+        await GopAacContractTests.TimelineAndRtcp(); await GopAacContractTests.LossEpochAndBounds();
+        await GopAacContractTests.ConfigAndObservedProfiles(); await GopAacContractTests.WirePayloadsAndSynchronization();
+        Console.WriteLine("4 GOP AAC contracts passed; only synthetic media and loopback peers used."); return 0;
+    }
+    catch (Exception error) { Console.Error.WriteLine("FAIL GOP AAC: " + error); return 1; }
+}
+
+if (args.SequenceEqual(new[] { "--listen-only" }))
+{
+    try
+    {
+        await ProtectAudioListenTests.AacBytesAndDecode();
+        await ProtectAudioListenTests.HttpAuthPayloadAndDisconnect();
+        await ProtectAudioListenTests.BoundBackpressureAndEpoch();
+        await ProtectAudioListenTests.PcmOnDemandAac();
+        Console.WriteLine("4 audio listen tests passed; only synthetic media and loopback peers used.");
+        return 0;
+    }
+    catch (Exception error) { Console.Error.WriteLine("FAIL audio listen: " + error.Message); return 1; }
+}
+
+if (args.SequenceEqual(new[] { "--audio-only" }))
+{
+    try
+    {
+        await AudioBackchannelContractTests.StrictRtp();
+        await AudioBackchannelContractTests.LazySpeakerLifecycle();
+        await OnvifAudioMetadataTests.HonestProfileScope();
+        await OnvifAudioMetadataTests.SourceEpochAndUnsupportedFormats();
+        await NativeTalkUdpTests.FilterAndLazyHandshake();
+        await NativeTalkUdpTests.LiveAacDecodeAndStop();
+        Console.WriteLine("6 audio contract tests passed; only synthetic media and loopback peers used, no cameras contacted.");
+        return 0;
+    }
+    catch (Exception error) { Console.Error.WriteLine("FAIL audio contract: " + error.Message); return 1; }
+}
+
+if (args.SequenceEqual(new[] { "--controls-only" }))
+{
+    try { await ProtectCameraControlTests.RunAsync(); await BaichuanAiControlTests.RunAsync(); await BaichuanFallbackControlTests.RunAsync(); await ProtectZoneDiscoveryTests.RunAsync(); return 0; }
+    catch (Exception error) { Console.Error.WriteLine("FAIL Protect controls: " + error.Message); return 1; }
+}
+
+if (args.SequenceEqual(new[] { "--low-quality-display-only" }))
+{
+    try
+    {
+        await H264SampleAspectRatioTests.SyntaxPreservation();
+        await H264SampleAspectRatioTests.MalformedInputs();
+        await H264SampleAspectRatioTests.RealFfmpegPixelPreservation();
+        await LowQualityDisplayMetadataTests.IsolationAndRecovery();
+        await LowQualityDisplayMetadataTests.ConfigurationGuards();
+        Console.WriteLine("5 native LQ display tests passed; only synthetic media processed.");
+        return 0;
+    }
+    catch (Exception error)
+    {
+        Console.Error.WriteLine("FAIL native LQ display test: " + error.Message);
+        return 1;
+    }
+}
+
+if (args.SequenceEqual(new[] { "--hardware-low-quality-only" }))
+{
+    try
+    {
+        await LowQualityVideoTranscoderTests.HardwareFfmpegPictureCompleteness();
+        Console.WriteLine("GPU low-quality picture-completeness regression passed; only synthetic media processed.");
+        return 0;
+    }
+    catch (Exception error)
+    {
+        Console.Error.WriteLine("FAIL GPU low-quality picture-completeness regression: " + error.Message);
+        return 1;
+    }
+}
+
+if (args.SequenceEqual(new[] { "--shared-stream-only" }))
+{
+    try
+    {
+        await SharedBaichuanStreamTests.MessageNumberRouting();
+        await SharedBaichuanStreamTests.StopAcknowledgementReleasesBinaryMode();
+        await SharedBaichuanStreamTests.OneLoginDemuxAndLowRetry();
+        Console.WriteLine("3 shared-session contract tests passed; only synthetic loopback peers contacted.");
+        return 0;
+    }
+    catch (Exception error)
+    {
+        Console.Error.WriteLine("FAIL shared-session contract test: " + error.Message);
+        return 1;
+    }
+}
+
+if (args.SequenceEqual(new[] { "--low-quality-only" }))
+{
+    try
+    {
+        await LowQualityVideoTranscoderTests.IncrementalHevcBoundaries();
+        await LowQualityVideoTranscoderTests.EncoderIsolation();
+        await LowQualityVideoTranscoderTests.HardwareAndScaledEncoderIsolation();
+        await LowQualityVideoTranscoderTests.RealFfmpegReconnectAndShutdown();
+        await LowQualityVideoTranscoderTests.RealFfmpegScaledReconnectAndShutdown();
+        Console.WriteLine("5 low-quality contract tests passed; no cameras or network devices contacted.");
+        return 0;
+    }
+    catch (Exception error)
+    {
+        Console.Error.WriteLine("FAIL low-quality contract test: " + error.Message);
+        return 1;
+    }
+}
+
+if (args.SequenceEqual(new[] { "--reliability-only" }))
+{
+    try
+    {
+        await RtspReliabilityTests.RequestBudgetsAndDeadlines(); await RtspReliabilityTests.ConnectionAndSessionLimits();
+        await RtspReliabilityTests.MediaActivityAndShutdown(); await RtspReliabilityTests.ReplacedTransportsAndSessionHeader();
+        await RtspReliabilityTests.ActorScopedTalk();
+        await TalkRecoveryTests.FreshSpeechAfterTransientFailure(); await TalkRecoveryTests.NativeDecoderFailureRecovery();
+        await TalkRecoveryTests.UnsupportedTalkDoesNotRetry(); await ReliabilityPtzControlTests.RunAsync();
+        await StreamReliabilityTests.FreshDescriptionsAcrossEpochs(); await StreamReliabilityTests.PublicationOrderAndByteBudgets();
+        await StreamReliabilityTests.AlarmSubscriptionRecovery(); await StreamReliabilityTests.LowFrameRatesAndCertificatePinning();
+        await StreamReliabilityTests.DurableReplayAndRecovery();
+        Console.WriteLine("14 reliability contracts passed; synthetic media, temporary state and loopback peers only."); return 0;
+    }
+    catch (Exception error) { Console.Error.WriteLine("FAIL reliability: " + error); return 1; }
+}
+
 return await ContractTests.RunAsync();
 
 internal static class ContractTests
@@ -49,7 +195,7 @@ internal static class ContractTests
             new ProtectOnvifStream("sub", "/test/subStream", sub)
         };
         var server = new ProtectOnvifServer(config, users, streams, 18554);
-        using var cancellation = new CancellationTokenSource(TimeSpan.FromSeconds(90));
+        using var cancellation = new CancellationTokenSource(TimeSpan.FromSeconds(180));
         Task serving = server.RunAsync(cancellation.Token);
         using var http = new HttpClient { BaseAddress = new Uri($"http://127.0.0.1:{port}"), Timeout = TimeSpan.FromSeconds(3) };
         int failures = 0, passed = 0;
@@ -73,6 +219,42 @@ internal static class ContractTests
         {
             await WaitForServer(http, serving);
             string example = FindExample();
+            await Test("RTSP request budgets and deadlines", RtspReliabilityTests.RequestBudgetsAndDeadlines);
+            await Test("RTSP connection and session limits", RtspReliabilityTests.ConnectionAndSessionLimits);
+            await Test("RTSP media activity and ordered shutdown", RtspReliabilityTests.MediaActivityAndShutdown);
+            await Test("RTSP replaced transports and session ownership", RtspReliabilityTests.ReplacedTransportsAndSessionHeader);
+            await Test("RTSP talk permissions isolate actors from viewers", RtspReliabilityTests.ActorScopedTalk);
+            await Test("talk retries only fresh speech after transient failure", TalkRecoveryTests.FreshSpeechAfterTransientFailure);
+            await Test("native decoder failures recover", TalkRecoveryTests.NativeDecoderFailureRecovery);
+            await Test("unsupported talk does not retry", TalkRecoveryTests.UnsupportedTalkDoesNotRetry);
+            await Test("PTZ discovery ownership shutdown and control capability isolation", ReliabilityPtzControlTests.RunAsync);
+            await Test("descriptions use fresh video and audio across source epochs", StreamReliabilityTests.FreshDescriptionsAcrossEpochs);
+            await Test("publication ordering and byte budgets preserve raw chunks", StreamReliabilityTests.PublicationOrderAndByteBudgets);
+            await Test("alarm subscriptions recover independently from transient failures", StreamReliabilityTests.AlarmSubscriptionRecovery);
+            await Test("low frame rates and camera certificate pins", StreamReliabilityTests.LowFrameRatesAndCertificatePinning);
+            await Test("persistent camera replay survives restart and partial append", StreamReliabilityTests.DurableReplayAndRecovery);
+            await Test("single and dual quality preserve one device identity and strict headless configuration", () => DualStreamContractTests.Configurations(example));
+            await Test("dual-quality configuration rejects mismatched codecs and unsafe conversions", () => DualStreamContractTests.InvalidConfigurations(example));
+            await Test("main and low streams have independent media with one event owner", () => DualStreamContractTests.IndependentStreams(example));
+            await Test("low RTSP mount preserves authenticated main aliases and playout", () => DualStreamContractTests.MainMounts(example));
+            await Test("low converter input retains raw audio and propagates source lifecycle", DualStreamContractTests.AudioAndSourceLifecycle);
+            await Test("native H264 display metadata preserves SPS syntax", H264SampleAspectRatioTests.SyntaxPreservation);
+            await Test("native H264 display metadata rejects malformed inputs", H264SampleAspectRatioTests.MalformedInputs);
+            await Test("native H264 display metadata preserves actual decoded pixels", H264SampleAspectRatioTests.RealFfmpegPixelPreservation);
+            await Test("optional native LQ display metadata isolates failure and preserves audio/lifecycle", LowQualityDisplayMetadataTests.IsolationAndRecovery);
+            await Test("native LQ display metadata configuration remains narrowly scoped", LowQualityDisplayMetadataTests.ConfigurationGuards);
+            await Test("optional low warmup and outages retain main health without hiding main failure", () => DualStreamContractTests.OptionalLowHealth(example));
+            await Test("incremental HEVC output preserves parameter sets and access-unit boundaries", LowQualityVideoTranscoderTests.IncrementalHevcBoundaries);
+            await Test("low encoder uses pipe-only input and bounded CPU threads", LowQualityVideoTranscoderTests.EncoderIsolation);
+            await Test("explicit hardware and scaled software encoders reject fallback and unsafe devices", LowQualityVideoTranscoderTests.HardwareAndScaledEncoderIsolation);
+            await Test("actual ffmpeg low conversion decodes reconnects and preserves the main stream", LowQualityVideoTranscoderTests.RealFfmpegReconnectAndShutdown);
+            await Test("actual scaled low conversion matches HEVC dimensions and preserves main/reconnect", LowQualityVideoTranscoderTests.RealFfmpegScaledReconnectAndShutdown);
+            await Test("one-to-one low quality retains night cadence and rejects camera clock jumps", LowQualityCadenceTests.SourceCadenceAndBurstClock);
+            await Test("real night encoder preserves source duration, HEVC pictures and original AAC", LowQualityCadenceTests.RealNightEncoderAndAacPreservation);
+            await Test("real TCP burst encoder retains positive native millisecond durations and original AAC", LowQualityCadenceTests.RealTcpBurstEncoderAndNativeMilliseconds);
+            await Test("exact video routing preserves legacy and unsolicited message watches", SharedBaichuanStreamTests.MessageNumberRouting);
+            await Test("successful preview stop releases only its binary command number", SharedBaichuanStreamTests.StopAcknowledgementReleasesBinaryMode);
+            await Test("shared login demuxes both qualities and retries low without stopping main", SharedBaichuanStreamTests.OneLoginDemuxAndLowRetry);
             await Test("shipped pilot config loads strictly without enabling recording or camera controls", () =>
             {
                 var pilot = NeolinkConfig.Load(example, strict: true);
@@ -143,13 +325,22 @@ internal static class ContractTests
                 Assert(diagnostics.Length == 2, "metrics lost a profile");
                 var fields = new HashSet<string>(["profile", "codec", "width", "height", "incomingFrames", "incomingVideoBytes", "lastVideoAgeMs", "maxArrivalGapMs", "sourceUptimeSeconds", "videoReady", "liveVideo", "authenticationFailed", "viewers",
                     "totalAccessUnits", "multiAccessUnitBuffers", "maxAccessUnitsPerBuffer", "maxVideoBufferBytes", "keyframeCount", "keyframeAgeMs", "gopBytes", "gopPackets", "gopBuffered", "gopCacheEvictions",
-                    "lastCameraTimestampDeltaUs", "maxCameraTimestampDeltaUs", "cameraTimestampZeroDeltas", "cameraTimestampBackwardCandidates"]);
+                    "lastCameraTimestampDeltaUs", "maxCameraTimestampDeltaUs", "cameraTimestampZeroDeltas", "cameraTimestampBackwardCandidates",
+                    "sourceEpoch", "descriptionAvailable", "audio"]);
                 foreach (var item in diagnostics)
                 {
                     Assert(fields.SetEquals(item.EnumerateObject().Select(x => x.Name)), "unexpected or missing stream metric fields");
                     Assert(item.GetProperty("lastVideoAgeMs").ValueKind == JsonValueKind.Null, "cold source must not pretend to have arrived recently");
                     Assert(item.GetProperty("incomingFrames").GetInt64() == 0 && item.GetProperty("incomingVideoBytes").GetInt64() == 0, "cold source counters must start at zero");
+                    var audio = item.GetProperty("audio");
+                    Assert(new HashSet<string>(["available","isAac","sampleRate","channels","metadataCurrent"])
+                        .SetEquals(audio.EnumerateObject().Select(x => x.Name)), "audio diagnostics exposes unexpected fields");
+                    Assert(item.GetProperty("sourceEpoch").GetInt64() == 0 && !item.GetProperty("descriptionAvailable").GetBoolean()
+                        && !audio.GetProperty("available").GetBoolean() && !audio.GetProperty("metadataCurrent").GetBoolean(),
+                        "cold diagnostic snapshot claims current media");
                 }
+                Assert(new HashSet<string>(["version","runtime"]).SetEquals(root.GetProperty("build").EnumerateObject().Select(x=>x.Name)),
+                    "build diagnostics exposes unexpected fields");
                 Assert(!body.Contains(User) && !body.Contains(Password) && !body.Contains(config.Mac) && !body.Contains(config.Uuid)
                     && !body.Contains(config.AdvertisedHost) && !body.Contains(config.Name) && !body.Contains(main.Name), "metrics exposes credentials or endpoint identities");
             });
@@ -189,6 +380,24 @@ internal static class ContractTests
             await Test("GOP config defaults aliases and source arrival metadata are correct", GopPlayoutWireTests.ConfigAndMetadata);
             await Test("actual RTSP aliases normalize AU timestamps markers and FU bytes", GopPlayoutWireTests.WireAliasesAndPictures);
             await Test("default RTSP is unchanged and GOP mounts explicitly refuse audio", GopPlayoutWireTests.DefaultAndAudioScope);
+            await Test("optional GOP AAC preserves sample timing and common RTCP mapping", GopAacContractTests.TimelineAndRtcp);
+            await Test("optional GOP AAC bounds retention and recovers from loss/epochs", GopAacContractTests.LossEpochAndBounds);
+            await Test("optional GOP AAC configuration and profiles reflect current source metadata", GopAacContractTests.ConfigAndObservedProfiles);
+            await Test("optional GOP AAC actual RTSP preserves NAL/AAC bytes and common reports", GopAacContractTests.WirePayloadsAndSynchronization);
+            await Test("audio backchannel rejects malformed RTP and unknown codecs", AudioBackchannelContractTests.StrictRtp);
+            await Test("audio backchannel opens the speaker only for valid audio and drops stale sessions", AudioBackchannelContractTests.LazySpeakerLifecycle);
+            await Test("Protect control schemas require auth, preserve AI source fields, and expose only real PTZ", ProtectCameraControlTests.RunAsync);
+            await Test("Baichuan AI preserves full XML, scopes types and rejects invalid or failed 343 writes", BaichuanAiControlTests.RunAsync);
+            await Test("Baichuan image/audio/MD/OSD reuse live sessions and preserve full settings with readback", BaichuanFallbackControlTests.RunAsync);
+            await Test("Protect initial AI-zone discovery is truthful bounded and cancellable", ProtectZoneDiscoveryTests.RunAsync);
+            await Test("ONVIF audio matches observed AAC and preserves GOP/default profile scope", OnvifAudioMetadataTests.HonestProfileScope);
+            await Test("ONVIF audio clears stale epochs and rejects unsupported codec metadata", OnvifAudioMetadataTests.SourceEpochAndUnsupportedFormats);
+            await Test("native UDP talk filters console sources and closes idle speaker sessions", NativeTalkUdpTests.FilterAndLazyHandshake);
+            await Test("native AAC UDP talk decodes real speech to PCM before EOF", NativeTalkUdpTests.LiveAacDecodeAndStop);
+            await Test("audio listen preserves actual AAC units and decoded samples", ProtectAudioListenTests.AacBytesAndDecode);
+            await Test("protected audio HTTP preserves GOP source and closes on client disconnect", ProtectAudioListenTests.HttpAuthPayloadAndDisconnect);
+            await Test("audio listen bounds queues, times out slow writers and clears old source epochs", ProtectAudioListenTests.BoundBackpressureAndEpoch);
+            await Test("ADPCM audio listen encodes AAC only during the active session", ProtectAudioListenTests.PcmOnDemandAac);
             await Test("actual RTSP PAUSE TEARDOWN and source resets cancel delayed old GOPs", GopPlayoutWireTests.CancelAndEpochRecovery);
             await Test("actual RTSP queue gaps discard partial GOPs and recover at a fresh keyframe", GopPlayoutWireTests.QueueGapRecovery);
             await Test("actual RTSP retains all encoded pictures across a twelve-second raw clock jump", GopPlayoutWireTests.RawClockJumpPictures);

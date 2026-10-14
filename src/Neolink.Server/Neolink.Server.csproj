@@ -11,7 +11,7 @@
          log, /api/features and the web UI. Release builds override it with the
          git tag (docker.yml passes -p:Version), so tagging vX.Y.Z is what
          increments the released version. -->
-    <Version>1.1.0</Version>
+    <Version>1.2.0</Version>
     <InvariantGlobalization>true</InvariantGlobalization>
     <ServerGarbageCollection>false</ServerGarbageCollection>
     <TieredPgo>true</TieredPgo>
@@ -29,7 +29,7 @@
 
   <!-- Ship the user's config (and the template) next to the built executable -->
   <ItemGroup>
-    <None Include="config.json" CopyToOutputDirectory="PreserveNewest" Condition="Exists('config.json')" />
+    <None Include="config.json" CopyToOutputDirectory="PreserveNewest" Condition="Exists('config.json') and '$(ExcludePrivateConfig)' != 'true'" />
     <None Include="config.example.json" CopyToOutputDirectory="PreserveNewest" />
     <None Include="sample_config.toml" CopyToOutputDirectory="PreserveNewest" Condition="Exists('sample_config.toml')" />
   </ItemGroup>

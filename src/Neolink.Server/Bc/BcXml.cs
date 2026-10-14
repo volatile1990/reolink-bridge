@@ -133,7 +133,7 @@ public sealed class BcXmlBody
                 new XAttribute("version", XmlVersion),
                 new XElement("channelId", Preview.ChannelId),
                 new XElement("handle", Preview.Handle),
-                new XElement("streamType", Preview.StreamType)));
+                Preview.StreamType == null ? null : new XElement("streamType", Preview.StreamType)));
         }
         if (PtzControl != null)
         {
@@ -233,7 +233,7 @@ public sealed class PreviewXml
 {
     public byte ChannelId;
     public uint Handle;
-    public string StreamType = "mainStream";
+    public string? StreamType = "mainStream";
 }
 
 /// <summary>PTZ movement command. Commands: up, down, left, right, stop.</summary>

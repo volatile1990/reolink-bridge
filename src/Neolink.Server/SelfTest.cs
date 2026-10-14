@@ -2667,13 +2667,15 @@ public static class SelfTest
         Test("viewer list: RTSP sessions list while playing, naming only a verified user", () =>
         {
             var viewers = new Streaming.ViewerRegistry();
+            var doorHub = new Streaming.StreamHub("front door mainStream");
+            var yardHub = new Streaming.StreamHub("yard subStream");
             var server = new Rtsp.RtspServer(new Dictionary<string, string> { ["alice"] = "pw" }) { Viewers = viewers };
             server.AddMount(new Rtsp.RtspMount
             {
-                Path = "/door", Hub = new Streaming.StreamHub("front door mainStream"),
+                Path = "/door", Hub = doorHub,
                 PermittedUsers = new HashSet<string> { "alice" },
             });
-            server.AddMount(new Rtsp.RtspMount { Path = "/yard", Hub = new Streaming.StreamHub("yard subStream") });
+            server.AddMount(new Rtsp.RtspMount { Path = "/yard", Hub = yardHub });
             int port = FreeTcpPort();
             using var serverCts = new CancellationTokenSource();
             _ = Task.Run(() => server.RunAsync("127.0.0.1", port, serverCts.Token));
@@ -2700,6 +2702,12 @@ public static class SelfTest
             // SETUP (+ PLAY when allowed) one video track; returns the SETUP status.
             int Play(System.Net.Sockets.TcpClient tcp, string path, string? user, string? pass)
             {
+                // A playable session requires current video parameters. Keep this
+                // viewer/authentication test independent of camera availability.
+                var hub = path == "/door" ? doorHub : yardHub;
+                hub.PublishVideo(new VideoFrame(VideoCodec.H264, true, 0, null,
+                    new byte[] { 0, 0, 0, 1, 0x67, 66, 0, 30, 0, 0, 1, 0x68, 0xCE, 0x3C, 0x80,
+                                 0, 0, 0, 1, 0x65, 5, 5, 5 }));
                 var ns = tcp.GetStream();
                 string auth = user == null ? "" :
                     $"Authorization: Basic {Convert.ToBase64String(Encoding.UTF8.GetBytes($"{user}:{pass}"))}\r\n";

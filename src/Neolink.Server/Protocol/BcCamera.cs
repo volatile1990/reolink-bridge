@@ -239,7 +239,9 @@ public sealed class BcCamera : IBcCamera
     public async Task StartVideoAsync(StreamKind stream, ChannelWriter<byte[]> binaryOut,
         Func<bool>? stallTolerable, CancellationToken ct)
     {
-        using var sub = _conn.Subscribe(BcConstants.MsgIdVideo);
+        ushort videoNumber = NewMessageNum();
+        // Older kit cameras report StreamType=0 for both qualities. The request number is the media discriminator.
+        using var sub = _conn.Subscribe(BcConstants.MsgIdVideo, videoNumber);
 
         // Stream codes/handles as used by the official clients
         byte streamCode = stream == StreamKind.Sub ? (byte)1 : (byte)0;
@@ -263,7 +265,7 @@ public sealed class BcCamera : IBcCamera
             {
                 MsgId = BcConstants.MsgIdVideo,
                 ChannelId = _channelId,
-                MsgNum = NewMessageNum(),
+                MsgNum = videoNumber,
                 StreamType = streamCode,
                 ResponseCode = 0,
                 Class = BcConstants.ClassModern,
@@ -277,10 +279,11 @@ public sealed class BcCamera : IBcCamera
                     StreamType = streamName,
                 },
             });
-        await _conn.SendAsync(startVideo, ct).ConfigureAwait(false);
-
+        bool requested = false;
         try
         {
+            await _conn.SendAsync(startVideo, ct).ConfigureAwait(false);
+            requested = true;
             bool holding = false;
             while (!ct.IsCancellationRequested)
             {
@@ -312,6 +315,8 @@ public sealed class BcCamera : IBcCamera
                     holding = false;
                     Log.Debug($"{_logTag}: privacy mode off — video resumed");
                 }
+                if (msg.Binary == null && msg.Meta.ResponseCode is not (0 or 200 or 201))
+                    throw new BcProtocolException($"Camera refused video stream {stream} (response code {msg.Meta.ResponseCode})");
                 if (msg.Binary is { Length: > 0 } bin)
                     await binaryOut.WriteAsync(bin, ct).ConfigureAwait(false);
             }
@@ -319,7 +324,26 @@ public sealed class BcCamera : IBcCamera
         finally
         {
             binaryOut.TryComplete();
+            // A substream retry must release only its own handle and leave the main preview/login alive.
+            if (requested && stream == StreamKind.Sub)
+            {
+                using var stop = new CancellationTokenSource(TimeSpan.FromSeconds(2));
+                try { await StopVideoAsync(videoNumber, streamCode, handle, stop.Token).ConfigureAwait(false); }
+                catch { } // disconnects and older firmware can omit the stop acknowledgement
+            }
         }
+    }
+
+    private async Task StopVideoAsync(ushort videoNumber, byte streamCode, uint handle, CancellationToken ct)
+    {
+        const uint videoStop = 4;
+        using var reply = _conn.Subscribe(videoStop, videoNumber);
+        await _conn.SendAsync(BcMessage.FromXml(new BcMeta
+        {
+            MsgId = videoStop, ChannelId = _channelId, MsgNum = videoNumber,
+            StreamType = streamCode, Class = BcConstants.ClassModern
+        }, new BcXmlBody { Preview = new PreviewXml { ChannelId = _channelId, Handle = handle, StreamType = null } }), ct).ConfigureAwait(false);
+        await reply.ReceiveAsync(TimeSpan.FromSeconds(2), ct).ConfigureAwait(false);
     }
 
     /// <summary>

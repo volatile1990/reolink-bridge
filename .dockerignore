@@ -2,8 +2,11 @@
 .github
 **/bin
 **/obj
+**/__pycache__
+*.pyc
 artifacts
 secrets
+state
 diagnostics
 recordings
 snapshots

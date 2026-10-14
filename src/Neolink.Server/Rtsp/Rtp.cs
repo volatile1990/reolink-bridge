@@ -14,6 +14,10 @@ public sealed class RtpPacketizer
     public byte PayloadType { get; }
     public uint Ssrc { get; }
     public ushort Seq { get; private set; }
+    internal uint SentPackets { get; private set; }
+    internal uint SentPayloadOctets { get; private set; }
+    internal void RecordSent(ReadOnlySpan<byte> packet)
+    { if (packet.Length >= 12) { SentPackets = unchecked(SentPackets + 1); SentPayloadOctets = unchecked(SentPayloadOctets + (uint)(packet.Length - 12)); } }
 
     public RtpPacketizer(byte payloadType)
     {

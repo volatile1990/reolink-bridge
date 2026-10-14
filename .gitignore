@@ -1,6 +1,8 @@
 # Build output and editor state
 **/bin/
 **/obj/
+**/__pycache__/
+*.py[cod]
 artifacts/
 .vs/
 .vscode/
@@ -9,6 +11,7 @@ artifacts/
 
 # Local deployment files, credentials and runtime state
 secrets/
+state/
 .env
 .env.*
 !.env.example

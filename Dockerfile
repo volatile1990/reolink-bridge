@@ -1,5 +1,5 @@
 # syntax=docker/dockerfile:1
-FROM mcr.microsoft.com/dotnet/sdk:10.0 AS build
+FROM mcr.microsoft.com/dotnet/sdk:10.0-noble AS build
 WORKDIR /src
 
 COPY nuget.config ./
@@ -8,20 +8,28 @@ COPY src/Neolink.WebClient/Neolink.WebClient.csproj src/Neolink.WebClient/
 RUN dotnet restore src/Neolink.Server/Neolink.Server.csproj
 
 COPY src/ ./src/
+ARG BRIDGE_VERSION=1.2.0
+ARG BRIDGE_SOURCE_REVISION=unknown
 RUN dotnet publish src/Neolink.Server/Neolink.Server.csproj \
     --configuration Release --no-restore --output /out \
-    -p:UseAppHost=false -p:PublishSingleFile=false -p:SelfContained=false
+    -p:UseAppHost=false -p:PublishSingleFile=false -p:SelfContained=false \
+    -p:Version=${BRIDGE_VERSION} -p:SourceRevisionId=${BRIDGE_SOURCE_REVISION}
 
 # The upstream project references Microsoft.AspNetCore.App, even in headless mode.
-FROM mcr.microsoft.com/dotnet/aspnet:10.0 AS runtime
+FROM mcr.microsoft.com/dotnet/aspnet:10.0-noble AS runtime
 USER root
-RUN apt-get update \
-    && apt-get install --yes --no-install-recommends curl \
+RUN sed -i '/^Components:/ { / universe/! s/$/ universe/; / multiverse/! s/$/ multiverse/; }' /etc/apt/sources.list.d/ubuntu.sources \
+    && apt-get update \
+    && apt-get install --yes --no-install-recommends curl ffmpeg intel-media-va-driver-non-free vainfo \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
 COPY --from=build /out/ ./
 COPY LICENSE UPSTREAM.md ./
+ARG BRIDGE_VERSION=1.2.0
+ARG BRIDGE_SOURCE_REVISION=unknown
 LABEL org.opencontainers.image.source="https://github.com/volatile1990/reolink-bridge" \
+      org.opencontainers.image.version="${BRIDGE_VERSION}" \
+      org.opencontainers.image.revision="${BRIDGE_SOURCE_REVISION}" \
       org.opencontainers.image.licenses="AGPL-3.0-only" \
       org.opencontainers.image.description="Headless Baichuan to authenticated RTSP and ONVIF bridge"
 

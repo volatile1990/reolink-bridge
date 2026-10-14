@@ -10,20 +10,21 @@
 using System.Net.Sockets;
 using System.Text;
 using System.Threading.Channels;
+using Neolink.Streaming;
 using Neolink.Bc;
 
 namespace Neolink.Protocol;
 
 /// <summary>
 /// A TCP connection to a camera. Handles framing and routes incoming messages to
-/// subscribers by message ID. One subscriber per message ID at a time.
+/// subscribers by message ID and optional command number. Exact subscriptions take precedence over ID-only watches.
 /// </summary>
 public sealed class BcConnection : IBcConnection
 {
     private readonly TcpClient _tcp;
     private readonly NetworkStream _stream;
     private readonly BufferedStream _readStream; // read side only; writes go to _stream directly
-    private readonly Dictionary<uint, Channel<BcMessage>> _subscribers = new();
+    private readonly Dictionary<(uint Id, ushort? Number), Channel<BcMessage>> _subscribers = new();
     private readonly HashSet<uint> _reportedUnhandled = new();
     private readonly object _subGate = new();
     private readonly SemaphoreSlim _sendLock = new(1, 1);
@@ -88,11 +89,12 @@ public sealed class BcConnection : IBcConnection
                 Channel<BcMessage>? target = null;
                 lock (_subGate)
                 {
-                    _subscribers.TryGetValue(msg.Meta.MsgId, out target);
+                    if (!_subscribers.TryGetValue((msg.Meta.MsgId, msg.Meta.MsgNum), out target))
+                        _subscribers.TryGetValue((msg.Meta.MsgId, null), out target);
                 }
                 if (target != null)
                 {
-                    // Unbounded channel: never blocks. Video frames are consumed promptly downstream.
+                    // Bounded by bytes and messages; overflow closes only this subscription for controlled recovery.
                     target.Writer.TryWrite(msg);
                 }
                 else
@@ -140,24 +142,24 @@ public sealed class BcConnection : IBcConnection
         return " xml=" + (s.Length > 400 ? s[..400] + "…" : s);
     }
 
-    public BcSubscription Subscribe(uint msgId)
+    public BcSubscription Subscribe(uint msgId) => SubscribeCore(msgId, null);
+    public BcSubscription Subscribe(uint msgId, ushort messageNumber) => SubscribeCore(msgId, messageNumber);
+
+    private BcSubscription SubscribeCore(uint msgId, ushort? messageNumber)
     {
-        var channel = Channel.CreateUnbounded<BcMessage>(new UnboundedChannelOptions
-        {
-            SingleReader = true,
-            SingleWriter = true,
-        });
+        var channel = new ByteBoundedChannel<BcMessage>(16 * 1024 * 1024, 1024,
+            msg => checked((msg.Binary?.Length ?? 0) + (msg.Xml?.Serialize().Length ?? 0) + 128));
         lock (_subGate)
         {
-            if (!_subscribers.TryAdd(msgId, channel))
-                throw new InvalidOperationException($"Simultaneous subscription to message ID {msgId}");
+            if (!_subscribers.TryAdd((msgId, messageNumber), channel))
+                throw new InvalidOperationException($"Simultaneous subscription to message ID {msgId}, command number {messageNumber}");
         }
-        return new BcSubscription(msgId, channel.Reader, () => Unsubscribe(msgId));
+        return new BcSubscription(msgId, channel.Reader, () => Unsubscribe(msgId, messageNumber));
     }
 
-    internal void Unsubscribe(uint msgId)
+    internal void Unsubscribe(uint msgId, ushort? messageNumber = null)
     {
-        lock (_subGate) { _subscribers.Remove(msgId); }
+        lock (_subGate) { _subscribers.Remove((msgId, messageNumber)); }
     }
 
     public async Task SendAsync(BcMessage msg, CancellationToken ct)

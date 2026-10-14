@@ -22,5 +22,7 @@ jobs:
         run: dotnet run --project src/Neolink.Server/Neolink.Server.csproj --configuration Release --no-build -- selftest
       - name: Run Protect contract tests
         run: dotnet run --project tests/Neolink.ProtectTests/Neolink.ProtectTests.csproj --configuration Release
+      - name: Test read-only diagnostics and release tools
+        run: python3 -m unittest discover -s tests/tools -v
       - name: Build container
         run: docker build --tag reolink-bridge:ci .

@@ -20,6 +20,7 @@ public sealed class OnvifPtzCamera
     /// <summary>Bumped by every PTZ command, from here or any other UI; a watchdog stops only its own move.</summary>
     private long _generation;
     private volatile bool _moving;
+    private int _stopping;
     private volatile CameraCapabilities? _caps;
     private readonly object _capsLock = new();
     private Task? _capsRead;
@@ -47,6 +48,9 @@ public sealed class OnvifPtzCamera
 
     /// <summary>Whether the head is moving as far as this endpoint knows.</summary>
     internal bool Moving => _moving;
+    internal long OwnershipGeneration => Interlocked.Read(ref _generation);
+    private void RequireRunning()
+    { if (Volatile.Read(ref _stopping) != 0) throw new CameraOfflineException(Name); }
 
     internal (uint Width, uint Height) Size() =>
         _size?.Invoke() is { Width: > 0, Height: > 0 } s ? s : (1920, 1080);
@@ -71,6 +75,9 @@ public sealed class OnvifPtzCamera
 
     /// <summary>The read in flight, for tests.</summary>
     internal Task CapabilitiesRead => _capsRead ?? Task.CompletedTask;
+    /// <summary>A bridge caller may supply freshly read capabilities before emitting any PTZ metadata.</summary>
+    internal void ObserveCapabilities(CameraCapabilities capabilities)
+    { if (!capabilities.Provisional) _caps = capabilities; }
 
     private async Task ReadCapabilitiesAsync()
     {
@@ -111,12 +118,59 @@ public sealed class OnvifPtzCamera
         await _moveGate.WaitAsync(ct).ConfigureAwait(false);
         try
         {
+            if (command != "stop") RequireRunning();
             await SendAsync(command, speed, ct).ConfigureAwait(false);
             var generation = Interlocked.Increment(ref _generation);
             _moving = command != "stop";
             if (_moving) _ = WatchdogAsync(generation, timeout, attempt: 1);
         }
         finally { _moveGate.Release(); }
+    }
+
+    /// <summary>A bounded button nudge. Stop is attempted even when sending the direction fails or
+    /// the caller cancels; the generation guard never stops a later operator's move.</summary>
+    internal async Task<long?> NudgeAsync(string command, float speed, TimeSpan duration, CancellationToken ct,
+        long? expectedGeneration = null)
+    {
+        long generation;
+        long? completedGeneration = null;
+        await _moveGate.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            RequireRunning();
+            if (expectedGeneration != null && Interlocked.Read(ref _generation) != expectedGeneration) return null;
+            generation = Interlocked.Increment(ref _generation);
+            _moving = true;
+            _ = WatchdogAsync(generation, duration + TimeSpan.FromMilliseconds(250), attempt: 1);
+        }
+        finally { _moveGate.Release(); }
+        try
+        {
+            await _moveGate.WaitAsync(ct).ConfigureAwait(false);
+            try
+            {
+                if (Interlocked.Read(ref _generation) != generation) return null;
+                await SendAsync(command, speed, ct).ConfigureAwait(false);
+            }
+            finally { _moveGate.Release(); }
+            await Task.Delay(duration, ct).ConfigureAwait(false);
+        }
+        finally
+        {
+            using var stopDeadline = new CancellationTokenSource(TimeSpan.FromSeconds(3));
+            await _moveGate.WaitAsync(stopDeadline.Token).ConfigureAwait(false);
+            try
+            {
+                if (Interlocked.Read(ref _generation) == generation)
+                {
+                    await SendAsync("stop", 32, stopDeadline.Token).ConfigureAwait(false);
+                    completedGeneration = Interlocked.Increment(ref _generation);
+                    _moving = false;
+                }
+            }
+            finally { _moveGate.Release(); }
+        }
+        return completedGeneration;
     }
 
     private async Task SendAsync(string command, float speed, CancellationToken ct)
@@ -138,6 +192,7 @@ public sealed class OnvifPtzCamera
     /// <summary>How often a held zoom steps the lens; each step is an exact position, all Reolink takes.</summary>
     private static readonly TimeSpan ZoomTick = TimeSpan.FromMilliseconds(250);
     private CancellationTokenSource? _zoom;
+    private Task? _zoomTask;
     private volatile bool _zooming;
 
     /// <summary>Whether a zoom is under way.</summary>
@@ -154,11 +209,13 @@ public sealed class OnvifPtzCamera
         await _moveGate.WaitAsync(ct).ConfigureAwait(false);
         try
         {
-            var mine = new CancellationTokenSource(timeout);
+            RequireRunning();
             StopZoom();
+            if (_zoomTask != null) await _zoomTask.WaitAsync(ct).ConfigureAwait(false);
+            var mine = new CancellationTokenSource(timeout);
             _zoom = mine;
             _zooming = true;
-            _ = ZoomLoopAsync(mine, zoom, Math.Sign(velocity) * step);
+            _zoomTask = ZoomLoopAsync(mine, zoom, Math.Sign(velocity) * step);
         }
         finally { _moveGate.Release(); }
     }
@@ -195,6 +252,22 @@ public sealed class OnvifPtzCamera
         catch (ObjectDisposedException) { /* it had just finished */ }
     }
 
+    internal async Task<bool> SetLensPositionAsync(string command, uint position, CancellationToken ct,
+        long? expectedGeneration = null)
+    {
+        await _moveGate.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            RequireRunning();
+            if (expectedGeneration != null && Interlocked.Read(ref _generation) != expectedGeneration) return false;
+            StopZoom();
+            if (_zoomTask != null) await _zoomTask.WaitAsync(ct).ConfigureAwait(false);
+            await Control.SetZoomFocusAsync(command, position, ct).ConfigureAwait(false);
+            return true;
+        }
+        finally { _moveGate.Release(); }
+    }
+
     // ------------------------------------------------------------------ presets
 
     private volatile IReadOnlyList<PtzPresetInfo>? _presets;
@@ -219,7 +292,9 @@ public sealed class OnvifPtzCamera
         await _moveGate.WaitAsync(ct).ConfigureAwait(false);
         try
         {
+            RequireRunning();
             StopZoom();
+            if (_zoomTask != null) await _zoomTask.WaitAsync(ct).ConfigureAwait(false);
             Sending.Value = this; // this preset move is not another UI's
             await Control.PtzToPresetAsync(id, ct).ConfigureAwait(false);
             Interlocked.Increment(ref _generation); // retires the watchdog of an earlier move
@@ -270,5 +345,30 @@ public sealed class OnvifPtzCamera
             await MoveAsync("stop", 32, OnvifPtzServer.DefaultMoveTimeout, limit.Token).ConfigureAwait(false);
         }
         catch (Exception ex) { Log.Debug($"{Name}: ONVIF PTZ stop on shutdown failed: {Log.Flatten(ex)}"); }
+    }
+
+    /// <summary>Retires every shared REST/ONVIF owner while the camera session is
+    /// still alive. No further actuator request may start after this point.</summary>
+    internal async Task ShutdownAsync()
+    {
+        Interlocked.Exchange(ref _stopping, 1);
+        StopZoom();
+        using var budget = new CancellationTokenSource(TimeSpan.FromSeconds(3));
+        try
+        {
+            await _moveGate.WaitAsync(budget.Token).ConfigureAwait(false);
+            try
+            {
+                if (_zoomTask != null) await _zoomTask.WaitAsync(budget.Token).ConfigureAwait(false);
+                if (_moving)
+                {
+                    await SendAsync("stop", 32, budget.Token).ConfigureAwait(false);
+                    _moving = false;
+                }
+                Interlocked.Increment(ref _generation);
+            }
+            finally { _moveGate.Release(); }
+        }
+        catch (Exception) { Log.Warn($"{Name}: PTZ stop on shutdown did not complete within its budget"); }
     }
 }

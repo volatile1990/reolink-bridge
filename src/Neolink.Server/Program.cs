@@ -60,7 +60,7 @@ for (int i = 0; i < argList.Count; i++)
         case "--demo":
             demoMode = true;
             break;
-        case "rtsp" or "selftest" or "probe":
+        case "rtsp" or "selftest" or "probe" or "streamprobe":
             command = a;
             break;
         default:
@@ -178,6 +178,9 @@ else
 // lands while it is awake, instead of waiting for the background sweep's next
 // 15-minute window to happen to coincide with a wake. Add --verbose for the
 // full ability-table dump.
+if (command == "streamprobe")
+    return await ProtectStreamProbe.RunAsync(config);
+
 if (command == "probe")
 {
     var targets = config.Cameras.Where(c => !c.IsGenericRtsp).ToList();

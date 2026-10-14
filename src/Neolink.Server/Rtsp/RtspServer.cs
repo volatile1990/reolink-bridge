@@ -2,11 +2,36 @@
 // Licensed under the GNU Affero General Public License v3.0; see the LICENSE file
 // in the repository root.
 using System.Net;
+using System.Collections.Concurrent;
 using System.Net.Sockets;
 using System.Text;
 using Neolink.Streaming;
 
 namespace Neolink.Rtsp;
+
+/// <summary>Local resource budgets. Media activity keeps a playing connection alive.</summary>
+public sealed record RtspResourceLimits
+{
+    public int MaxConnections { get; init; } = 128;
+    public int MaxConnectionsPerPeer { get; init; } = 32;
+    public int MaxSessionsPerConnection { get; init; } = 8;
+    public int MaxRequestBodyBytes { get; init; } = 64 * 1024;
+    public int MaxHeaderBytes { get; init; } = 64 * 1024;
+    public int MaxHeaderCount { get; init; } = 64;
+    public TimeSpan RequestDeadline { get; init; } = TimeSpan.FromSeconds(30);
+    public TimeSpan ConnectionIdleTimeout { get; init; } = TimeSpan.FromSeconds(120);
+    public TimeSpan SessionIdleTimeout { get; init; } = TimeSpan.FromSeconds(60);
+    internal TimeSpan WatchInterval { get; init; } = TimeSpan.FromMilliseconds(250);
+
+    internal void Validate()
+    {
+        if (MaxConnections < 1 || MaxConnectionsPerPeer < 1 || MaxSessionsPerConnection < 1
+            || MaxRequestBodyBytes < 0 || MaxHeaderBytes < 128 || MaxHeaderCount < 1
+            || RequestDeadline <= TimeSpan.Zero || ConnectionIdleTimeout <= TimeSpan.Zero
+            || SessionIdleTimeout <= TimeSpan.Zero || WatchInterval <= TimeSpan.Zero)
+            throw new ArgumentException("Invalid RTSP resource limits");
+    }
+}
 
 public sealed class RtspMount
 {
@@ -18,6 +43,10 @@ public sealed class RtspMount
     /// <summary>Camera control that backs the RTSP audio backchannel (two-way talk)
     /// for this mount, or null when talk is disabled or the source has no speaker.</summary>
     public ICameraControl? Talk { get; set; }
+    /// <summary>Optional speaker-operation subset of already authenticated mount users.</summary>
+    public HashSet<string>? TalkPermittedUsers { get; init; }
+    public bool TalkAllowedFor(string? user) => TalkPermittedUsers == null
+        || user != null && TalkPermittedUsers.Contains(user);
 
     /// <summary>The DEFAULT audio for sessions on this mount: true serves
     /// transcoded Opus, false the camera's original track. Seeded from the
@@ -26,6 +55,11 @@ public sealed class RtspMount
     public bool Opus { get; init; }
     /// <summary>Complete-GOP video-only output normalization; disabled for existing mounts.</summary>
     public bool GopPlayout { get; init; }
+    public bool GopAudio { get; init; }
+    internal bool GopAacAvailable => GopAudio && Hub is StreamHub actual && Hub.LiveVideo
+        && Hub.GetVideoDiagnostics().LastVideoAgeMs is >= 0 and <= 5000
+        && actual.AudioMetadataSourceEpoch == Hub.SourceEpoch && actual.LastAudioAgeMs is >= 0 and <= 5000
+        && actual.Audio is { IsAac: true, SampleRate: >= 8000 and <= 96000, Channels: >= 1 and <= 2, AudioSpecificConfig.Length: >= 2 };
     /// <summary>Additional startup reserve after the first complete GOP has arrived.</summary>
     public int PlayoutDelayMs { get; init; }
 }
@@ -35,11 +69,31 @@ public sealed class RtspServer
 {
     /// <summary>Bridge mode accepts interleaved RTP over TCP only; never opens dynamic UDP media ports.</summary>
     public bool TcpOnly { get; init; }
+    public RtspResourceLimits ResourceLimits { get; init; } = new();
+    internal TimeProvider ResourceTimeProvider { get; init; } = TimeProvider.System;
+    internal int ListeningPort { get; private set; }
+    private readonly object _connectionGate = new();
+    private readonly Dictionary<long, (TcpClient Client, string Peer, Task Completion)> _connections = new();
+    private long _nextConnection;
+    internal int ActiveConnectionCount { get { lock (_connectionGate) return _connections.Count; } }
     // Injected only by deterministic local contract tests; each pump owns its own timeline.
     internal TimeProvider PlayoutTimeProvider { get; init; } = TimeProvider.System;
     internal Func<TimeSpan, CancellationToken, Task>? PlayoutWaiter { get; init; }
     private readonly Dictionary<string, RtspMount> _mounts = new(StringComparer.OrdinalIgnoreCase);
     private readonly IReadOnlyDictionary<string, string> _users;
+    private readonly ConcurrentDictionary<string, GopAacDiagnostics> _gopAacSessions = new();
+    private GopAacDiagnostics? _lastGopAac;
+    internal void ObserveGopAac(string session, GopAacDiagnostics value, bool completed = false)
+    {
+        if (completed) { _gopAacSessions.TryRemove(session, out _); _lastGopAac = value; }
+        else _gopAacSessions[session] = value;
+    }
+    public object GopAudioDiagnostics() => new
+    {
+        activeSessions = _gopAacSessions.Count,
+        timeBasis = "arrival-estimate-and-aac-samples", captureSynchronizationVerified = false,
+        sessions = _gopAacSessions.Values.ToArray(), lastCompleted = _lastGopAac
+    };
 
     public RtspServer(IReadOnlyDictionary<string, string> users)
     {
@@ -79,9 +133,11 @@ public sealed class RtspServer
 
     public async Task RunAsync(string bindAddr, int port, CancellationToken ct)
     {
+        ResourceLimits.Validate();
         var ip = bindAddr == "0.0.0.0" ? IPAddress.Any : IPAddress.Parse(bindAddr);
         var listener = new TcpListener(ip, port);
         listener.Start();
+        ListeningPort = ((IPEndPoint)listener.LocalEndpoint).Port;
         Log.Info($"RTSP server listening on rtsp://{bindAddr}:{port}/");
 
         var host = NetUtil.DisplayHost(bindAddr);
@@ -104,23 +160,44 @@ public sealed class RtspServer
                     break;
                 }
                 client.NoDelay = true;
-                var conn = new RtspConnection(client, this);
-                _ = Task.Run(async () =>
+                string peer = client.Client.RemoteEndPoint is IPEndPoint remote
+                    ? remote.Address.MapToIPv6().ToString() : "unknown";
+                lock (_connectionGate)
                 {
-                    try
+                    if (_connections.Count >= ResourceLimits.MaxConnections
+                        || _connections.Values.Count(value => value.Peer == peer) >= ResourceLimits.MaxConnectionsPerPeer)
                     {
-                        await conn.RunAsync(ct).ConfigureAwait(false);
+                        client.Dispose();
+                        continue;
                     }
-                    catch (Exception ex)
+                    long id = ++_nextConnection;
+                    // Start without a scheduling cancellation token: every accepted client owns cleanup,
+                    // including a cancellation between Accept and execution of this delegate.
+                    var completion = Task.Run(async () =>
                     {
-                        Log.Debug($"RTSP connection error: {Log.Flatten(ex)}");
-                    }
-                }, ct);
+                        try { await new RtspConnection(client, this).RunAsync(ct).ConfigureAwait(false); }
+                        catch (Exception ex) { Log.Debug($"RTSP connection error: {Log.Flatten(ex)}"); }
+                        finally
+                        {
+                            client.Dispose();
+                            lock (_connectionGate) _connections.Remove(id);
+                        }
+                    }, CancellationToken.None);
+                    _connections.Add(id, (client, peer, completion));
+                }
             }
         }
         finally
         {
             listener.Stop();
+            Task[] pending;
+            lock (_connectionGate)
+            {
+                foreach (var connection in _connections.Values) connection.Client.Dispose();
+                pending = _connections.Values.Select(value => value.Completion).ToArray();
+            }
+            await Task.WhenAll(pending).ConfigureAwait(false);
+            ListeningPort = 0;
         }
     }
 }

@@ -1,6 +1,18 @@
 # Tests und Pilotstand
 
-Stand der lokalen Prüfungen: 10. Oktober 2026. Die Betriebsmessungen unten sind jeweils datierte Pilotbefunde. Zum lokalen Ausführen wird das .NET-10-SDK benötigt; die folgenden Befehle laufen im Repository-Verzeichnis.
+## Regressionen der Version 1.2.0
+
+Der aktuelle Prüfstand ergänzt die historischen Tests um RTSP-Budgets/Deadlines, echte Sitzungsabläufe mit Medienaktivität, neue Video-/Audio-Epochen, Codecwechsel, begrenzte Rohqueues, Alarm-Retry, gültige 1–4-fps-LQ, PTZ-Erkennung/Besitz/Shutdown, Talk-/Decoder-Recovery, Aktorrechte, Zertifikat-Pinning und persistentes Replay mit Absturz-/Retentionprüfungen. Sämtliche Reproduktionen verwenden synthetische Geräte, Loopback und temporäre Dateien. Die neue Quelle ist dadurch nicht automatisch produktiv ausgerollt.
+
+```console
+dotnet run --project tests/Neolink.ProtectTests/Neolink.ProtectTests.csproj --configuration Release -- --reliability-only
+python -m unittest discover -s tests/tools -v
+```
+
+Der vollständige Runner enthält diese Regressionen zusätzlich zu allen vorhandenen Verträgen. Encoderprüfungen decodieren echte synthetische Medien mit FFmpeg; der spezielle VAAPI-Test benötigt weiterhin ein passendes Rendergerät. Ein erfolgreicher Softwaretest ist kein neuer Hardware- oder iPhone-Nachweis.
+
+
+Historischer lokaler Prüfstand: 10. Oktober 2026; Hardware-LQ-Prüfung und Rollout-Anleitung ergänzt am 12. Oktober. Die Betriebsmessungen unten sind jeweils datierte Pilotbefunde. Zum lokalen Ausführen wird das .NET-10-SDK benötigt; die folgenden Befehle laufen im Repository-Verzeichnis.
 
 ## Automatische Prüfungen
 
@@ -10,13 +22,27 @@ dotnet run --project src/Neolink.Server/Neolink.Server.csproj --configuration Re
 dotnet run --project tests/Neolink.ProtectTests/Neolink.ProtectTests.csproj --configuration Release
 ```
 
-Die lokalen Prüfungen umfassen **159 Upstream-Selbsttests und 82 ONVIF-/RTSP-/Snapshot-/Ereignis-Vertragstests**. Am 10. Oktober 2026 bestanden alle Prüfungen; der Release-Build wurde einschließlich der GOP-Ausgabe ohne Fehler oder Warnungen geprüft.
+Der Prüfstand vom 10. Oktober 2026 umfasste **159 Upstream-Selbsttests und 82 ONVIF-/RTSP-/Snapshot-/Ereignis-Vertragstests**. Damals bestanden alle Prüfungen; der Release-Build wurde einschließlich der GOP-Ausgabe ohne Fehler oder Warnungen geprüft. Die nachfolgende Hardware-LQ-Prüfung wurde am 12. Oktober ergänzt.
 
 Die zusätzlichen Vertragstests starten den tatsächlichen HTTP-Listener auf Loopback und verwenden synthetische Zugangsdaten und Medienzustände. Sie prüfen Geräteidentität und stabile UUID/MAC, Media1/Media2, ehrliche H.265-/H.264-Profile, RTSP-URLs, WSSE-/Basic-Anmeldung, Zeitabweichung und Replay-Schutz, Bereitschaft des Streams, XML-/XXE-Abweisung sowie die strenge Pilot-Konfiguration. Sie verbinden sich mit keiner echten Kamera. Details stehen im [Testprojekt](tests/Neolink.ProtectTests/README.md).
 
 Die GOP-Tests prüfen zusätzlich den tatsächlichen RTSP-TCP-Pfad: beide Mount-Aliase, einzelne RTP-Marker und Zeitstempel pro Bild, unveränderte codierte NAL-Inhalte auch nach FU-Fragmentierung, die unveränderte Standardausgabe sowie Audio-Abweisung im ausdrücklich aktivierten Video-Modus. Deterministische Uhren prüfen Drift, Wrap, begrenzte GOP-Puffer, Metadaten und Wiederaufnahme nach einer Lücke. PAUSE, TEARDOWN, Source-Wechsel und die echte DropOldest-Subscriberqueue sind ebenfalls abgedeckt. Die ergänzten Regressionen erhalten reale Bilder trotz eines zwölfsekündigen Raw-Clock-Sprungs, wiederholter oder rückläufiger RTP-Werte und gebündelter Access Units; sie prüfen zugleich plausible variable Kadenz und die Zuordnung des nächsten Schlüsselbilds.
 
 Die Snapshot-Tests prüfen Media1/Media2-URIs, Anmeldung vor dem nativen Abruf, binäre JPEG-Ausgabe, Frische und Source-Wechsel, begrenzte Antwortgröße und Fristen. HTTP Digest wird mit echter Challenge-Verhandlung, Bindung an GET und Anfragepfad, Replay-Zählern, begrenztem Nonce-Cache und monotoner Ablaufzeit geprüft; vorab gesendetes Basic bleibt verfügbar. Der native Cache wird mit monotoner Uhr geprüft; parallele Aufrufer teilen eine Anforderung, deren Arbeit durch einen einzelnen abgebrochenen HTTP-Aufruf nicht beendet wird. Synthetische Baichuan-Peers prüfen den Befehl 109 einschließlich FullAES, Reassembly-Limits und verspäteter Antworten nach Abbruch. Nach dem vollständigen 201-Abschluss wird der binäre Snapshot-Modus freigegeben; ein später wiederverwendeter Nachrichtenzähler muss erneut eine XML-Bestätigung lesen können. Andere Videotransfers behalten ihren Modus. Diese Tests belegen noch keine Unterstützung durch eine konkrete Kamerafirmware.
+
+### Optionales GOP-AAC
+
+Am 13. Oktober ergänzt: `--gop-aac-only` prüft vier zusätzliche Verträge mit synthetischen Medien und Loopback-RTSP. Sie erhalten gebündelte Videobilder trotz eines 8,67-Sekunden-Kamera-Uhrsprungs, vergleichen die NAL- und AAC-Nutzdaten auf der Leitung, prüfen AAC-1024-Sample-Schritte einschließlich Wrap sowie gemeinsame RTCP-NTP-Paare/CNAME und echte Senderzähler. Paket- und Bytegrenzen, Audioverlust, Source-Epoch, PAUSE/PLAY und TEARDOWN sind enthalten. ONVIF und SDP bleiben ohne Opt-in beziehungsweise ohne aktuelle echte AAC-Daten stumm. Release-Build und vollständige Regression mit 118 Verträgen bestanden; es wurden keine Kameras kontaktiert. Die Ankunftsschätzung ersetzt keinen echten A/V-Synchronitätstest und keine produktive Aufnahmeprüfung.
+
+### Quellkadenz bei LQ-Konvertierung
+
+`--lq-cadence-only` prüft die begrenzte Bildzeit-Zuordnung für gleiche Quell-/Ausgaberaten. 80 tatsächlich mit 12,5 fps eingehende Bilder behalten 6,4 Sekunden einschließlich des letzten Bildintervalls, obwohl Quelle und Encoder mit einer Obergrenze von 20 fps konfiguriert sind. Tests enthalten Mikrosekunden-Wrap, falsche 50-ms-Kamera-PTS, 16-fach gebündelte Bilder mit 8,67-Sekunden-Kamera-Uhrsprung, identische Ankunftszeit, Zeitumkehr und Quellwechsel. Ein echter FFmpeg-Encoder erzeugt decodierbares HEVC bei Nachtkadenz, erhält AAC-Bytes/1024-Sample-Abstände und baut nach einem Epoch-Wechsel mit Tageskadenz neu auf. Verwendet werden synthetische Medien; echte VAAPI-/Aufnahme- und A/V-Nachweise gehören zum gesonderten Canary.
+
+### Native LQ-Anzeigemetadaten
+
+`--low-quality-display-only` führt fünf gezielte Prüfungen der optionalen H.264-SAR-Anpassung aus. Sie prüfen vollständigen SPS-Syntaxerhalt einschließlich Crop, POC, Skalierung, Timing und HRD, begrenzte ungültige Eingaben, Lebenszyklus und Fehlerisolierung ausschließlich im LQ-Zweig sowie Konfigurationsgrenzen. Ein echter FFmpeg-Test decodiert 75 Bilder vor und nach der Metadatenänderung bytegleich und erkennt SAR 4:3 / DAR 16:9. Die Prüfungen sind auch Teil der vollständigen Vertragstests.
+
+Am 13. Oktober 2026 bestanden der Release-Build ohne Warnungen, alle 159 Selbsttests, alle 101 Vertragstests und die fünf gezielten Anzeigeprüfungen. Diese Offlineprüfungen bestätigen noch keine konkrete HDMI-Darstellung. Der projektspezifische Helfer `camera_eingang_display_metadata.py` baut den Versuch auf dem vorhandenen Eingang-Laufzeitimage und ändert ausschließlich dessen Image plus einen optionalen LQ-Metadatenschalter. Er sichert Originale privat auf dem NAS, erhält die anderen fünf Container und nimmt fehlgeschlagene Versuche zurück. `camera_eingang_display_verify.py` prüft anschließend echte Protect-WSS-SPS und frische HQ/LQ-Aufnahmen mit RAM-Decodierung. Die tatsächliche Füllung der Kachel muss am angeschlossenen Monitor geprüft werden.
 
 ### Kameraereignisse und Bewegungsfilter
 
@@ -34,6 +60,68 @@ oder dass Protect daraus native Smart-Detection-Ereignisse erzeugt. Der neue
 Modus `none` setzt für sichtbare Protect-Klassenereignisse eine getrennte,
 bereits geprüfte Integration voraus; die Bridge erzeugt diese Einträge selbst
 nicht. Details stehen in [docs/onvif-events.md](docs/onvif-events.md).
+
+## Hardware-LQ-Prüfung und Rollout am 12. Oktober 2026
+
+Die normalen Vertragstests prüfen die ausdrückliche Wahl von `software` oder `vaapi`, das festgelegte DRM-Gerät, begrenzte FFmpeg-Pipes, Skalierung, gültige gerade Auflösungen und den unveränderten Hauptstream. Kameraadressen und Zugangsdaten werden FFmpeg nicht übergeben. Für den Hardwarepfad werden `hevc_vaapi`, `iHD`, NV12-Upload, keine B-Bilder und `-aud 0` geprüft; ein Softwarefallback ist ausgeschlossen.
+
+Die zusätzliche GPU-Regression muss ausdrücklich auf einem Linux-Host mit dem freigegebenen Intel-Rendergerät und FFmpeg ausgeführt werden:
+
+```sh
+dotnet run --project tests/Neolink.ProtectTests/Neolink.ProtectTests.csproj --configuration Release --no-build -- --hardware-low-quality-only
+```
+
+Sie verwendet ausschließlich synthetische Medien: 120 H.264-Quellbilder mit 20 fps werden bei 896 × 512 Pixeln in 10- und 20-fps-HEVC umgewandelt. Erwartet werden jeweils 60 beziehungsweise 120 tatsächliche Bilder, einschließlich P-Bildern. Der Test zählt Access Units, prüft den inkrementellen Annex-B-Parser mit mehreren Chunkgrößen, kontrolliert Header und Auflösung an Schlüsselbildern und verlangt die vollständige Softwaredekodierung ohne Decoderfehler. Fehlende GPU-Unterstützung ergibt einen Fehler in dieser ausdrücklich angeforderten Prüfung.
+
+Diese Vollständigkeitsprüfung erhält eine konkrete Regression des lokalen FFmpeg-6.1-/Gemini-Lake-Pfads: Mit VAAPI-AUDs (`-aud 1`) konnten nur einzelne Schlüsselbilder verwertbar bleiben, während der Encoder weiterhin lief. `-aud 0` verhindert diesen beobachteten Fehler; die Bridge kann HEVC-Bildgrenzen ohne AUDs lesen. Das ist ein Befund dieser geprüften Kombination, keine Behauptung über jede VAAPI-Implementierung. Die GPU-Prüfung und die folgenden Liveprüfungen beantworten getrennte Fragen.
+
+### Geschützter NAS-Rollout
+
+Die projektspezifischen Helfer liegen eine Ebene neben dem Repository unter `netzwerkanalyse`; die folgenden PowerShell-Befehle laufen dort. `camera_lq_hardware.py` verwendet den vorhandenen NAS-SafeConnector. Es exportiert keine Zugangsdaten. Vorhandene Pakete und Manifestdateien werden nicht überschrieben; für einen neuen Quellstand separate Dateinamen wählen.
+
+```powershell
+python camera_lq_hardware.py baseline --output camera-lq-nas-baseline.json
+python protect_low_quality_profiles.py plan --ip 192.168.30.210 --save-baseline camera-lq-protect-before.json --output camera-lq-protect-plan.json
+python camera_lq_hardware.py package --output camera-lq-package.json
+python camera_lq_hardware.py stage --output camera-lq-stage.json
+```
+
+Die NAS-Baseline liefert `release`, das Stage-Ergebnis `imageTag`. Diese beiden Werte in die folgende gezielte Canary-Aktion übernehmen; 10 fps sind hier ein Prüfbeispiel, keine abschließend bestimmte Leistungseinstellung:
+
+```powershell
+$nasLqRelease = 'REPLACE_WITH_BASELINE_RELEASE'
+$nasLqImage = 'REPLACE_WITH_STAGED_IMAGE_TAG'
+python camera_lq_hardware.py apply --release $nasLqRelease --ip 192.168.30.210 --image $nasLqImage --fps 10 --width 896 --height 512 --bitrate 1024 --output camera-lq-canary.json
+python protect_low_quality_profiles.py apply --baseline camera-lq-protect-before.json --ip 192.168.30.210 --output camera-lq-protect-canary.json
+python protect_low_quality_profiles.py verify --baseline camera-lq-protect-before.json --ip 192.168.30.210 --output camera-lq-protect-canary-verify.json
+```
+
+Erst nach erfolgreicher Canary-Prüfung jeweils einzeln `.211`, `.212` und `.213` übernehmen. `.214` und `.215` bleiben Main-only; die Profil- und Recorder-Helfer immer mit `--ip` auf die jeweilige Dual-Kamera begrenzen. `tune` ändert die LQ-Parameter eines bereits übernommenen Dienstes. Nach jeder geänderten Auflösung oder Bilderrate die vorhandene Protect-Profilwahl erneut mit `apply --ip …` aktualisieren und beide Aufnahmequalitäten prüfen. Wenn HQ/LQ-Aufnahmen nicht fortschreiten, ermöglicht `protect_low_quality_recorder_refresh.py apply --baseline … --ip …` einen geschützten lokalen Recorder-Neuaufbau mit `forceTcp: null → true → null`.
+
+Der Worker sichert ursprüngliche Compose-Datei, Konfigurationen und Container-Inspect rootgeschützt auf dem NAS und hält das alte Image über einen eigenen Tag vor. Jede Mutation hält den Watchdog-Lock und einen selbst angelegten Wartungsmarker unter `/var/lib/reolink-camera-resilience/maintenance`; nur der eigene Marker wird anschließend entfernt. `restart: always`, read-only, UID, Secrets-Mounts, Netz, MAC, UUID, Hauptprofil, Kamerazugang und Ereigniskonfiguration bleiben geschützt. Nur das gewählte LQ-Profil, dessen Encoder-/Zeitbasisfelder und das Image samt genau einem Rendergerät und Gruppe 937 dürfen sich ändern. Die übrigen fünf Container-IDs müssen pro Aktion erhalten bleiben. Ein fehlgeschlagener Versuch stellt die unmittelbar vorherigen Einstellungen dieses Zieles wieder her; bereits erfolgreiche andere Kameras bleiben erhalten.
+
+Bereitschaft verlangt gesunde HQ-/LQ-Metadaten, ein aktives `hevc_vaapi`-Backend sowie zwei authentifizierte Messungen mit etwa fünf Sekunden Abstand. Aus dem gemessenen Abstand und `ΔtotalAccessUnits` muss die tatsächliche LQ-Rate mindestens 75 % des konfigurierten Werts erreichen. HQ und LQ müssen fortschreiten; Quellen, Encoderzustand und Uptime dürfen innerhalb des Fensters nicht wechseln oder zurückspringen. Die Fehlerbelege enthalten nur sichere Diagnosefelder. Eine bloß angekündigte Bildrate oder `/health` allein erfüllt diese Prüfung nicht.
+
+Für die vier geprüften Kameras verhindert der Worker eine Auflösung über den nativen 896 × 512 Pixeln und eine Ausgabe über `low_quality_source_fps`. Diese Zeitbasis muss zur tatsächlich gemessenen Kameraquelle passen. Der separate Garage-Helfer ändert ausschließlich die native `subStream/frame`-Einstellung und die Bridge-Zeitbasis zusammen; er sichert die komplette native Encoder-XML privat und prüft alle übrigen Felder unverändert.
+
+Nach jeder Übernahme die Last unter paralleler Verwendung messen, wirkliche Protect-Liveabrufe und frische gespeicherte HQ-/LQ-Ausschnitte prüfen. `protect_low_quality_reduced_verify.py live --output …` und `recording --output …` prüfen die vier Dual- und zwei Main-only-Kameras und decodieren Aufnahmen nur im RAM. Aufnahmefortschritt ist durch steigende `recordingEnd`/`recordingEndLQ` und echte Playback-Verfügbarkeit zu belegen. Kamera-IDs, Aufnahme-/Retentionseinstellungen, nativer Ereignisadapter und Stromausfall-Wiederanlauf werden mit der Baseline verglichen. Ergebnisse und endgültige Leistungswerte gehören in den datierten Projektabschlussbeleg.
+
+### Rückkehr zum ursprünglichen Betrieb
+
+Für Garage zuerst die Hardware-LQ-Ausgabe auf höchstens 10 fps reduzieren. Danach den nativen Substream und dessen Bridge-Zeitbasis gemeinsam auf 10 fps zurückstellen. Erst anschließend das ursprüngliche Bridge-Image und die ursprüngliche Konfiguration wiederherstellen; so bleibt die Eingangszeitbasis stets zur Kamera passend. Für die anderen drei Dual-Kameras entfällt die native Quelländerung.
+
+```powershell
+$nasLqGarageBackup = 'REPLACE_WITH_GARAGE_SOURCE_BACKUP'
+python camera_lq_hardware.py tune --release $nasLqRelease --ip 192.168.30.211 --fps 10
+python camera_lq_garage_source20.py rollback --backup $nasLqGarageBackup
+python camera_lq_hardware.py rollback --release $nasLqRelease --ip 192.168.30.211
+python protect_low_quality_profiles.py restore --baseline camera-lq-protect-before.json --ip 192.168.30.211
+python protect_low_quality_recorder_refresh.py apply --baseline camera-lq-protect-before.json --ip 192.168.30.211
+```
+
+Die NAS-/Protect-Rückkehr für `.210`, `.212` und `.213` ebenfalls einzeln mit `--ip` durchführen. Der Recorder-Helfer prüft tatsächlichen Aufnahmefortschritt und überspringt einen bereits funktionierenden Recorder. Anschließend erneut Livebild, gespeicherte Ausschnitte, Originalkanäle und den Watchdog-Zustand prüfen. Kein globaler Protect-Neustart und keine erneute Kameraaufnahme sind dafür vorgesehen.
+
+Für diesen Auftrag liegt die ursprüngliche NAS-Baseline unter `/volume1/docker/reolink-bridge-pilot/.lq-hardware-20261012-1791820172000145020`, die native Garage-Quellsicherung unter `/volume1/docker/reolink-bridge-pilot/.lq-garage-source-20261012-1791821487639732836`. Beide enthalten private Dateien, die auf dem NAS bleiben. Die Helfer akzeptieren diese Pfade als `--release` beziehungsweise `--backup`; lokale Reportdateien enthalten ausschließlich projizierte Metadaten.
 
 ## Echter NAS-Pilot
 

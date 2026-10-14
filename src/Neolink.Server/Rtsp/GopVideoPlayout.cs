@@ -7,7 +7,11 @@ namespace Neolink.Rtsp;
 internal sealed record GopPlayoutPicture(byte[] AnnexB, bool Keyframe, bool HasSps,
     uint RtpTimestamp, TimeSpan Offset, long SourceEpoch);
 internal sealed record CompletedVideoGop(IReadOnlyList<GopPlayoutPicture> Pictures, TimeSpan Duration,
-    long SourceEpoch, bool UniformCadence = false);
+    long SourceEpoch, bool UniformCadence = false)
+{
+    public long SourceArrivalTimestamp { get; init; }
+    public long SourceArrivalFrequency { get; init; }
+}
 
 /// <summary>One RTSP pump owns this object. It releases only a complete bounded GOP,
 /// scales plausible camera PTS onto the measured keyframe-arrival wall duration, and paces
@@ -203,7 +207,8 @@ internal sealed class GopVideoPlayout
         }
         _haveOutputTimestamp = true;
         _nextOutputTimestamp = unchecked(start + (uint)durationTicks);
-        return new CompletedVideoGop(pictures, TimeSpan.FromSeconds(durationTicks / 90000d), first.SourceEpoch, uniform);
+        return new CompletedVideoGop(pictures, TimeSpan.FromSeconds(durationTicks / 90000d), first.SourceEpoch, uniform)
+        { SourceArrivalTimestamp = first.ArrivalTimestamp!.Value, SourceArrivalFrequency = first.ArrivalTimestampFrequency };
     }
 
     public CompletedVideoGop BeginGop(CompletedVideoGop gop)
@@ -234,6 +239,10 @@ internal sealed class GopVideoPlayout
     {
         _haveLastSent = true; _lastSentTimestamp = picture.RtpTimestamp; _lastSentAt = _clock.GetTimestamp();
     }
+
+    /// <summary>The unchanged video's planned presentation instant, shared by optional AAC/RTCP.</summary>
+    public long PresentationTimestamp(TimeSpan offset) => checked(_scheduleEpoch + (long)Math.Round(
+        (_reserve + _currentGopOffset + offset).TotalSeconds * _clock.TimestampFrequency));
 
     public async Task WaitAsync(TimeSpan offset, CancellationToken ct)
     {

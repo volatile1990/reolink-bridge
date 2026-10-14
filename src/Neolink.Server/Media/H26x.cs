@@ -163,7 +163,8 @@ public static class H26x
         r.Bits(1); // sps_temporal_id_nesting_flag
 
         // profile_tier_level: 12 bytes of general PTL...
-        r.Bits(8); r.Bits(32); r.Bits(32); r.Bits(24); r.Bits(8);
+        // general_profile_* (8), compatibility (32), constraint flags (48), level (8).
+        r.Bits(8); r.Bits(32); r.Bits(32); r.Bits(16); r.Bits(8);
         // ...plus per-sub-layer presence flags and their PTL blocks.
         Span<bool> profilePresent = stackalloc bool[8];
         Span<bool> levelPresent = stackalloc bool[8];

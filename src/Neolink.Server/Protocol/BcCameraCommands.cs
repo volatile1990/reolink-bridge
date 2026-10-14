@@ -23,6 +23,40 @@ public static class BcCameraCommands
 {
     public static readonly string[] PtzCommands = { "up", "down", "left", "right", "stop" };
 
+    /// <summary>Read real AI configuration on the existing session (reolink_aio's 342/AiDetectCfg contract).
+    /// No extra login, Preview, settings write or invented detection is performed.</summary>
+    public static async Task<XElement?> GetAiDetectConfigAsync(this IBcCamera cam, string aiType,
+        TimeSpan? timeout = null, CancellationToken ct = default)
+    {
+        if (aiType is not ("people" or "vehicle" or "dog_cat" or "face" or "package")) throw new ArgumentException("Unknown AI type");
+        var body = new BcXmlBody();
+        body.Raw.Add(new XElement("AiDetectCfg", new XAttribute("version", "1.1"),
+            new XElement("chn", cam.ChannelId), new XElement("type", aiType)));
+        var reply = await cam.SendCommandAsync(342, body, extension: ChannelExt(cam), replyTimeout: timeout, ct: ct).ConfigureAwait(false);
+        var cfg = reply?.Xml?.RawElement("AiDetectCfg");
+        if (cfg != null) ValidateAiDetectConfig(cam, aiType, cfg);
+        return cfg;
+    }
+
+    /// <summary>343 is the full AiDetectCfg setter (also used by the camera app for sizes/area).
+    /// Only a complete, correctly scoped read-modify-write object is accepted.</summary>
+    public static async Task SetAiDetectConfigAsync(this IBcCamera cam, string aiType, XElement cfg,
+        TimeSpan? timeout = null, CancellationToken ct = default)
+    {
+        ValidateAiDetectConfig(cam, aiType, cfg);
+        var body = new BcXmlBody(); body.Raw.Add(new XElement(cfg));
+        var reply = await cam.SendCommandAsync(343, body, extension: ChannelExt(cam), replyTimeout: timeout, ct: ct).ConfigureAwait(false);
+        if (reply == null) throw new IOException("Camera did not acknowledge AI configuration");
+    }
+
+    private static void ValidateAiDetectConfig(IBcCamera cam, string aiType, XElement cfg)
+    {
+        if (aiType is not ("people" or "vehicle" or "dog_cat" or "face" or "package")
+            || cfg.Name.LocalName != "AiDetectCfg" || cfg.Elements("type").Count() != 1 || cfg.Element("type")?.Value != aiType
+            || cfg.Elements("chn").Count() != 1 || !byte.TryParse(cfg.Element("chn")?.Value, out byte channel) || channel != cam.ChannelId)
+            throw new InvalidDataException("AI response belongs to a different camera channel or detection type");
+    }
+
     private static ExtensionXml ChannelExt(IBcCamera cam) => new() { ChannelId = cam.ChannelId };
     private static ExtensionXml RfExt(IBcCamera cam) => new() { RfId = cam.ChannelId };
 

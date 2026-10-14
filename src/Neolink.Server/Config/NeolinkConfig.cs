@@ -790,14 +790,25 @@ public sealed class NeolinkConfig
             Onvif.Validate();
             if (BindPort == 0 || BindPort == Onvif.Port)
                 throw new FormatException("Bridge RTSP and ONVIF ports must be separate and nonzero");
-            if (Cameras.Count != 1 || Cameras[0].IsGenericRtsp || Cameras[0].Stream != "mainStream"
+            if (Onvif.NativeTalkPort > 0 && Onvif.NativeTalkPort == BindPort)
+                throw new FormatException("Native talk UDP and RTSP ports must be distinct");
+            if (Cameras.Count != 1 || Cameras[0].IsGenericRtsp || Cameras[0].Stream is not ("mainStream" or "both")
                 || Cameras[0].AlwaysOn != true || Cameras[0].Udp || Cameras[0].UdpProbe || Cameras[0].WakeCapture
                 || Cameras[0].Uid != null || Cameras[0].PtzShare || Cameras[0].PtzPort is not (null or 0))
-                throw new FormatException("Bridge mode requires exactly one TCP Baichuan camera, stream mainStream, always_on true, with UDP/discovery/control features disabled");
+                throw new FormatException("Bridge mode requires exactly one TCP Baichuan camera, stream mainStream or both, always_on true, with UDP/discovery/control features disabled");
             if (Users.Count == 0 || Users.Any(u => string.IsNullOrEmpty(u.Pass)) || Users.Select(u => u.Name).Distinct().Count() != Users.Count)
                 throw new FormatException("Bridge mode requires distinct users with nonempty passwords");
-            if (Onvif.Profiles.Count != 1 || Onvif.Profiles[0].Stream != "mainStream")
-                throw new FormatException("Bridge mode currently offers one mainStream profile per camera");
+            if (Onvif.ControlUsers != null && Onvif.ControlUsers.Any(name => !Users.Any(user => user.Name == name)))
+                throw new FormatException("onvif.control_users must refer to existing authenticated bridge users");
+            if (Onvif.CameraHttpsCertificateSha256 != null && Cameras[0].HttpAddress?.StartsWith("https://", StringComparison.OrdinalIgnoreCase) != true)
+                throw new FormatException("A camera certificate pin requires an explicit HTTPS camera http_address");
+            if (Onvif.Profiles.Count is < 1 or > 2 || Onvif.Profiles[0].Stream != "mainStream"
+                || (Onvif.Profiles.Count == 2 && Onvif.Profiles[1].Stream != "subStream"))
+                throw new FormatException("Bridge mode requires mainStream first and optionally one subStream profile on the same camera");
+            if (Onvif.Profiles.Count == 2 && Onvif.Profiles[0].Codec != Onvif.Profiles[1].Codec)
+                throw new FormatException("Protect HQ and LQ output profiles must use the same codec");
+            if (Cameras[0].Stream == "both" && Onvif.Profiles.Count != 2)
+                throw new FormatException("Bridge stream both requires mainStream and subStream ONVIF profiles");
             if (Recording != null || Mqtt != null || WakeHints != null)
                 throw new FormatException("Bridge mode does not allow recording, MQTT or wake-hint services");
             if (!System.Text.RegularExpressions.Regex.IsMatch(Cameras[0].Name, "^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$"))

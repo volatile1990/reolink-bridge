@@ -65,6 +65,8 @@ public sealed record SdCardInfo(int Id, long TotalMb, long FreeMb, bool Formatte
 /// (higher = more sensitive); StayTime — seconds a target must linger before the
 /// alarm fires — is null when the firmware doesn't report one for the type.</summary>
 public sealed record AiSensitivity(string Type, int Sensitivity, int? StayTime);
+public sealed record AiAlarmNumericField(string Id, double Value, double? Min, double? Max, bool Writable, double Step = 1);
+public sealed record AiAlarmParameters(string Type, bool? Enabled, IReadOnlyList<AiAlarmNumericField> Fields);
 
 /// <summary>One detection type's zone grid (the HTTP API's "scope"): Table is
 /// Cols*Rows characters, row by row from the top-left — '1' = the camera watches
@@ -76,7 +78,8 @@ public sealed record DetectionZone(string Type, int Cols, int Rows, string Table
 /// timestamp visibility + position and the Reolink watermark. PosOptions is the
 /// firmware's own list of valid positions (empty when it didn't provide one).</summary>
 public sealed record OsdSettings(bool ShowName, string? Name, string? NamePos,
-    bool ShowTime, string? TimePos, bool? Watermark, IReadOnlyList<string> PosOptions);
+    bool ShowTime, string? TimePos, bool? Watermark, IReadOnlyList<string> PosOptions,
+    bool CanShowName = true, bool CanShowTime = true);
 
 /// <summary>A firmware-update check verdict (read-only — nothing is ever installed).</summary>
 public sealed record FirmwareStatus(bool UpdateAvailable, string? NewVersion);
@@ -384,6 +387,12 @@ public interface ICameraControl
     /// <summary>Sets one AI type's sensitivity (0-100, higher = more sensitive).</summary>
     Task SetAiSensitivityAsync(string aiType, int sensitivity, CancellationToken ct) =>
         throw new NotSupportedException("AI sensitivity is not available for this camera");
+    Task<AiAlarmParameters?> GetAiAlarmParametersAsync(string aiType, CancellationToken ct) =>
+        Task.FromResult<AiAlarmParameters?>(null);
+    Task SetAiAlarmParametersAsync(string aiType, IReadOnlyDictionary<string, double> parameters, bool? enabled, CancellationToken ct) =>
+        throw new NotSupportedException("AI parameters are not available for this camera");
+    Task<BaichuanAiDiagnostic?> GetBaichuanAiDiagnosticAsync(string aiType, CancellationToken ct) =>
+        Task.FromResult<BaichuanAiDiagnostic?>(null);
 
     /// <summary>The camera's HTTP API cannot be asked at this moment — the transport
     /// backoff is armed after a failure, or the camera is parked asleep. Distinguishes
@@ -469,7 +478,7 @@ public sealed class TalkBusyException : Exception
 /// one outstanding request per message ID, and cameras are generally happier
 /// answering control commands one at a time.
 /// </summary>
-public sealed class CameraControl : ICameraControl
+public sealed partial class CameraControl : ICameraControl
 {
     /// <summary>Probes for optional features must fail fast, not hold the gate for 15s.</summary>
     private static readonly TimeSpan ProbeTimeout = TimeSpan.FromSeconds(4);
@@ -1116,10 +1125,8 @@ public sealed class CameraControl : ICameraControl
             // No Reolink HTTP API. If this camera has an ONVIF imaging fallback
             // (Lumus and other HTTP-less models), surface just the picture settings
             // it can provide; everything else stays null. Otherwise nothing.
-            if (_onvif == null) return null;
-            var onvifImage = await GetOnvifImageSettingsAsync(ct).ConfigureAwait(false);
-            return onvifImage == null ? null
-                : new HttpFeatures(onvifImage, null, null, null, null, null, null);
+            var onvifImage = _onvif == null ? null : await GetOnvifImageSettingsAsync(ct).ConfigureAwait(false);
+            return await BcFallbackCompleteFeaturesAsync(new HttpFeatures(onvifImage, null, null, null, null, null, null), ct).ConfigureAwait(false);
         }
         // Sequential on purpose (the HTTP client serializes requests anyway) —
         // but ONE slow answer must not blank the rest of the panel. A mid-sweep
@@ -1180,6 +1187,7 @@ public sealed class CameraControl : ICameraControl
         // ALL of them, when the backoff was already armed by an earlier failure
         // and every read no-opped: the panel then shows the last-known state
         // instead of going limited for no visible reason).
+        fresh = await BcFallbackCompleteFeaturesAsync(fresh, ct).ConfigureAwait(false);
         var c = _httpFeaturesCache;
         var merged = c == null ? fresh : new HttpFeatures(
             fresh.Image ?? c.Image, fresh.Volume ?? c.Volume, fresh.WifiSignal ?? c.WifiSignal,
@@ -1234,6 +1242,7 @@ public sealed class CameraControl : ICameraControl
         // camera never reaches this: img is non-null and ONVIF stays untouched.
         if (img == null)
         {
+            if (await GetBcFallbackImageAsync(ct).ConfigureAwait(false) is { } native) return native;
             if (_onvif == null) return null;
             var onvif = await GetOnvifImageSettingsAsync(ct).ConfigureAwait(false);
             // Remember which transport actually served imaging, so a WRITE follows
@@ -1243,6 +1252,7 @@ public sealed class CameraControl : ICameraControl
             return onvif;
         }
         _httpImagingWorks = true;
+        BcFallbackImage = false;
         // The ISP half (day/night, flip, ...) is optional — picture sliders alone
         // are still worth showing if a firmware rejects GetIsp.
         var isp = await HttpTryAsync<JsonObject?>(async c => await _httpApi!.GetIspAsync(c).ConfigureAwait(false), ct)
@@ -1365,6 +1375,8 @@ public sealed class CameraControl : ICameraControl
     public async Task SetImageSettingsAsync(int? bright, int? contrast, int? saturation, int? hue, int? sharpen,
         string? dayNight, string? antiFlicker, bool? flip, bool? mirror, CancellationToken ct)
     {
+        if (BcFallbackImage || _httpApi == null && _onvif == null)
+        { await SetBcFallbackImageAsync(bright, contrast, saturation, hue, sharpen, dayNight, antiFlicker, flip, mirror, ct).ConfigureAwait(false); return; }
         // Route the write down whichever transport served the read. ONVIF when the
         // camera has no HTTP API OR its HTTP API isn't answering imaging (the Lumus
         // has a dead HTTP API derived from its host) — provided ONVIF is available.
@@ -1424,15 +1436,20 @@ public sealed class CameraControl : ICameraControl
                  $"{(flip != null || mirror != null ? " (flip/mirror restarts the video stream)" : "")}");
     }
 
-    public Task<int?> GetVolumeAsync(CancellationToken ct) =>
-        HttpTryAsync<int?>(async c => (int?)(await _httpApi!.GetAudioCfgAsync(c).ConfigureAwait(false))["volume"], ct);
+    public async Task<int?> GetVolumeAsync(CancellationToken ct)
+    {
+        var value = await HttpTryAsync<int?>(async c => (int?)(await _httpApi!.GetAudioCfgAsync(c).ConfigureAwait(false))["volume"], ct).ConfigureAwait(false);
+        if (value != null) { BcFallbackVolume = false; return value; }
+        return await GetBcFallbackVolumeAsync(ct).ConfigureAwait(false);
+    }
 
     /// <summary>The audio settings BEYOND the speaker volume, which models expose
     /// unevenly: the encode settings' record-audio flag, and whichever extra
     /// AudioCfg volumes this firmware carries. Absent members read as null and the
     /// UI simply doesn't draw them — the camera decides what's on offer.</summary>
-    public Task<AudioState?> GetAudioStateAsync(CancellationToken ct) =>
-        HttpTryAsync<AudioState>(async c =>
+    public async Task<AudioState?> GetAudioStateAsync(CancellationToken ct)
+    {
+        var value = await HttpTryAsync<AudioState>(async c =>
         {
             bool? rec = null;
             try { rec = EncRecordAudio(await _httpApi!.GetEncAsync(c).ConfigureAwait(false)); }
@@ -1446,7 +1463,14 @@ public sealed class CameraControl : ICameraControl
             }
             catch (ReolinkApiException) { /* no AudioCfg: volumes stay hidden */ }
             return rec == null && talk == null && visitor == null ? null : new AudioState(rec, talk, visitor);
-        }, ct);
+        }, ct).ConfigureAwait(false);
+        if (value?.RecordAudio != null) BcFallbackRecordAudio = false;
+        if (value?.TalkVolume != null || value?.VisitorVolume != null) BcFallbackAudioVolumes = false;
+        var native = await GetBcFallbackAudioAsync(value?.RecordAudio == null,
+            value?.TalkVolume == null && value?.VisitorVolume == null, ct).ConfigureAwait(false);
+        return value == null ? native : new(value.RecordAudio ?? native?.RecordAudio,
+            value.TalkVolume ?? native?.TalkVolume, value.VisitorVolume ?? native?.VisitorVolume);
+    }
 
     /// <summary>The record-audio state from the encode settings. The flag lives at
     /// the TOP of the Enc object (one switch for the camera — what the app shows);
@@ -1469,6 +1493,8 @@ public sealed class CameraControl : ICameraControl
     /// recordings here, in the Reolink app and on the SD card alike.</summary>
     public async Task SetRecordAudioAsync(bool on, CancellationToken ct)
     {
+        if (BcFallbackRecordAudio || _httpApi == null)
+        { await SetBcFallbackRecordAudioAsync(on, ct).ConfigureAwait(false); return; }
         if (_httpApi == null)
             throw new NotSupportedException($"record audio needs the camera's HTTP API ('{CameraName}' has none)");
         var enc = await _httpApi.GetEncAsync(ct).ConfigureAwait(false);
@@ -1497,6 +1523,8 @@ public sealed class CameraControl : ICameraControl
     /// minimal payload like the picture writes — see SetImageSettingsAsync.</summary>
     public async Task SetAudioVolumesAsync(int? talkVolume, int? visitorVolume, CancellationToken ct)
     {
+        if (BcFallbackAudioVolumes || _httpApi == null)
+        { await SetBcFallbackAudioVolumesAsync(null, talkVolume, visitorVolume, ct).ConfigureAwait(false); return; }
         if (_httpApi == null)
             throw new NotSupportedException($"audio volumes need the camera's HTTP API ('{CameraName}' has none)");
         var cfg = new JsonObject { ["channel"] = _httpApi.ChannelId };
@@ -1516,6 +1544,8 @@ public sealed class CameraControl : ICameraControl
 
     public async Task SetVolumeAsync(int volume, CancellationToken ct)
     {
+        if (BcFallbackVolume || _httpApi == null)
+        { await SetBcFallbackAudioVolumesAsync(volume, null, null, ct).ConfigureAwait(false); return; }
         if (_httpApi == null)
             throw new NotSupportedException($"the speaker volume needs the camera's HTTP API ('{CameraName}' has none)");
         int vol = Math.Clamp(volume, 0, 100);
@@ -1775,7 +1805,8 @@ public sealed class CameraControl : ICameraControl
     /// to the first block — standalone cameras have exactly one).</summary>
     internal static bool SupportsAiTrack(JsonObject ability, int channel)
     {
-        return (int?)AbilityChannel(ability, channel)?["supportAITrack"]?["ver"] is > 0;
+        var entry = AbilityChannel(ability, channel);
+        return (int?)(entry?["aiTrack"] ?? entry?["supportAITrack"])?["ver"] is > 0;
     }
 
     private static JsonObject? AbilityChannel(JsonObject ability, int channel)
@@ -1844,12 +1875,16 @@ public sealed class CameraControl : ICameraControl
 
     // ------------------------------------------- detection sensitivity (HTTP)
 
-    public Task<int?> GetMdSensitivityAsync(CancellationToken ct) =>
-        HttpTryAsync<int?>(async c =>
+    public async Task<int?> GetMdSensitivityAsync(CancellationToken ct)
+    {
+        var value = await HttpTryAsync<int?>(async c =>
         {
             var (cfg, isMdAlarm) = await _httpApi!.GetMdConfigAsync(c).ConfigureAwait(false);
             return MdSensitivityValue(cfg, isMdAlarm);
-        }, ct);
+        }, ct).ConfigureAwait(false);
+        if (value != null) { BcFallbackMd = false; return value; }
+        return await GetBcFallbackMdAsync(ct).ConfigureAwait(false);
+    }
 
     /// <summary>Normalizes the two firmware dialects to 1-50, higher = more sensitive.
     /// MdAlarm/newSens carries the user-facing value; the old sens tables carry the
@@ -1864,6 +1899,8 @@ public sealed class CameraControl : ICameraControl
 
     public async Task SetMdSensitivityAsync(int sensitivity, CancellationToken ct)
     {
+        if (BcFallbackMd || _httpApi == null)
+        { await SetBcFallbackMdAsync(sensitivity, ct).ConfigureAwait(false); return; }
         if (_httpApi == null)
             throw new NotSupportedException($"motion sensitivity needs the camera's HTTP API ('{CameraName}' has none)");
         int v = Math.Clamp(sensitivity, 1, 50);
@@ -1960,10 +1997,11 @@ public sealed class CameraControl : ICameraControl
 
     public async Task<IReadOnlyList<AiSensitivity>?> GetAiSensitivitiesAsync(CancellationToken ct)
     {
-        if (_httpApi == null) return null;
+        var supported = await HttpAiSupportedTypesAsync(ct).ConfigureAwait(false);
         var list = new List<AiSensitivity>();
         foreach (var type in _aiAlarmTypes ?? AiAlarmTypes)
         {
+            if (supported != null && !supported.Contains(type) || supported == null && type is "face" or "package") continue;
             var one = await HttpTryAsync<AiSensitivity?>(async c =>
             {
                 var cfg = await _httpApi!.GetAiAlarmAsync(type, c).ConfigureAwait(false);
@@ -1974,9 +2012,15 @@ public sealed class CameraControl : ICameraControl
                 NoteAiZoneSupport(type, ParseZone(type, cfg) != null);
                 return ParseAiSensitivity(type, cfg);
             }, ct).ConfigureAwait(false);
+            if (one != null) NoteAiTransport(type, false);
+            else if ((type is "people" or "vehicle" or "dog_cat" || _aiAlarmTypes?.Contains(type) == true)
+                && await TryBaichuanAiConfigAsync(type, ct).ConfigureAwait(false) is { } native)
+            {
+                var parameters = ParseBaichuanAiParameters(type, native);
+                if (parameters.Fields.SingleOrDefault(f => f.Id == "sensitivity") is { Writable: true } sensitivity)
+                    one = new(type, (int)sensitivity.Value, parameters.Fields.SingleOrDefault(f => f.Id == "stayTime") is { Writable: true } delay ? (int)delay.Value : null);
+            }
             if (one != null) list.Add(one);
-            // Transport backoff armed mid-sweep — the rest would no-op anyway.
-            if (DateTime.UtcNow < _httpRetryAt) return list.Count > 0 ? list : null;
         }
         if (_aiAlarmTypes == null && list.Count > 0)
             _aiAlarmTypes = list.Select(a => a.Type).ToList();
@@ -1990,13 +2034,15 @@ public sealed class CameraControl : ICameraControl
 
     public async Task SetAiSensitivityAsync(string aiType, int sensitivity, CancellationToken ct)
     {
-        if (_httpApi == null)
-            throw new NotSupportedException($"AI sensitivity needs the camera's HTTP API ('{CameraName}' has none)");
+        await EnsureAiTypeSupportedAsync(aiType, ct).ConfigureAwait(false);
         if (!AiAlarmTypes.Contains(aiType))
             throw new ArgumentException($"unknown AI type '{aiType}'");
+        if (sensitivity is < 0 or > 100) throw new ArgumentException("AI sensitivity exceeds camera bounds");
+        if (AiUsesBaichuan(aiType))
+        { await SetBaichuanAiParametersAsync(aiType, new Dictionary<string, double> { ["sensitivity"] = sensitivity }, null, ct).ConfigureAwait(false); return; }
         // Read-modify-write of the full AiAlarm object: it carries channel/ai_type
         // and the target-size bounds the firmware expects to see again.
-        var cfg = await _httpApi.GetAiAlarmAsync(aiType, ct).ConfigureAwait(false);
+        var cfg = await _httpApi!.GetAiAlarmAsync(aiType, ct).ConfigureAwait(false);
         cfg["sensitivity"] = Math.Clamp(sensitivity, 0, 100);
         await _httpApi.SetAiAlarmAsync(cfg, ct).ConfigureAwait(false);
         Log.Info($"{CameraName}: {aiType} detection sensitivity set to {Math.Clamp(sensitivity, 0, 100)}/100");
@@ -2026,19 +2072,41 @@ public sealed class CameraControl : ICameraControl
 
     private MdWriteMode _mdWriteMode;
 
-    /// <summary>AI types this camera reports a zone of their OWN for. Most cameras
-    /// keep a single zone that governs every detection type, and answer per-type
-    /// alarm queries with sensitivities but no grid — for those this stays empty and
-    /// the editor offers one zone rather than a tab per type.</summary>
+    /// <summary>Only genuine grids establish support. CGI and Baichuan report
+    /// different parts of the same AI configuration: a CGI sensitivity reply
+    /// without scope must not erase a grid previously read from Baichuan 342.</summary>
     private readonly HashSet<string> _aiZoneTypes = new(StringComparer.OrdinalIgnoreCase);
+    private readonly HashSet<string> _httpAiZoneTypes = new(StringComparer.OrdinalIgnoreCase);
+    private readonly HashSet<string> _baichuanAiZoneTypes = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, bool> _aiZoneTransports = new(StringComparer.OrdinalIgnoreCase);
 
-    private void NoteAiZoneSupport(string type, bool hasOwnZone)
+    private void NoteAiZoneSupport(string type, bool hasOwnZone, bool baichuan = false)
     {
         lock (_aiZoneTypes)
         {
-            if (hasOwnZone) _aiZoneTypes.Add(type);
+            var dialect = baichuan ? _baichuanAiZoneTypes : _httpAiZoneTypes;
+            if (hasOwnZone)
+            { dialect.Add(type); _aiZoneTransports[type] = baichuan; }
+            else
+            {
+                dialect.Remove(type);
+                if (_aiZoneTransports.TryGetValue(type, out bool previous) && previous == baichuan)
+                {
+                    if (_httpAiZoneTypes.Contains(type)) _aiZoneTransports[type] = false;
+                    else if (_baichuanAiZoneTypes.Contains(type)) _aiZoneTransports[type] = true;
+                    else _aiZoneTransports.Remove(type);
+                }
+            }
+            if (_httpAiZoneTypes.Contains(type) || _baichuanAiZoneTypes.Contains(type)) _aiZoneTypes.Add(type);
             else _aiZoneTypes.Remove(type);
         }
+    }
+
+    private bool AiZoneUsesBaichuan(string type)
+    {
+        lock (_aiZoneTypes)
+            return _aiZoneTransports.TryGetValue(type, out bool baichuan) ? baichuan
+                : throw new NotSupportedException("Camera did not report a writable AI grid");
     }
 
     /// <summary>The detection types with a zone the user can edit separately. "md" is
@@ -2053,6 +2121,8 @@ public sealed class CameraControl : ICameraControl
 
     public async Task<DetectionZone?> GetDetectionZoneAsync(string type, CancellationToken ct)
     {
+        if (type != "md" && !AiAlarmTypes.Contains(type)) throw new ArgumentException("Unknown detection type");
+        if (type != "md") await EnsureAiTypeSupportedAsync(type, ct).ConfigureAwait(false);
         // A type this camera already rejected costs a doomed round trip, and a
         // failed one arms the backoff that blanks everything else.
         if (type != "md" && _aiAlarmTypes != null && !_aiAlarmTypes.Contains(type))
@@ -2064,7 +2134,11 @@ public sealed class CameraControl : ICameraControl
         var fresh = await HttpTryAsync<DetectionZone?>(async c =>
         {
             if (type != "md")
-                return ParseZone(type, await _httpApi!.GetAiAlarmAsync(type, c).ConfigureAwait(false));
+            {
+                var grid = ParseZone(type, await _httpApi!.GetAiAlarmAsync(type, c).ConfigureAwait(false));
+                NoteAiZoneSupport(type, grid != null);
+                return grid;
+            }
             // Newer firmware (the Video Doorbell line) answers GetMdAlarm for
             // sensitivity but keeps the zone grid — ONE grid, shared by every
             // detection type — only in the legacy Alarm object. Which object holds
@@ -2099,7 +2173,15 @@ public sealed class CameraControl : ICameraControl
         // kept for the run would then hide the camera's real zone until a restart.
         // The camera is asked on every read, as it always was, so one bad answer
         // costs one read.
-        if (type == "md") _zoneAbsent = fresh == null && answeredWithoutGrid;
+        if (type == "md")
+        {
+            if (fresh == null) fresh = await GetBcFallbackMdZoneAsync(ct).ConfigureAwait(false);
+            else BcFallbackMdZone = false;
+            _zoneAbsent = fresh == null && answeredWithoutGrid;
+        }
+
+        if (fresh == null && type != "md" && await TryBaichuanAiConfigAsync(type, ct, recordParameterTransport: false).ConfigureAwait(false) is { } native)
+            fresh = ParseBaichuanAiZone(type, native);
 
         if (fresh != null)
         {
@@ -2183,6 +2265,21 @@ public sealed class CameraControl : ICameraControl
 
     public async Task SetDetectionZoneAsync(string type, string table, CancellationToken ct)
     {
+        if (type == "md" && (BcFallbackMdZone || _httpApi == null))
+        { await SetBcFallbackMdZoneAsync(table, ct).ConfigureAwait(false); return; }
+        if (type != "md")
+        {
+            if (!AiAlarmTypes.Contains(type)) throw new ArgumentException("Unknown AI type");
+            await EnsureAiTypeSupportedAsync(type, ct).ConfigureAwait(false);
+            // Parameters and grids can use different native dialects. Resolve a
+            // fresh real grid before choosing its writer, independently of the
+            // most recent sensitivity/target-size query's transport.
+            var zone = await GetDetectionZoneAsync(type, ct).ConfigureAwait(false)
+                ?? throw new NotSupportedException("Camera did not report a writable AI grid");
+            if (zone.Table.Length != table.Length || table.Any(ch => ch is not ('0' or '1')))
+                throw new ArgumentException("AI area dimensions changed or contain invalid bits");
+            if (AiZoneUsesBaichuan(type)) { await SetBaichuanAiZoneAsync(type, table, ct).ConfigureAwait(false); return; }
+        }
         if (_httpApi == null)
             throw new NotSupportedException($"detection zones need the camera's HTTP API ('{CameraName}' has none)");
         if (type == "md")
@@ -2293,12 +2390,16 @@ public sealed class CameraControl : ICameraControl
         Log.Info($"{CameraName}: HDR set to {value}");
     }
 
-    public Task<OsdSettings?> GetOsdSettingsAsync(CancellationToken ct) =>
-        HttpTryAsync<OsdSettings?>(async c =>
+    public async Task<OsdSettings?> GetOsdSettingsAsync(CancellationToken ct)
+    {
+        var value = await HttpTryAsync<OsdSettings?>(async c =>
         {
             var (osd, range) = await _httpApi!.GetOsdAsync(c).ConfigureAwait(false);
             return ParseOsd(osd, range);
-        }, ct);
+        }, ct).ConfigureAwait(false);
+        if (value != null) { BcFallbackOsd = false; return value; }
+        return await GetBcFallbackOsdAsync(ct).ConfigureAwait(false);
+    }
 
     internal static OsdSettings ParseOsd(JsonObject osd, JsonObject? range)
     {
@@ -2320,6 +2421,8 @@ public sealed class CameraControl : ICameraControl
     public async Task SetOsdSettingsAsync(bool? showName, string? namePos, bool? showTime, string? timePos,
         bool? watermark, CancellationToken ct)
     {
+        if (BcFallbackOsd || _httpApi == null)
+        { await SetBcFallbackOsdAsync(showName, namePos, showTime, timePos, watermark, ct).ConfigureAwait(false); return; }
         if (_httpApi == null)
             throw new NotSupportedException($"OSD settings need the camera's HTTP API ('{CameraName}' has none)");
         // Read-modify-write of the whole Osd object — SetOsd expects the complete
@@ -2605,8 +2708,8 @@ public sealed class CameraControl : ICameraControl
                      $"{ability.AudioType}, {ability.LengthPerEncoder} samples/block, mic at {sampleRate} Hz)");
 
             // PCM chunks → resample/encode/frame → BcMedia frames → camera.
-            var frames = Channel.CreateUnbounded<byte[]>(
-                new UnboundedChannelOptions { SingleReader = true, SingleWriter = true });
+            var frames = Channel.CreateBounded<byte[]>(new BoundedChannelOptions(256)
+                { SingleReader = true, SingleWriter = true, FullMode = BoundedChannelFullMode.DropOldest });
             var encoder = new TalkFrameEncoder(sampleRate, (int)ability.SampleRate, (int)ability.LengthPerEncoder);
             using var pumpCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
             var pump = Task.Run(async () =>

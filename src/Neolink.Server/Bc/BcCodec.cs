@@ -89,6 +89,9 @@ public static class BcCodec
         };
 
         var msg = new BcMessage { Meta = meta };
+        // A stopped preview releases its command number. Its acknowledgement can contain XML despite the old binary mode.
+        if (msgId == 4 && responseCode == 200)
+            ctx.InBinMode.Remove(msgNum);
 
         if (!BcConstants.IsModernClass(cls))
         {

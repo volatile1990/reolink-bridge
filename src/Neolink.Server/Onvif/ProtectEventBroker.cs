@@ -26,7 +26,7 @@ public sealed class ProtectEventBroker
     private readonly TimeSpan _stale;
     private readonly int _channel;
     private readonly string _motionEventPolicy;
-    private readonly string _instanceId = Guid.NewGuid().ToString("N");
+    private string _instanceId = Guid.NewGuid().ToString("N");
     private readonly Queue<ProtectAlarmPush> _replay = new();
     private readonly Dictionary<string, Subscription> _subscriptions = new(StringComparer.Ordinal);
     private readonly Dictionary<string, State> _states = new(StringComparer.Ordinal) { ["motion"] = new() };
@@ -34,6 +34,8 @@ public sealed class ProtectEventBroker
     private long _suppressedUnclassifiedPushes, _forwardedMotionStarts, _forwardedMotionClears;
     private DateTimeOffset? _lastCameraPush;
     private bool _stopped;
+    private bool _sourceConnected;
+    private readonly ProtectReplayJournal? _journal;
 
     private sealed class State
     {
@@ -52,7 +54,8 @@ public sealed class ProtectEventBroker
     }
 
     public ProtectEventBroker(int staleSeconds = 120, TimeProvider? clock = null, int channel = 0,
-        string motionEventPolicy = "all")
+        string motionEventPolicy = "all", string? replayPath = null,
+        int replayRetentionSeconds = 86400, int replayMaxBytes = 8 * 1024 * 1024)
     {
         if (staleSeconds is < 5 or > 600) throw new ArgumentOutOfRangeException(nameof(staleSeconds));
         if (motionEventPolicy is not ("all" or "classified" or "none")) throw new ArgumentOutOfRangeException(nameof(motionEventPolicy));
@@ -60,6 +63,13 @@ public sealed class ProtectEventBroker
         _clock = clock ?? TimeProvider.System;
         _channel = channel;
         _motionEventPolicy = motionEventPolicy;
+        if (replayPath != null)
+        {
+            _journal = new(replayPath, replayMaxBytes, TimeSpan.FromSeconds(replayRetentionSeconds), _clock.GetUtcNow());
+            _instanceId = _journal.InstanceId; _cameraPushes = _journal.Sequence; _connectionEpoch = _journal.Epoch;
+            foreach (var push in _journal.Entries(_clock.GetUtcNow()))
+                foreach (var kind in push.Classes) _states.TryAdd(kind, new State());
+        }
     }
 
     public static string Topic(string kind) => kind == "motion" ? MotionTopic : AiTopicRoot + (kind switch
@@ -205,10 +215,16 @@ public sealed class ProtectEventBroker
         {
             if (_stopped) return;
             Prune();
-            _cameraPushes++; _lastCameraPush = _clock.GetUtcNow();
-            _replay.Enqueue(new(_cameraPushes, _lastCameraPush.Value, push.Active, classes.Order(StringComparer.Ordinal).ToArray(),
-                push.AiTypes.Take(16).Select(BoundedText).ToArray(), BoundedText(push.Status), _connectionEpoch));
-            while (_replay.Count > MaxQueue) _replay.Dequeue();
+            _cameraPushes++; _lastCameraPush = _clock.GetUtcNow(); _sourceConnected = true;
+            var cameraPush = new ProtectAlarmPush(_cameraPushes, _lastCameraPush.Value, push.Active,
+                classes.Order(StringComparer.Ordinal).ToArray(), push.AiTypes.Take(16).Select(BoundedText).ToArray(),
+                BoundedText(push.Status), _connectionEpoch);
+            if (_journal != null) _journal.Append(cameraPush, _lastCameraPush.Value);
+            else
+            {
+                _replay.Enqueue(cameraPush);
+                while (_replay.Count > MaxQueue) _replay.Dequeue();
+            }
             foreach (string kind in classes) _states.TryAdd(kind, new State());
             bool classified = push.AiTypes.Any(IsClassification);
             bool forwardMotion = push.Active && (_motionEventPolicy == "all" || (_motionEventPolicy == "classified" && classified));
@@ -250,15 +266,20 @@ public sealed class ProtectEventBroker
     {
         lock (_gate)
         {
-            _connectionEpoch++;
+            if (_stopped) return;
+            _connectionEpoch++; _sourceConnected = false;
+            _journal?.SetEpoch(_connectionEpoch);
             foreach (var kind in _states.Keys) Set(kind, false);
         }
     }
+    public void SetSourceConnected(bool connected)
+    { lock (_gate) if (!_stopped) _sourceConnected = connected; }
+
     public void Stop()
     {
         lock (_gate)
         {
-            _stopped = true;
+            _stopped = true; _sourceConnected = false; _journal?.Dispose();
             foreach (var sub in _subscriptions.Values) Wake(sub);
             _subscriptions.Clear();
         }
@@ -282,17 +303,28 @@ public sealed class ProtectEventBroker
         if (after < 0 || limit is < 1 or > MaxQueue) throw new ArgumentOutOfRangeException(nameof(after));
         lock (_gate)
         {
-            long oldest = _replay.TryPeek(out var first) ? first.Sequence : _cameraPushes + 1;
+            var replay = _journal?.Entries(_clock.GetUtcNow()) ?? _replay.ToArray();
+            long oldest = replay.Length > 0 ? replay[0].Sequence : _cameraPushes + 1;
+            var selected = new List<object>();
+            int responseBytes = 0;
+            foreach (var push in replay.Where(e => e.Sequence > after).Take(limit))
+            {
+                var value = new
+                {
+                    seq = push.Sequence, timestampUtc = push.At, motion = push.Active, isActive = push.Active,
+                    classes = push.Classes.ToArray(), rawAiTypes = push.RawAiTypes.ToArray(), sourceStatus = push.SourceStatus,
+                    source = new { profile = "main", channel = _channel, connectionEpoch = push.ConnectionEpoch }, zones = Array.Empty<string>()
+                };
+                int size = System.Text.Json.JsonSerializer.SerializeToUtf8Bytes(value).Length;
+                if (selected.Count > 0 && responseBytes + size > 448 * 1024) break;
+                selected.Add(value); responseBytes += size;
+            }
             return new
             {
                 instanceId = _instanceId, currentSeq = _cameraPushes, oldestSeq = oldest,
                 truncated = after < oldest - 1,
-                events = _replay.Where(e => e.Sequence > after).Take(limit).Select(e => new
-                {
-                    seq = e.Sequence, timestampUtc = e.At, motion = e.Active, isActive = e.Active,
-                    classes = e.Classes.ToArray(), rawAiTypes = e.RawAiTypes.ToArray(), sourceStatus = e.SourceStatus,
-                    source = new { profile = "main", channel = _channel, connectionEpoch = e.ConnectionEpoch }, zones = Array.Empty<string>()
-                }).ToArray()
+                source = new { connectionEpoch = _connectionEpoch, connected = _sourceConnected },
+                events = selected.ToArray()
             };
         }
     }
@@ -303,6 +335,8 @@ public sealed class ProtectEventBroker
             Prune();
             return new
             {
+                replay = _journal?.Diagnostics() ?? new { enabled = false, retainedPushes = _replay.Count },
+                source = new { connectionEpoch = _connectionEpoch, connected = _sourceConnected },
                 cameraPushes = _cameraPushes, stateChanges = _changes, deliveredMessages = _delivered,
                 queueResets = _queueResets, subscriptions = _subscriptions.Count,
                 queuedMessages = _subscriptions.Values.Sum(s => s.Queue.Count),

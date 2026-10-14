@@ -21,6 +21,13 @@ public static class Sdp
     public static string Build(IStreamHub hub, string sessionName, bool backchannel = false, bool opus = false,
         bool videoOnly = false)
     {
+        hub.TryGetCurrentDescription(out var snapshot);
+        return Build(snapshot, sessionName, backchannel, opus, videoOnly);
+    }
+
+    public static string Build(StreamDescriptionSnapshot hub, string sessionName, bool backchannel = false, bool opus = false,
+        bool videoOnly = false)
+    {
         var sb = new StringBuilder();
         long sid = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
         sb.Append("v=0\r\n");

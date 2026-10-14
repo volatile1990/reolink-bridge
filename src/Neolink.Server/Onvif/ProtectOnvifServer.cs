@@ -13,10 +13,10 @@ using Neolink.Streaming;
 
 namespace Neolink.Onvif;
 
-public sealed record ProtectOnvifStream(string Token, string Path, IStreamHub Hub);
+public sealed record ProtectOnvifStream(string Token, string Path, IStreamHub Hub, bool RequiredForHealth = true);
 
 /// <summary>Read-only ONVIF device/media endpoint for one independently addressable camera.
-/// Camera controls, encoder writes, time writes and extra camera logins are deliberately absent.</summary>
+/// Optional authenticated camera controls are served separately from the read-only Media profile contract.</summary>
 public sealed partial class ProtectOnvifServer
 {
     public const string NsSoap = "http://www.w3.org/2003/05/soap-envelope";
@@ -36,14 +36,20 @@ public sealed partial class ProtectOnvifServer
     private readonly int _rtspPort;
     private readonly IProtectSnapshotProvider? _snapshots;
     private readonly SnapshotDigestAuthentication _snapshotDigest;
+    private readonly ProtectCameraControls? _controls;
+    private readonly IReadOnlySet<string> _controlUsers;
     public ProtectEventBroker? Events { get; }
+    /// <summary>Safe, authenticated diagnostics from the optional low-quality encoder.</summary>
+    public Func<object>? LowQualityEncoderDiagnostics { get; set; }
+    public Func<object>? NativeTalkDiagnostics { get; set; }
+    public Func<object>? GopAudioDiagnostics { get; set; }
     private readonly long _startedTimestamp = System.Diagnostics.Stopwatch.GetTimestamp();
     private readonly Dictionary<string, DateTime> _nonces = new(StringComparer.Ordinal);
     private readonly Dictionary<string, int> _connections = new(StringComparer.Ordinal);
 
     public ProtectOnvifServer(BridgeOnvifConfig config, IReadOnlyDictionary<string, string> users,
         IReadOnlyList<ProtectOnvifStream> streams, int rtspPort, IProtectSnapshotProvider? snapshots = null,
-        TimeProvider? snapshotAuthClock = null, ProtectEventBroker? events = null)
+        TimeProvider? snapshotAuthClock = null, ProtectEventBroker? events = null, ProtectCameraControls? controls = null)
     {
         config.Validate();
         if (rtspPort is < 1 or > 65535 || config.Port == rtspPort)
@@ -52,35 +58,54 @@ public sealed partial class ProtectOnvifServer
             throw new ArgumentException("Each ONVIF profile needs a distinct stream token");
         if (streams.Any(s => !s.Path.StartsWith('/') || s.Path.Contains('?') || s.Path.Contains('#')))
             throw new ArgumentException("RTSP paths must be absolute mount paths");
+        if (!streams.Any(s => s.RequiredForHealth))
+            throw new ArgumentException("At least one ONVIF stream must be required for health");
         _config = config;
         _users = users;
+        _controlUsers = (config.ControlUsers ?? users.Keys.ToList()).ToHashSet(StringComparer.Ordinal);
         _streams = streams;
         _rtspPort = rtspPort;
         _snapshots = snapshots;
         _snapshotDigest = new SnapshotDigestAuthentication(users, snapshotAuthClock ?? TimeProvider.System);
+        if (config.Controls && users.Count == 0) throw new ArgumentException("Camera controls require authenticated bridge users");
+        if (controls != null && !config.Controls) throw new ArgumentException("Camera controls require an explicit opt-in");
+        _controls = controls;
+        // REST and native ONVIF share one actuator owner, watchdog and zoom loop.
+        _ptzCamera = controls?.PtzCamera;
         Events = config.Events ? events ?? new ProtectEventBroker(config.EventStaleSeconds,
             motionEventPolicy: config.MotionEventPolicy) : null;
     }
 
-    public bool Healthy => _streams.All(s => !s.Hub.AuthenticationFailed
+    public bool Healthy => _streams.Where(s => s.RequiredForHealth).All(s => !s.Hub.AuthenticationFailed
         && s.Hub.VideoReady && s.Hub.LiveVideo && Matches(s)
         && s.Hub.GetVideoDiagnostics().LastVideoAgeMs is >= 0 and <= 5000);
 
-    private string SourceStatus(bool healthy) => _streams.Any(s => s.Hub.AuthenticationFailed)
+    private string SourceStatus(bool healthy) => _streams.Any(s => s.RequiredForHealth && s.Hub.AuthenticationFailed)
         ? "authentication-failed" : healthy ? "ready" : "waiting-for-camera";
 
     private string MetricsJson() => JsonSerializer.Serialize(new
     {
+        build = BridgeBuildInfo.Diagnostics(),
         status = SourceStatus(Healthy),
+        source = SourceDiagnostics?.Invoke(),
         events = Events?.Diagnostics(),
+        lowQualityEncoder = LowQualityEncoderDiagnostics?.Invoke(),
+        nativeTalk = NativeTalkDiagnostics?.Invoke(),
+        gopAudio = GopAudioDiagnostics?.Invoke(),
         uptimeSeconds = System.Diagnostics.Stopwatch.GetElapsedTime(_startedTimestamp).TotalSeconds,
         streams = _streams.Select(stream =>
         {
+            bool descriptionAvailable = stream.Hub.TryGetCurrentDescription(out var description);
             var diagnostics = stream.Hub.GetVideoDiagnostics();
             var buffers = stream.Hub.GetVideoBufferDiagnostics();
             return new
             {
                 profile = stream.Token,
+                sourceEpoch = description.SourceEpoch,
+                descriptionAvailable,
+                audio = new { available = description.Audio != null, isAac = description.Audio?.IsAac,
+                    sampleRate = description.Audio?.SampleRate, channels = description.Audio?.Channels,
+                    metadataCurrent = descriptionAvailable && description.Audio != null },
                 codec = stream.Hub.Codec?.ToString(),
                 width = stream.Hub.Width,
                 height = stream.Hub.Height,
@@ -116,6 +141,15 @@ public sealed partial class ProtectOnvifServer
         var basic = NetUtil.DecodeBasicAuth(authorization);
         return basic is { } credentials && _users.TryGetValue(credentials.User, out var expected)
             && NetUtil.FixedTimeEquals(expected, credentials.Pass);
+    }
+    private bool ControlUserAllowed(string? authorization) => NetUtil.DecodeBasicAuth(authorization) is { } basic
+        && _controlUsers.Contains(basic.User);
+    private string? AuthenticatedUsername(XElement envelope, string? authorization)
+    {
+        if (authorization != null) return NetUtil.DecodeBasicAuth(authorization)?.User;
+        var token = envelope.Elements().FirstOrDefault(e => e.Name.LocalName == "Header")?
+            .Descendants().FirstOrDefault(e => e.Name.LocalName == "UsernameToken");
+        return token == null ? null : Child(token, "Username");
     }
 
     public async Task RunAsync(CancellationToken ct)
@@ -164,10 +198,21 @@ public sealed partial class ProtectOnvifServer
         finally
         {
             listener.Stop();
+            await StopControlsAsync().ConfigureAwait(false);
             Events?.Stop();
             await Task.WhenAll(clients).ConfigureAwait(false);
             try { await discovery.ConfigureAwait(false); } catch (OperationCanceledException) { }
         }
+    }
+
+    public Func<object>? SourceDiagnostics { get; set; }
+    internal Task StopControlsAsync() => _controls?.StopAsync() ?? Task.CompletedTask;
+    private async Task WarmControlMetadataAsync(CancellationToken ct)
+    {
+        if (_controls == null) return;
+        try { await _controls.CapabilitiesAsync(ct).ConfigureAwait(false); }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested) { throw; }
+        catch { /* unavailable optional controls do not invalidate configured video profiles */ }
     }
 
     private async Task ServeAsync(TcpClient client, CancellationToken ct)
@@ -199,6 +244,19 @@ public sealed partial class ProtectOnvifServer
             }
             if (request.Length != 3 || !request[2].StartsWith("HTTP/1."))
             { await RespondAsync(stream, 400, "", true, ct); return; }
+            bool controlPath = request[1].StartsWith("/control/", StringComparison.Ordinal);
+            if (request[0] == "GET" && request[1] == "/control/listen")
+            {
+                await HandleListenAsync(stream, headers, ct).ConfigureAwait(false);
+                return;
+            }
+            if (controlPath && request[0] == "GET")
+            {
+                // Cold capability reads have their own bounded work budget, independent of the header deadline.
+                var result = await HandleControlAsync("GET", request[1], "", headers, ct).ConfigureAwait(false);
+                await RespondAsync(stream, result.Status, result.Body, true, ct, "application/json").ConfigureAwait(false);
+                return;
+            }
             if (request[0] == "GET")
             {
                 if (request[1] == "/events" || request[1].StartsWith("/events?", StringComparison.Ordinal))
@@ -226,7 +284,7 @@ public sealed partial class ProtectOnvifServer
                 return;
             }
             if (request[0] != "POST") { await RespondAsync(stream, 405, "", true, ct); return; }
-            if (request[1] is not ("/onvif/device_service" or "/onvif/media_service" or "/onvif/media2_service" or "/onvif/events_service")
+            if (!controlPath && request[1] is not ("/onvif/device_service" or "/onvif/media_service" or "/onvif/media2_service" or "/onvif/events_service" or "/onvif/ptz_service")
                 && !ValidSubscriptionPath(request[1]))
             { await RespondAsync(stream, 404, "", true, ct); return; }
             if (headers.ContainsKey("Transfer-Encoding") || !int.TryParse(headers.GetValueOrDefault("Content-Length"),
@@ -251,6 +309,12 @@ public sealed partial class ProtectOnvifServer
             bool close = request[2] != "HTTP/1.1" || headers.GetValueOrDefault("Connection")?.Equals("close", StringComparison.OrdinalIgnoreCase) == true;
             using var work = CancellationTokenSource.CreateLinkedTokenSource(ct);
             work.CancelAfter(TimeSpan.FromSeconds(ProtectEventBroker.MaxPullSeconds + 5));
+            if (controlPath)
+            {
+                var result = await HandleControlAsync("POST", request[1], Encoding.UTF8.GetString(bodyBytes), headers, work.Token).ConfigureAwait(false);
+                await RespondAsync(stream, result.Status, result.Body, true, ct, "application/json").ConfigureAwait(false);
+                return;
+            }
             var reply = await HandleAsync(Encoding.UTF8.GetString(bodyBytes), headers.GetValueOrDefault("Authorization"), work.Token, request[1]).ConfigureAwait(false);
             await RespondAsync(stream, reply.Status, reply.Body, close, ct).ConfigureAwait(false);
             if (close) return;
@@ -336,6 +400,10 @@ public sealed partial class ProtectOnvifServer
             return Fault(400, "ter:WellFormed", "A SOAP envelope and single operation are required");
         string service = op.Name.NamespaceName, action = op.Name.LocalName;
         if (service == NsDevice)
+        {
+            if (action is "GetServices" or "GetCapabilities" && _controls != null
+                && Authenticated(envelope, authorization))
+                await WarmControlMetadataAsync(ct).ConfigureAwait(false);
             switch (action)
             {
                 case "GetSystemDateAndTime": return Ok(SystemDateAndTime());
@@ -343,7 +411,17 @@ public sealed partial class ProtectOnvifServer
                 case "GetCapabilities": return Ok(Capabilities());
                 case "GetServiceCapabilities": return Ok(DeviceServiceCapabilities());
             }
+        }
         if (!Authenticated(envelope, authorization)) return Fault(401, "ter:NotAuthorized", "Authentication required");
+        if (service is NsMedia or NsMedia2 && action is "GetProfiles" or "GetProfile")
+            await WarmControlMetadataAsync(ct).ConfigureAwait(false);
+        if (service == NsPtz)
+        {
+            if (action is "ContinuousMove" or "RelativeMove" or "AbsoluteMove" or "GotoPreset" or "Stop"
+                && !_controlUsers.Contains(AuthenticatedUsername(envelope, authorization) ?? ""))
+                return Fault(403, "ter:NotAuthorized", "Camera control permission required");
+            return await HandleNativePtzAsync(op, ct).ConfigureAwait(false);
+        }
         if (service is NsEvents or NsWsnt)
         {
             string? owner = AuthenticatedOwner(envelope, authorization);
@@ -381,6 +459,7 @@ public sealed partial class ProtectOnvifServer
         // Metadata comes from the stream already carried by RTSP, never another camera connection.
         if (_streams.Any(s => !Matches(s)))
             return Fault(503, "ter:Action", "Camera encoding differs from the configured profile; correct the bridge configuration");
+        if (TryAudioReply(action, prefix, media2, op, out var audioReply)) return audioReply;
         if (action is "GetProfiles" or "GetVideoSources" or "GetVideoEncoderConfigurations")
             return Ok(action switch
             {

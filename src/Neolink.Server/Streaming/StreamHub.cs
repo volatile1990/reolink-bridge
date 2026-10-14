@@ -24,7 +24,15 @@ public sealed record HubVideo(long Index, byte[] AnnexB, bool Keyframe, uint Rtp
     public uint? CameraMicroseconds { get; init; }
 }
 /// <summary>One raw AAC access unit (no ADTS header). RTP clock = sample rate.</summary>
-public sealed record HubAudioAac(long Index, byte[] Au, uint RtpTs) : HubPacket(Index);
+public sealed record HubAudioAac(long Index, byte[] Au, uint RtpTs) : HubPacket(Index)
+{
+    public long SourceEpoch { get; init; }
+    /// <summary>Monotonic ADTS-block arrival; not a camera capture timestamp.</summary>
+    public long? ArrivalTimestamp { get; init; }
+    public long ArrivalTimestampFrequency { get; init; }
+    public int BlockIndex { get; init; }
+    public int BlockUnits { get; init; } = 1;
+}
 /// <summary>16-bit little-endian mono PCM decoded from ADPCM. RTP clock = sample rate.</summary>
 public sealed record HubAudioPcm(long Index, byte[] Pcm, uint RtpTs) : HubPacket(Index);
 /// <summary>One Opus packet transcoded from the camera's audio (RFC 7587: 48 kHz
@@ -98,8 +106,22 @@ public sealed class StreamHub : IStreamHub, IMediaSink
 
     // --- Audio track info ---
     public AudioTrackInfo? Audio { get; private set; }
+    /// <summary>Observed AAC payload bitrate, averaged over the current source
+    /// epoch's samples. This is measured media metadata, not an encoder setting.</summary>
+    public int? AudioBitrateKbps { get; private set; }
+    public long AudioMetadataSourceEpoch { get; private set; } = -1;
+    private long _aacPayloadBytes;
+    private long _aacSampleCount;
+    private long _lastAudioTimestamp, _audioPacketCount;
+    private readonly ConcurrentDictionary<Guid, (Channel<HubPacket> Channel, bool Viewer)> _audioSubscribers = new();
+    /// <summary>Only audio consumers, with no GOP priming or video packet retention.</summary>
+    public int AudioSubscriberCount => _audioSubscribers.Count;
+    public double? LastAudioAgeMs => Interlocked.Read(ref _audioPacketCount) == 0 ? null :
+        Math.Max(0, _diagnosticClock.GetTimestamp() - Interlocked.Read(ref _lastAudioTimestamp))
+            * 1000.0 / _diagnosticClock.TimestampFrequency;
 
-    private readonly TaskCompletionSource _videoReady = new(TaskCreationOptions.RunContinuationsAsynchronously);
+    private TaskCompletionSource _videoReady = NewReadySignal();
+    private static TaskCompletionSource NewReadySignal() => new(TaskCreationOptions.RunContinuationsAsynchronously);
     private DateTime _firstVideoAt = DateTime.MaxValue;
     private bool _audioProbeDone;
 
@@ -251,13 +273,13 @@ public sealed class StreamHub : IStreamHub, IMediaSink
         }
     }
 
-    public int SubscriberCount => _subscribers.Count;
+    public int SubscriberCount => _subscribers.Count + _audioSubscribers.Count;
 
     /// <summary>External watchers only — recorders and other internal taps excluded.</summary>
     public int ViewerCount => Volatile.Read(ref _viewerCount);
 
     /// <summary>True once codec parameters have been learned (DESCRIBE/init can be answered).</summary>
-    public bool VideoReady => _videoReady.Task.IsCompletedSuccessfully;
+    public bool VideoReady { get { lock (_gate) return _videoReady.Task.IsCompletedSuccessfully; } }
 
     /// <inheritdoc/>
     public bool HasBufferedGop
@@ -287,128 +309,163 @@ public sealed class StreamHub : IStreamHub, IMediaSink
 
     public void PublishVideo(VideoFrame frame)
     {
-        long arrivalTimestamp = _diagnosticClock.GetTimestamp();
-        RecordVideoArrival(frame.Data.Length);
-        RecordVideoBuffer(frame);
-        // Advance the RTP timestamp using the camera's microsecond counter when sane,
-        // otherwise fall back to wall clock.
-        uint deltaUs;
-        var wallNow = _wallClock.Elapsed;
-        if (!_haveVideoTs)
+        lock (_gate)
         {
-            deltaUs = 0;
-            _haveVideoTs = true;
-        }
-        else
-        {
-            deltaUs = unchecked(frame.Microseconds - _lastVideoUs); // wrap-safe
-            if (deltaUs == 0 || deltaUs > 5_000_000)
-                deltaUs = (uint)Math.Clamp((wallNow - _lastWall).TotalMicroseconds, 0, 5_000_000);
-        }
-        _lastVideoUs = frame.Microseconds;
-        _lastWall = wallNow;
-        _videoRtpTs = unchecked(_videoRtpTs + (uint)((ulong)deltaUs * 90 / 1000));
-
-        // Learn codec parameters from the stream. Parameter sets ride keyframes,
-        // so once they are known, P-frames skip the full-buffer NAL scan — that's
-        // the hub's per-frame hot path across every stream.
-        bool paramsUpdated = false;
-        bool frameHasSps = false;
-        bool needParams = frame.Keyframe || Sps == null || Pps == null
-            || (frame.Codec == VideoCodec.H265 && Vps == null);
-        if (needParams)
-        foreach (var nal in H26x.SplitNals(frame.Data))
-        {
-            var span = nal.Span;
-            if (span.Length == 0) continue;
-            if (frame.Codec == VideoCodec.H264)
+            long arrivalTimestamp = _diagnosticClock.GetTimestamp();
+            RecordVideoArrival(frame.Data.Length);
+            RecordVideoBuffer(frame);
+            // Advance the RTP timestamp using the camera's microsecond counter when sane,
+            // otherwise fall back to wall clock.
+            uint deltaUs;
+            var wallNow = _wallClock.Elapsed;
+            if (!_haveVideoTs)
             {
-                switch (H26x.H264NalType(span))
-                {
-                    case H26x.H264Sps: Sps = nal.ToArray(); paramsUpdated = true; frameHasSps = true; break;
-                    case H26x.H264Pps: Pps = nal.ToArray(); paramsUpdated = true; break;
-                }
+                deltaUs = 0;
+                _haveVideoTs = true;
             }
             else
             {
-                switch (H26x.H265NalType(span))
+                deltaUs = unchecked(frame.Microseconds - _lastVideoUs); // wrap-safe
+                if (deltaUs == 0 || deltaUs > 5_000_000)
+                    deltaUs = (uint)Math.Clamp((wallNow - _lastWall).TotalMicroseconds, 0, 5_000_000);
+            }
+            _lastVideoUs = frame.Microseconds;
+            _lastWall = wallNow;
+            _videoRtpTs = unchecked(_videoRtpTs + (uint)((ulong)deltaUs * 90 / 1000));
+
+            // Learn codec parameters from the stream. Parameter sets ride keyframes,
+            // so once they are known, P-frames skip the full-buffer NAL scan — that's
+            // the hub's per-frame hot path across every stream.
+            if (Codec != null && Codec != frame.Codec)
+            {
+                Sps = Pps = Vps = null;
+                var previous = _videoReady;
+                _videoReady = NewReadySignal();
+                previous.TrySetResult();
+            }
+            bool paramsUpdated = false;
+            bool frameHasSps = false;
+            bool needParams = frame.Keyframe || Sps == null || Pps == null
+                || (frame.Codec == VideoCodec.H265 && Vps == null);
+            if (needParams)
+            foreach (var nal in H26x.SplitNals(frame.Data))
+            {
+                var span = nal.Span;
+                if (span.Length == 0) continue;
+                if (frame.Codec == VideoCodec.H264)
                 {
-                    case H26x.H265Vps: Vps = nal.ToArray(); paramsUpdated = true; break;
-                    case H26x.H265Sps: Sps = nal.ToArray(); paramsUpdated = true; frameHasSps = true; break;
-                    case H26x.H265Pps: Pps = nal.ToArray(); paramsUpdated = true; break;
+                    switch (H26x.H264NalType(span))
+                    {
+                        case H26x.H264Sps: Sps = nal.ToArray(); paramsUpdated = true; frameHasSps = true; break;
+                        case H26x.H264Pps: Pps = nal.ToArray(); paramsUpdated = true; break;
+                    }
+                }
+                else
+                {
+                    switch (H26x.H265NalType(span))
+                    {
+                        case H26x.H265Vps: Vps = nal.ToArray(); paramsUpdated = true; break;
+                        case H26x.H265Sps: Sps = nal.ToArray(); paramsUpdated = true; frameHasSps = true; break;
+                        case H26x.H265Pps: Pps = nal.ToArray(); paramsUpdated = true; break;
+                    }
                 }
             }
-        }
 
-        lock (_gate)
-        {
-            Codec = frame.Codec;
-            if (_firstVideoAt == DateTime.MaxValue) _firstVideoAt = DateTime.UtcNow;
-            // Sources without a resolution side channel (generic RTSP pulls) get
-            // their dimensions from the SPS itself — MSE rejects a 0×0 init. Re-read on
-            // every SPS: a bad first one, or a resolution change, must not stick.
-            if (((Width == 0 && paramsUpdated && Sps != null) || (_sizeFromSps && frameHasSps))
-                && H26x.TryGetDimensions(frame.Codec, Sps, out var w, out var h))
+            lock (_gate)
             {
-                if (_sizeFromSps && (w != Width || h != Height))
-                    Log.Info($"{Name}: video size now {w}x{h} (was {Width}x{Height})");
-                Width = w;
-                Height = h;
-                _sizeFromSps = true;
+                Codec = frame.Codec;
+                if (_firstVideoAt == DateTime.MaxValue) _firstVideoAt = DateTime.UtcNow;
+                // Sources without a resolution side channel (generic RTSP pulls) get
+                // their dimensions from the SPS itself — MSE rejects a 0×0 init. Re-read on
+                // every SPS: a bad first one, or a resolution change, must not stick.
+                if (((Width == 0 && paramsUpdated && Sps != null) || (_sizeFromSps && frameHasSps))
+                    && H26x.TryGetDimensions(frame.Codec, Sps, out var w, out var h))
+                {
+                    if (_sizeFromSps && (w != Width || h != Height))
+                        Log.Info($"{Name}: video size now {w}x{h} (was {Width}x{Height})");
+                    Width = w;
+                    Height = h;
+                    _sizeFromSps = true;
+                }
             }
+
+            // H.265 needs the VPS too: an hvcC built without it is not a decodable
+            // configuration, and MSE rejects the init segment outright.
+            bool ready = Sps != null && Pps != null
+                         && (frame.Codec == VideoCodec.H264 || Vps != null);
+            if (ready)
+                _videoReady.TrySetResult();
+
+            Emit(new HubVideo(0, frame.Data, frame.Keyframe, _videoRtpTs, frameHasSps)
+                 { SourceEpoch = SourceEpoch, ArrivalTimestamp = arrivalTimestamp,
+                   ArrivalTimestampFrequency = _diagnosticClock.TimestampFrequency, CameraMicroseconds = frame.Microseconds },
+                 frame.Keyframe, frame.Data.Length);
         }
-
-        // H.265 needs the VPS too: an hvcC built without it is not a decodable
-        // configuration, and MSE rejects the init segment outright.
-        bool ready = Sps != null && Pps != null
-                     && (frame.Codec == VideoCodec.H264 || Vps != null);
-        if (ready)
-            _videoReady.TrySetResult();
-
-        Emit(new HubVideo(Interlocked.Increment(ref _index), frame.Data, frame.Keyframe, _videoRtpTs, frameHasSps)
-             { SourceEpoch = SourceEpoch, ArrivalTimestamp = arrivalTimestamp,
-               ArrivalTimestampFrequency = _diagnosticClock.TimestampFrequency, CameraMicroseconds = frame.Microseconds },
-             frame.Keyframe, frame.Data.Length);
     }
 
     public void PublishAac(AacFrame frame)
     {
-        MaybeStartTranscoder(AudioTranscoder.SourceKind.AdtsAac);
-        _transcoder?.Feed(frame.Data); // whole ADTS block — ffmpeg reads the framing itself
-        foreach (var au in Adts.Split(frame.Data))
+        lock (_gate)
         {
-            if (Audio == null || !Audio.IsAac)
+            MaybeStartTranscoder(AudioTranscoder.SourceKind.AdtsAac);
+            _transcoder?.Feed(frame.Data); // whole ADTS block — ffmpeg reads the framing itself
+            var units = Adts.Split(frame.Data);
+            long arrival = _diagnosticClock.GetTimestamp();
+            for (int unitIndex = 0; unitIndex < units.Count; unitIndex++)
             {
-                Audio = new AudioTrackInfo(true, au.SampleRate, au.Channels, au.AudioSpecificConfig);
-                Log.Debug($"{Name}: AAC audio detected ({au.SampleRate} Hz, {au.Channels}ch)");
+                var au = units[unitIndex];
+                if (AudioMetadataSourceEpoch != SourceEpoch || Audio == null || !Audio.IsAac
+                    || Audio.SampleRate != au.SampleRate || Audio.Channels != au.Channels)
+                {
+                    Audio = new AudioTrackInfo(true, au.SampleRate, au.Channels, au.AudioSpecificConfig);
+                    _aacPayloadBytes = 0;
+                    _aacSampleCount = 0;
+                    AudioMetadataSourceEpoch = SourceEpoch;
+                    Log.Debug($"{Name}: AAC audio detected ({au.SampleRate} Hz, {au.Channels}ch)");
+                }
+                _aacPayloadBytes += au.Data.Length;
+                _aacSampleCount += 1024;
+                AudioBitrateKbps = (int)Math.Clamp(Math.Round(8.0 * _aacPayloadBytes * au.SampleRate
+                    / _aacSampleCount / 1000.0), 1, int.MaxValue);
+                var packet = new HubAudioAac(0, au.Data, _audioRtpTs)
+                { SourceEpoch = SourceEpoch, ArrivalTimestamp = arrival, ArrivalTimestampFrequency = _diagnosticClock.TimestampFrequency,
+                    BlockIndex = unitIndex, BlockUnits = units.Count };
+                packet = (HubAudioAac)Emit(packet, false, au.Data.Length);
+                PublishToAudioListeners(packet);
+                _audioRtpTs = unchecked(_audioRtpTs + 1024); // AAC frame = 1024 samples
             }
-            Emit(new HubAudioAac(Interlocked.Increment(ref _index), au.Data, _audioRtpTs), false, au.Data.Length);
-            _audioRtpTs = unchecked(_audioRtpTs + 1024); // AAC frame = 1024 samples
         }
     }
 
     public void PublishAdpcm(AdpcmFrame frame)
     {
-        byte[] pcm;
-        try
+        lock (_gate)
         {
-            pcm = Adpcm.BlockToPcm(frame.Data);
+            byte[] pcm;
+            try
+            {
+                pcm = Adpcm.BlockToPcm(frame.Data);
+            }
+            catch (Exception ex)
+            {
+                Log.Debug($"{Name}: bad ADPCM block: {ex.Message}");
+                return;
+            }
+            if (Audio == null || Audio.IsAac || AudioMetadataSourceEpoch != SourceEpoch)
+            {
+                // The original Neolink played DVI-4 ADPCM at 8 kHz
+                Audio = new AudioTrackInfo(false, 8000, 1, null);
+                Log.Debug($"{Name}: ADPCM audio detected (decoding to PCM @ 8 kHz)");
+            }
+            AudioBitrateKbps = null; // raw L16 is not an ONVIF AudioEncoding enum
+            AudioMetadataSourceEpoch = SourceEpoch;
+            MaybeStartTranscoder(AudioTranscoder.SourceKind.Pcm16le8k);
+            _transcoder?.Feed(pcm);
+            var packet = new HubAudioPcm(0, pcm, _audioRtpTs);
+            packet = (HubAudioPcm)Emit(packet, false, pcm.Length);
+            PublishToAudioListeners(packet);
+            _audioRtpTs = unchecked(_audioRtpTs + (uint)(pcm.Length / 2));
         }
-        catch (Exception ex)
-        {
-            Log.Debug($"{Name}: bad ADPCM block: {ex.Message}");
-            return;
-        }
-        if (Audio == null)
-        {
-            // The original Neolink played DVI-4 ADPCM at 8 kHz
-            Audio = new AudioTrackInfo(false, 8000, 1, null);
-            Log.Debug($"{Name}: ADPCM audio detected (decoding to PCM @ 8 kHz)");
-        }
-        MaybeStartTranscoder(AudioTranscoder.SourceKind.Pcm16le8k);
-        _transcoder?.Feed(pcm);
-        Emit(new HubAudioPcm(Interlocked.Increment(ref _index), pcm, _audioRtpTs), false, pcm.Length);
-        _audioRtpTs = unchecked(_audioRtpTs + (uint)(pcm.Length / 2));
     }
 
     /// <summary>Starts the Opus transcoder on the publish loop's next audio frame
@@ -425,12 +482,15 @@ public sealed class StreamHub : IStreamHub, IMediaSink
             Log.Info($"{Name}: transcoding audio to Opus " +
                      $"({(kind == AudioTranscoder.SourceKind.AdtsAac ? "AAC" : "ADPCM/PCM")} source, " +
                      "48 kHz mono @ 32 kb/s) — runs while Opus clients are connected");
+            long transcodingEpoch = SourceEpoch;
             _transcoder = new AudioTranscoder(Name, kind, pkt =>
             {
-                // Runs on the transcoder's reader task; Emit locks, _index is
-                // interlocked, and _opusRtpTs is only ever touched here.
-                Emit(new HubAudioOpus(Interlocked.Increment(ref _index), pkt, _opusRtpTs), false, pkt.Length);
-                _opusRtpTs = unchecked(_opusRtpTs + AudioTranscoder.SamplesPerPacket);
+                lock (_gate)
+                {
+                    if (SourceEpoch != transcodingEpoch) return;
+                    Emit(new HubAudioOpus(0, pkt, _opusRtpTs), false, pkt.Length);
+                    _opusRtpTs = unchecked(_opusRtpTs + AudioTranscoder.SamplesPerPacket);
+                }
             });
         }
     }
@@ -439,10 +499,11 @@ public sealed class StreamHub : IStreamHub, IMediaSink
     // and fans it out, both under _castGate so a concurrent Subscribe can't
     // interleave. The lock is effectively uncontended: one media loop publishes
     // per hub, and TryWrite on a DropOldest channel never blocks.
-    private void Emit(HubPacket packet, bool videoKeyframe, int payloadBytes)
+    private HubPacket Emit(HubPacket packet, bool videoKeyframe, int payloadBytes)
     {
         lock (_castGate)
         {
+            packet = packet with { Index = ++_index };
             if (videoKeyframe)
             {
                 _gop.Clear();
@@ -472,40 +533,83 @@ public sealed class StreamHub : IStreamHub, IMediaSink
             var cast = _cast;
             for (int i = 0; i < cast.Length; i++)
                 cast[i].Writer.TryWrite(packet); // bounded DropOldest: never blocks
+            return packet;
         }
     }
 
     public void SourceStopped()
     {
-        // Diagnostic deltas must not interpret reconnect clock resets as camera reversals.
-        lock (_diagnosticTimestampGate)
-        {
-            _haveDiagnosticCameraTimestamp = false;
-            Interlocked.Exchange(ref _lastCameraDeltaUs, -1);
-        }
-        // The transcoder is session-scoped too: kill its ffmpeg with the session
-        // (a battery camera parking must not leave one idling). While Opus
-        // listeners remain, the next session's first audio frame starts a fresh one.
         lock (_gate)
         {
-            _transcoder?.Dispose();
-            _transcoder = null;
+            lock (_diagnosticTimestampGate)
+            {
+                _haveDiagnosticCameraTimestamp = false;
+                Interlocked.Exchange(ref _lastCameraDeltaUs, -1);
+            }
+            lock (_castGate)
+            {
+                Interlocked.Increment(ref _sourceEpoch);
+                _gop.Clear(); _gopBytes = 0; _gopOpen = false; _live = false;
+            }
+            var previous = _videoReady;
+            _videoReady = NewReadySignal();
+            previous.TrySetResult(); // old waiters re-check the new epoch instead of stranding.
+            _audioProbeDone = false;
+            _firstVideoAt = DateTime.MaxValue;
+            Codec = null; Sps = Pps = Vps = null; Width = Height = 0; _sizeFromSps = false;
+            Audio = null; AudioBitrateKbps = null; AudioMetadataSourceEpoch = -1;
+            _aacPayloadBytes = _aacSampleCount = 0;
+            _haveVideoTs = false;
+            _transcoder?.Dispose(); _transcoder = null;
         }
-        // The GOP cache is session-scoped: with no live publisher behind it, priming
-        // a joiner would play a second of stale video and freeze (seen when clicking
-        // an offline camera in the sidebar). The next session's first keyframe
-        // reopens the cache in Emit.
-        lock (_castGate)
+    }
+
+    public bool TryGetCurrentDescription(out StreamDescriptionSnapshot description)
+    {
+        lock (_gate)
         {
-            Interlocked.Increment(ref _sourceEpoch);
-            _gop.Clear();
-            _gopBytes = 0;
-            _gopOpen = false;
-            _live = false;
+            bool fresh = LiveVideo && !AuthenticationFailed && _videoReady.Task.IsCompletedSuccessfully
+                && GetVideoDiagnostics().LastVideoAgeMs is >= 0 and <= 5000;
+            var audio = AudioMetadataSourceEpoch == SourceEpoch && LastAudioAgeMs is >= 0 and <= 5000 ? Audio : null;
+            description = new(Codec, Sps?.ToArray(), Pps?.ToArray(), Vps?.ToArray(), Width, Height,
+                audio == null ? null : audio with { AudioSpecificConfig = audio.AudioSpecificConfig?.ToArray() },
+                SourceEpoch, fresh, fresh);
+            return fresh;
         }
     }
 
     // ------------------------------------------------------------------ subscribe
+
+    private void PublishToAudioListeners(HubPacket packet)
+    {
+        Interlocked.Exchange(ref _lastAudioTimestamp, _diagnosticClock.GetTimestamp());
+        Interlocked.Increment(ref _audioPacketCount);
+        if (_audioSubscribers.IsEmpty) return;
+        // Bound retained bytes as well as packet count. Normal camera AAC/PCM
+        // blocks are far smaller; an oversized block never stalls the publisher.
+        if (packet is HubAudioAac aac && aac.Au.Length > 8184
+            || packet is HubAudioPcm pcm && pcm.Pcm.Length > 16384) return;
+        foreach (var subscription in _audioSubscribers.Values) subscription.Channel.Writer.TryWrite(packet);
+    }
+
+    public (Guid Id, ChannelReader<HubPacket> Reader) SubscribeAudio(bool viewer = true)
+    {
+        var channel = Channel.CreateBounded<HubPacket>(new BoundedChannelOptions(32)
+        { FullMode = BoundedChannelFullMode.DropOldest, SingleReader = true, SingleWriter = true });
+        var id = Guid.NewGuid();
+        _audioSubscribers[id] = (channel, viewer);
+        if (viewer) Interlocked.Increment(ref _viewerCount);
+        return (id, channel.Reader);
+    }
+
+    public void UnsubscribeAudio(Guid id)
+    {
+        if (_audioSubscribers.TryRemove(id, out var subscription))
+        {
+            if (subscription.Viewer) Interlocked.Decrement(ref _viewerCount);
+            subscription.Channel.Writer.TryComplete();
+        }
+    }
 
     public (Guid id, ChannelReader<HubPacket> reader) Subscribe(bool viewer = false)
     {
@@ -566,26 +670,43 @@ public sealed class StreamHub : IStreamHub, IMediaSink
     /// </summary>
     public async Task<bool> WaitForDescribeInfoAsync(TimeSpan timeout, CancellationToken ct)
     {
+        ct.ThrowIfCancellationRequested();
         Volatile.Write(ref _lastViewerAskTicks, DateTime.UtcNow.Ticks);
-        using var cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
-        cts.CancelAfter(timeout);
+        using var deadline = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        deadline.CancelAfter(timeout);
         try
         {
-            await _videoReady.Task.WaitAsync(cts.Token).ConfigureAwait(false);
+            while (true)
+            {
+                deadline.Token.ThrowIfCancellationRequested();
+                Task ready;
+                long epoch;
+                lock (_gate) { ready = _videoReady.Task; epoch = SourceEpoch; }
+                await ready.WaitAsync(deadline.Token).ConfigureAwait(false);
+                bool probe;
+                lock (_gate)
+                {
+                    if (SourceEpoch != epoch || !ReferenceEquals(ready, _videoReady.Task)) continue;
+                    probe = Audio == null && !_audioProbeDone;
+                }
+                if (probe)
+                {
+                    for (int i = 0; i < 20; i++)
+                    {
+                        lock (_gate)
+                            if (SourceEpoch != epoch || Audio != null) break;
+                        await Task.Delay(100, deadline.Token).ConfigureAwait(false);
+                    }
+                    lock (_gate) if (SourceEpoch == epoch) _audioProbeDone = true;
+                }
+                lock (_gate)
+                {
+                    if (SourceEpoch != epoch || !ReferenceEquals(ready, _videoReady.Task)) continue;
+                    deadline.Token.ThrowIfCancellationRequested();
+                    return TryGetCurrentDescription(out _);
+                }
+            }
         }
-        catch (OperationCanceledException)
-        {
-            return false;
-        }
-        // Give audio a moment to appear (it typically arrives within a second of
-        // video) — but only probe once per hub. If the camera showed no audio the
-        // first time, don't tax every subsequent DESCRIBE with the wait.
-        if (Audio == null && !_audioProbeDone)
-        {
-            for (int i = 0; i < 20 && Audio == null && !cts.IsCancellationRequested; i++)
-                await Task.Delay(100, CancellationToken.None).ConfigureAwait(false);
-            _audioProbeDone = true;
-        }
-        return true;
+        catch (OperationCanceledException) when (!ct.IsCancellationRequested) { return false; }
     }
 }

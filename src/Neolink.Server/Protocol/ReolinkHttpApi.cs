@@ -51,10 +51,14 @@ public sealed class ReolinkHttpApi : IDisposable
     private DateTime _tokenExpiry;
 
     /// <param name="address">"host", "host:port" or a full "http(s)://host[:port]" URL.</param>
-    public ReolinkHttpApi(string address, string username, string? password, byte channelId)
+    public ReolinkHttpApi(string address, string username, string? password, byte channelId, string? certificateSha256 = null)
     {
         var baseUrl = (address.Contains("://") ? address : $"http://{address}").TrimEnd('/');
         _apiUrl = $"{baseUrl}/api.cgi";
+        if (certificateSha256 != null && (!_apiUrl.StartsWith("https:", StringComparison.OrdinalIgnoreCase)
+            || !System.Text.RegularExpressions.Regex.IsMatch(certificateSha256, "^[a-fA-F0-9]{64}$")))
+            throw new ArgumentException("Certificate pin requires an HTTPS endpoint and a SHA256 fingerprint", nameof(certificateSha256));
+        _certificateSha256 = certificateSha256;
         _username = username;
         _password = password ?? "";
         _channelId = channelId;
@@ -84,10 +88,19 @@ public sealed class ReolinkHttpApi : IDisposable
             // Cameras serve their HTTPS API with a self-signed certificate.
             handler.SslOptions = new System.Net.Security.SslClientAuthenticationOptions
             {
-                RemoteCertificateValidationCallback = (_, _, _, _) => true,
+                RemoteCertificateValidationCallback = (_, certificate, _, _) => CertificateMatches(certificate, _certificateSha256),
             };
         }
         return handler;
+    }
+
+    private readonly string? _certificateSha256;
+    internal static bool CertificateMatches(System.Security.Cryptography.X509Certificates.X509Certificate? certificate, string? pin)
+    {
+        if (certificate == null) return false;
+        if (pin == null) return true; // existing self-signed camera policy stays compatible unless explicitly pinned.
+        return System.Security.Cryptography.CryptographicOperations.FixedTimeEquals(
+            System.Security.Cryptography.SHA256.HashData(certificate.GetRawCertData()), Convert.FromHexString(pin));
     }
 
     public void Dispose() { _http.Dispose(); _httpLong?.Dispose(); }
@@ -326,6 +339,11 @@ public sealed class ReolinkHttpApi : IDisposable
             ?? throw new ReolinkApiException("GetAbility reply carries no Ability table");
     }
 
+    /// <summary>Per-class hardware support and current alarm state. A generic GetAiAlarm echo is not a capability.</summary>
+    public async Task<JsonObject> GetAiStateAsync(CancellationToken ct) =>
+        (await ExecAsync("GetAiState", new JsonObject { ["channel"] = _channelId }, ct).ConfigureAwait(false)) as JsonObject
+            ?? throw new ReolinkApiException("GetAiState reply carries no support state");
+
     /// <summary>Reads the AI config (auto-tracking et al.). Firmwares differ on whether
     /// the value is wrapped in an "AiCfg" object; the returned object is the unwrapped
     /// config and <paramref name="wrapped"/> says which shape to write back.</summary>
@@ -429,6 +447,15 @@ public sealed class ReolinkHttpApi : IDisposable
             new JsonObject { ["channel"] = _channelId, ["ai_type"] = aiType }, ct).ConfigureAwait(false);
         return value?["AiAlarm"] as JsonObject
             ?? throw new ReolinkApiException($"GetAiAlarm({aiType}) reply carries no AiAlarm settings");
+    }
+
+    /// <summary>Reads the AI config and the firmware's own numeric bounds. No guessed model ranges.</summary>
+    public async Task<(JsonObject Config, JsonObject? Range)> GetAiAlarmWithRangeAsync(string aiType, CancellationToken ct)
+    {
+        var (value, range) = await ExecRangeAsync("GetAiAlarm",
+            new JsonObject { ["channel"] = _channelId, ["ai_type"] = aiType }, ct).ConfigureAwait(false);
+        return (value?["AiAlarm"] as JsonObject ?? throw new ReolinkApiException("AI alarm settings unavailable"),
+            range?["AiAlarm"] as JsonObject);
     }
 
     /// <summary>Writes an AI alarm config; pass a (modified) object from <see cref="GetAiAlarmAsync"/>.</summary>

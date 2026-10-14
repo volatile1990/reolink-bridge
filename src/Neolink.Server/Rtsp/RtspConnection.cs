@@ -2,6 +2,8 @@
 // Licensed under the GNU Affero General Public License v3.0; see the LICENSE file
 // in the repository root.
 using System.Buffers.Binary;
+using System.Collections.Concurrent;
+using System.Globalization;
 using System.Net;
 using System.Net.Sockets;
 using System.Text;
@@ -17,7 +19,7 @@ public sealed class RtspConnection
     private readonly NetworkStream _stream;
     private readonly RtspServer _server;
     private readonly SemaphoreSlim _writeLock = new(1, 1);
-    private readonly Dictionary<string, RtspSession> _sessions = new();
+    private readonly ConcurrentDictionary<string, RtspSession> _sessions = new();
     private readonly byte[] _readBuf = new byte[8192];
     private readonly EndPoint? _remote;
     /// <summary>Once-per-process flag for the "Opus requested but no usable ffmpeg" refusal log.</summary>
@@ -29,6 +31,10 @@ public sealed class RtspConnection
     /// SETUP falls back to it when its own URI carries no ?audio= — some clients
     /// resolve control URIs strictly per RFC 3986 and drop the query.</summary>
     private bool? _describedOpus;
+    private StreamDescriptionSnapshot? _description;
+    private IStreamHub? _describedHub;
+    private long _lastActivity;
+    private CancellationToken _connectionToken;
     private int _readLen;
     private int _readPos;
 
@@ -46,45 +52,74 @@ public sealed class RtspConnection
         _stream = client.GetStream();
         _server = server;
         _remote = client.Client.RemoteEndPoint;
+        _lastActivity = server.ResourceTimeProvider.GetTimestamp();
     }
+
+    internal void Close() => _client.Dispose();
+    internal void Touch() => Interlocked.Exchange(ref _lastActivity, _server.ResourceTimeProvider.GetTimestamp());
 
     public async Task RunAsync(CancellationToken ct)
     {
         Log.Debug($"RTSP client connected: {_remote}");
+        using var lifetime = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        _connectionToken = lifetime.Token;
+        using var close = lifetime.Token.Register(Close);
+        var watch = WatchIdleAsync(lifetime.Token);
         try
         {
-            while (!ct.IsCancellationRequested)
+            while (!lifetime.IsCancellationRequested)
             {
-                int first = await PeekByteAsync(ct).ConfigureAwait(false);
+                int first = await PeekByteAsync(lifetime.Token).ConfigureAwait(false);
                 if (first < 0) break;
+                using var request = CancellationTokenSource.CreateLinkedTokenSource(lifetime.Token);
+                request.CancelAfter(_server.ResourceLimits.RequestDeadline);
 
                 if (first == '$')
                 {
                     // Interleaved client data: RTCP receiver reports (ignored) or, on a
                     // backchannel channel, G.711 audio the client is talking to the camera.
-                    var head = await ReadExactAsync(4, ct).ConfigureAwait(false);
+                    var head = await ReadExactAsync(4, request.Token).ConfigureAwait(false);
                     byte channel = head[1];
                     int len = (head[2] << 8) | head[3];
-                    var payload = await ReadExactAsync(len, ct).ConfigureAwait(false);
+                    var payload = await ReadExactAsync(len, request.Token).ConfigureAwait(false);
+                    Touch();
                     RouteInterleaved(channel, payload);
                     continue;
                 }
 
-                var request = await ReadRequestAsync(ct).ConfigureAwait(false);
-                if (request == null) break;
-                await HandleRequestAsync(request, ct).ConfigureAwait(false);
+                var parsed = await ReadRequestAsync(request.Token).ConfigureAwait(false);
+                if (parsed == null) break;
+                Touch();
+                await HandleRequestAsync(parsed, request.Token).ConfigureAwait(false);
             }
         }
         catch (IOException) { }
         catch (SocketException) { }
         catch (ObjectDisposedException) { } // connection killed by the stalled-client guard
+        catch (OperationCanceledException) { }
         finally
         {
-            foreach (var session in _sessions.Values)
-                session.Stop();
+            lifetime.Cancel();
+            await Task.WhenAll(_sessions.Values.Select(session => session.StopAsync())).ConfigureAwait(false);
             _sessions.Clear();
+            try { await watch.ConfigureAwait(false); } catch (OperationCanceledException) { }
             _client.Dispose();
+            _writeLock.Dispose();
             Log.Debug($"RTSP client disconnected: {_remote}");
+        }
+    }
+
+    private async Task WatchIdleAsync(CancellationToken ct)
+    {
+        using var timer = new PeriodicTimer(_server.ResourceLimits.WatchInterval);
+        while (await timer.WaitForNextTickAsync(ct).ConfigureAwait(false))
+        {
+            foreach (var (id, session) in _sessions)
+                if (session.IdleAge >= _server.ResourceLimits.SessionIdleTimeout && _sessions.TryRemove(id, out var expired))
+                    await expired.StopAsync().ConfigureAwait(false);
+            if (_server.ResourceTimeProvider.GetElapsedTime(Interlocked.Read(ref _lastActivity))
+                >= _server.ResourceLimits.ConnectionIdleTimeout)
+            { Close(); return; }
         }
     }
 
@@ -113,19 +148,33 @@ public sealed class RtspConnection
             return null;
         }
         var req = new RtspRequest { Method = parts[0].ToUpperInvariant(), Uri = parts[1] };
+        int headerBytes = requestLine.Length + 2, headerCount = 0;
+        if (headerBytes > _server.ResourceLimits.MaxHeaderBytes)
+            throw new IOException("RTSP request line exceeds its resource budget");
 
         while (true)
         {
             var line = await ReadLineAsync(ct).ConfigureAwait(false);
             if (line == null) return null;
             if (line.Length == 0) break;
+            headerBytes += line.Length + 2;
+            if (++headerCount > _server.ResourceLimits.MaxHeaderCount || headerBytes > _server.ResourceLimits.MaxHeaderBytes)
+                throw new IOException("RTSP request headers exceed their resource budget");
             int colon = line.IndexOf(':');
-            if (colon > 0)
-                req.Headers[line[..colon].Trim()] = line[(colon + 1)..].Trim();
+            if (colon <= 0 || !req.Headers.TryAdd(line[..colon].Trim(), line[(colon + 1)..].Trim()))
+                throw new IOException("Malformed or repeated RTSP header");
         }
 
-        if (int.TryParse(req.Header("Content-Length"), out int bodyLen) && bodyLen > 0)
-            await ReadExactAsync(bodyLen, ct).ConfigureAwait(false); // read and discard
+        if (req.Header("Content-Length") is { } length)
+        {
+            if (!int.TryParse(length, NumberStyles.None, CultureInfo.InvariantCulture, out int bodyLen)
+                || bodyLen > _server.ResourceLimits.MaxRequestBodyBytes)
+            {
+                await RespondAsync(req, 413, "Request Entity Too Large", ct: ct).ConfigureAwait(false);
+                throw new IOException("RTSP request body exceeds its resource budget");
+            }
+            if (bodyLen > 0) await ReadExactAsync(bodyLen, ct).ConfigureAwait(false); // bounded read and discard
+        }
 
         return req;
     }
@@ -156,6 +205,7 @@ public sealed class RtspConnection
                 break;
             case "GET_PARAMETER":
             case "SET_PARAMETER":
+                FindSession(req)?.Touch();
                 await RespondAsync(req, 200, "OK", sessionId: req.Header("Session"), ct: ct).ConfigureAwait(false);
                 break;
             case "TEARDOWN":
@@ -273,6 +323,8 @@ public sealed class RtspConnection
             return;
         }
         bool opus = !mount.GopPlayout && (audioChoice ?? mount.Opus);
+        if (mount.GopAacAvailable && audioChoice == true)
+        { await RespondAsync(req, 404, "Unsupported Audio Format", ct: ct).ConfigureAwait(false); return; }
 
         // Opus is only honest when the located ffmpeg can actually encode it
         // (probed once, lazily). Refusing here beats promising Opus in the SDP
@@ -288,8 +340,6 @@ public sealed class RtspConnection
             await RespondAsync(req, 404, "Not Found", ct: ct).ConfigureAwait(false);
             return;
         }
-        _describedOpus = opus;
-
         if (!await mount.Hub.WaitForDescribeInfoAsync(TimeSpan.FromSeconds(12), ct).ConfigureAwait(false))
         {
             Log.Warn($"DESCRIBE {path}: stream not ready (camera offline or still connecting)");
@@ -302,7 +352,7 @@ public sealed class RtspConnection
         // Plain players (VLC, ffmpeg, go2rtc without backchannel) never send the
         // header, so their SDP is unchanged.
         bool backchannel = false;
-        if (!mount.GopPlayout && WantsBackchannel(req) && mount.Talk != null)
+        if (!mount.GopPlayout && WantsBackchannel(req) && mount.Talk != null && mount.TalkAllowedFor(User))
         {
             try
             {
@@ -315,8 +365,17 @@ public sealed class RtspConnection
             }
         }
 
-        string sdp = Sdp.Build(mount.Hub, mount.Hub.Name, backchannel, opus: opus, videoOnly: mount.GopPlayout);
-        string contentBase = req.Uri.TrimEnd('/') + "/";
+        if (!mount.Hub.TryGetCurrentDescription(out var description))
+        {
+            await RespondAsync(req, 503, "Service Unavailable", "Retry-After: 5", ct: ct).ConfigureAwait(false);
+            return;
+        }
+        if (mount.GopPlayout && !mount.GopAacAvailable) description = description with { Audio = null };
+        _description = description;
+        _describedHub = mount.Hub;
+        _describedOpus = opus;
+        string sdp = Sdp.Build(description, mount.Hub.Name, backchannel: backchannel, opus: opus);
+        string contentBase = req.Uri.Split('?')[0].TrimEnd('/') + "/";
         await RespondAsync(req, 200, "OK",
             $"Content-Base: {contentBase}\r\nContent-Type: application/sdp",
             body: Encoding.ASCII.GetBytes(sdp), ct: ct).ConfigureAwait(false);
@@ -338,8 +397,11 @@ public sealed class RtspConnection
             return;
         }
         if (!await CheckAuthAsync(req, mount, ct).ConfigureAwait(false)) return;
-        if (trackId is not (0 or 1 or Sdp.BackchannelTrackId)) trackId = 0;
-        if (mount.GopPlayout && trackId != 0)
+        if (trackId == Sdp.BackchannelTrackId && !mount.TalkAllowedFor(User))
+        { await RespondAsync(req, 403, "Forbidden", ct: ct).ConfigureAwait(false); return; }
+        if (trackId is not (0 or 1 or Sdp.BackchannelTrackId))
+        { await RespondAsync(req, 404, "Not Found", ct: ct).ConfigureAwait(false); return; }
+        if (mount.GopPlayout && trackId != 0 && !(trackId == 1 && mount.GopAacAvailable && audio != "opus"))
         {
             await RespondAsync(req, 404, "Not Found", ct: ct).ConfigureAwait(false);
             return;
@@ -351,36 +413,46 @@ public sealed class RtspConnection
             await RespondAsync(req, 461, "Unsupported Transport", ct: ct).ConfigureAwait(false);
             return;
         }
+        var spec = ParseTransport(transportHeader);
+        if (spec == null || _server.TcpOnly && !spec.Tcp
+            || trackId == Sdp.BackchannelTrackId && (mount.Talk == null || !spec.Tcp))
+        { await RespondAsync(req, 461, "Unsupported Transport", ct: ct).ConfigureAwait(false); return; }
 
-        // Find or create the session
+        // Existing PLAY state takes precedence over a new track's metadata. This preserves
+        // the RTSP state contract while still checking current metadata before any new SETUP.
         RtspSession? session = null;
         var sessionId = req.Header("Session");
         if (sessionId != null)
-            _sessions.TryGetValue(sessionId, out session);
+        {
+            _sessions.TryGetValue(sessionId.Split(';')[0].Trim(), out session);
+            if (session == null)
+            { await RespondAsync(req, 454, "Session Not Found", ct: ct).ConfigureAwait(false); return; }
+            if (!ReferenceEquals(session.Hub, mount.Hub) || session.Playing)
+            { await RespondAsync(req, 455, "Method Not Valid in This State", sessionId: session.Id, ct: ct).ConfigureAwait(false); return; }
+        }
+        if (!mount.Hub.TryGetCurrentDescription(out var current))
+        { await RespondAsync(req, 503, "Service Unavailable", ct: ct).ConfigureAwait(false); return; }
+        var description = ReferenceEquals(_describedHub, mount.Hub) && _description is { } described
+            ? described : current;
+        if (description.SourceEpoch != current.SourceEpoch || description.Codec != current.Codec
+            || trackId == 1 && (description.Audio == null || !SameAudio(description.Audio, current.Audio)))
+        { await RespondAsync(req, 503, "Describe Current Stream First", ct: ct).ConfigureAwait(false); return; }
+
         if (session == null)
         {
+            if (_sessions.Count >= _server.ResourceLimits.MaxSessionsPerConnection)
+            { await RespondAsync(req, 453, "Not Enough Bandwidth", ct: ct).ConfigureAwait(false); return; }
             // The codec choice travels on the query: this URI's own ?audio= wins,
             // else what the DESCRIBE on this connection settled on, else the mount
             // default. Unknown values were already policed at DESCRIBE.
             bool opus = !mount.GopPlayout && ((TryMapAudio(audio, out var choice) ? choice : null)
-                ?? _describedOpus ?? mount.Opus);
+                ?? (ReferenceEquals(_describedHub, mount.Hub) ? _describedOpus : null) ?? mount.Opus);
             if (opus && !Media.Ffmpeg.SupportsOpus)
                 opus = false; // DESCRIBE-less client; never promise silence
-            session = new RtspSession(this, mount, opus);
+            session = new RtspSession(this, mount, opus, description);
             _sessions[session.Id] = session;
         }
-        else if (session.Playing)
-        {
-            await RespondAsync(req, 455, "Method Not Valid in This State", sessionId: session.Id, ct: ct).ConfigureAwait(false);
-            return;
-        }
 
-        var spec = ParseTransport(transportHeader);
-        if (_server.TcpOnly && !spec.Tcp)
-        {
-            await RespondAsync(req, 461, "Unsupported Transport", sessionId: session.Id, ct: ct).ConfigureAwait(false);
-            return;
-        }
         string responseTransport;
 
         if (trackId == Sdp.BackchannelTrackId)
@@ -393,7 +465,7 @@ public sealed class RtspConnection
                 return;
             }
             int ch = spec.InterleavedRtp ?? Sdp.BackchannelTrackId * 2;
-            session.SetupBackchannel((byte)ch, mount.Talk);
+            await session.SetupBackchannelAsync((byte)ch, mount.Talk!).ConfigureAwait(false);
             responseTransport = $"RTP/AVP/TCP;unicast;mode=record;interleaved={ch}-{ch + 1}";
         }
         else
@@ -422,39 +494,56 @@ public sealed class RtspConnection
             }
         }
 
+        session.Touch();
         await RespondAsync(req, 200, "OK",
             $"Transport: {responseTransport}",
             sessionId: session.Id, ct: ct).ConfigureAwait(false);
     }
 
+    internal static bool SameAudio(AudioTrackInfo? expected, AudioTrackInfo? actual) => expected != null && actual != null
+        && expected.IsAac == actual.IsAac && expected.SampleRate == actual.SampleRate && expected.Channels == actual.Channels
+        && (expected.AudioSpecificConfig == actual.AudioSpecificConfig
+            || expected.AudioSpecificConfig != null && actual.AudioSpecificConfig != null
+            && expected.AudioSpecificConfig.SequenceEqual(actual.AudioSpecificConfig));
+
     private sealed record TransportSpec(bool Tcp, int? InterleavedRtp, int? ClientRtpPort);
 
-    private static TransportSpec ParseTransport(string header)
+    private static TransportSpec? ParseTransport(string header)
     {
         // Clients may offer several transports separated by ','; take the first supported one.
         foreach (var offer in header.Split(','))
         {
             var fields = offer.Trim().Split(';');
             var proto = fields[0].Trim().ToUpperInvariant();
-            bool tcp = proto.Contains("/TCP");
-            if (!proto.StartsWith("RTP/AVP")) continue;
+            bool tcp = proto == "RTP/AVP/TCP";
+            if (proto is not ("RTP/AVP" or "RTP/AVP/TCP")) continue;
 
             int? interleaved = null, clientPort = null;
+            bool invalid = false;
             foreach (var f in fields.Skip(1))
             {
+                if (f.Trim().Equals("multicast", StringComparison.OrdinalIgnoreCase)) { invalid = true; break; }
                 var kv = f.Split('=', 2);
                 var key = kv[0].Trim().ToLowerInvariant();
                 if (kv.Length == 2)
                 {
                     var range = kv[1].Split('-');
-                    if (key == "interleaved" && int.TryParse(range[0], out var i)) interleaved = i;
-                    if (key == "client_port" && int.TryParse(range[0], out var p)) clientPort = p;
+                    if (key is "interleaved" or "client_port")
+                    {
+                        int maximum = key == "interleaved" ? 254 : 65534;
+                        int minimum = key == "interleaved" ? 0 : 1;
+                        if (!int.TryParse(range[0], out int value) || value < minimum || value > maximum
+                            || range.Length > 2 || range.Length == 2 && (!int.TryParse(range[1], out int end) || end != value + 1))
+                        { invalid = true; break; }
+                        if (key == "interleaved") interleaved = value;
+                        else clientPort = value;
+                    }
                 }
             }
-            if (tcp || clientPort.HasValue)
+            if (!invalid && (tcp || clientPort.HasValue))
                 return new TransportSpec(tcp, interleaved, clientPort);
         }
-        return new TransportSpec(false, null, null);
+        return null;
     }
 
     private async Task HandlePlayAsync(RtspRequest req, CancellationToken ct)
@@ -465,7 +554,9 @@ public sealed class RtspConnection
             await RespondAsync(req, 454, "Session Not Found", ct: ct).ConfigureAwait(false);
             return;
         }
-        session.Play(ct);
+        if (session.GopAudioWithoutVideo)
+        { await RespondAsync(req, 455, "GOP audio requires its video track", sessionId: session.Id, ct: ct).ConfigureAwait(false); return; }
+        await session.PlayAsync(_connectionToken).ConfigureAwait(false);
 
         var rtpInfoParts = new List<string>();
         string baseUri = req.Uri.TrimEnd('/');
@@ -487,7 +578,7 @@ public sealed class RtspConnection
             await RespondAsync(req, 454, "Session Not Found", ct: ct).ConfigureAwait(false);
             return;
         }
-        session.Pause();
+        await session.PauseAsync().ConfigureAwait(false);
         await RespondAsync(req, 200, "OK", sessionId: session.Id, ct: ct).ConfigureAwait(false);
     }
 
@@ -496,8 +587,8 @@ public sealed class RtspConnection
         var session = FindSession(req);
         if (session != null)
         {
-            session.Stop();
-            _sessions.Remove(session.Id);
+            _sessions.TryRemove(session.Id, out _);
+            await session.StopAsync().ConfigureAwait(false);
         }
         await RespondAsync(req, 200, "OK", sessionId: session?.Id, ct: ct).ConfigureAwait(false);
     }
@@ -531,24 +622,16 @@ public sealed class RtspConnection
         sb.Append($"RTSP/1.0 {code} {reason}\r\n");
         sb.Append($"CSeq: {req.CSeq}\r\n");
         sb.Append("Server: Neolink.NET\r\n");
-        if (sessionId != null) sb.Append($"Session: {sessionId};timeout=60\r\n");
+        if (sessionId != null) sb.Append($"Session: {sessionId};timeout={Math.Max(1, (int)_server.ResourceLimits.SessionIdleTimeout.TotalSeconds)}\r\n");
         if (extraHeaders != null) sb.Append(extraHeaders).Append("\r\n");
         sb.Append($"Content-Length: {body?.Length ?? 0}\r\n");
         sb.Append("\r\n");
 
         var head = Encoding.ASCII.GetBytes(sb.ToString());
-        await _writeLock.WaitAsync(ct).ConfigureAwait(false);
-        try
-        {
-            await _stream.WriteAsync(head, ct).ConfigureAwait(false);
-            if (body != null)
-                await _stream.WriteAsync(body, ct).ConfigureAwait(false);
-            await _stream.FlushAsync(ct).ConfigureAwait(false);
-        }
-        finally
-        {
-            _writeLock.Release();
-        }
+        byte[] response = new byte[head.Length + (body?.Length ?? 0)];
+        head.CopyTo(response, 0);
+        body?.CopyTo(response, head.Length);
+        await WriteGuardedAsync(response, ct).ConfigureAwait(false);
     }
 
     /// <summary>Sends an RTP packet over the control connection (interleaved framing).</summary>
@@ -573,10 +656,7 @@ public sealed class RtspConnection
 
     private async Task WriteGuardedAsync(ReadOnlyMemory<byte> data, CancellationToken ct)
     {
-        // Per-write on purpose: the timeout must cover the LOCK WAIT too — that
-        // is what transitively bounds RespondAsync's unguarded writes (a reply
-        // wedged on a half-dead client holds the lock, and it is the pump's timed
-        // wait here that detects it and closes the connection).
+        // Responses and media both use this guard, including the shared lock wait.
         using var cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
         cts.CancelAfter(TimeSpan.FromSeconds(10)); // slow-client guard
         try
@@ -697,6 +777,7 @@ internal sealed class RtspSession
     public TrackTransport? Video { get; private set; }
     public TrackTransport? Audio { get; private set; }
     public bool Playing => _pumpTask is { IsCompleted: false };
+    public bool GopAudioWithoutVideo => _mount.GopPlayout && _mount.GopAudio && Audio != null && Video == null;
 
     /// <summary>Interleaved channel the client sends backchannel audio on, or null.</summary>
     public byte? BackchannelChannel { get; private set; }
@@ -707,6 +788,11 @@ internal sealed class RtspSession
     /// track. Settled at SETUP from the URL's ?audio= (falling back to the mount's
     /// audio_transcode default) and fixed for the session's lifetime.</summary>
     private readonly bool _opus;
+    private readonly StreamDescriptionSnapshot _description;
+    private readonly object _stateGate = new();
+    private readonly SemaphoreSlim _lifecycle = new(1, 1);
+    private bool _stopped;
+    private long _lastActivity;
     private CancellationTokenSource? _pumpCts;
     private Task? _pumpTask;
     private BackchannelReceiver? _backchannel;
@@ -714,53 +800,111 @@ internal sealed class RtspSession
     /// <summary>The user the session's SETUP proved; fixed for the session's life.</summary>
     internal string? User { get; }
 
-    public RtspSession(RtspConnection conn, RtspMount mount, bool opus)
+    internal IStreamHub Hub => _mount.Hub;
+    internal TimeSpan IdleAge => _conn.Server.ResourceTimeProvider.GetElapsedTime(Interlocked.Read(ref _lastActivity));
+    internal void Touch()
+    {
+        Interlocked.Exchange(ref _lastActivity, _conn.Server.ResourceTimeProvider.GetTimestamp());
+        _conn.Touch();
+    }
+
+    public RtspSession(RtspConnection conn, RtspMount mount, bool opus, StreamDescriptionSnapshot? description = null)
     {
         _conn = conn;
         _mount = mount;
         _opus = opus;
+        if (description == null)
+        {
+            if (!mount.Hub.TryGetCurrentDescription(out var current))
+                throw new IOException("RTSP stream description is unavailable");
+            description = current;
+        }
+        _description = description;
         User = conn.User;
+        Touch();
     }
 
     public void SetTrack(int trackId, TrackTransport transport)
     {
-        if (trackId == 0) Video = transport;
-        else Audio = transport;
+        lock (_stateGate)
+        {
+            if (_stopped) { transport.Close(); throw new IOException("RTSP session has expired"); }
+            if (trackId == 0) { Video?.Close(); Video = transport; }
+            else { Audio?.Close(); Audio = transport; }
+        }
     }
 
     /// <summary>Registers a two-way-talk receive track on an interleaved channel.</summary>
-    public void SetupBackchannel(byte channel, ICameraControl talk)
+    public void SetupBackchannel(byte channel, ICameraControl talk) => _ = SetupBackchannelAsync(channel, talk);
+
+    public async Task SetupBackchannelAsync(byte channel, ICameraControl talk)
     {
-        BackchannelChannel = channel;
-        _backchannel = new BackchannelReceiver(talk);
+        await _lifecycle.WaitAsync().ConfigureAwait(false);
+        try
+        {
+            if (_stopped) throw new IOException("RTSP session has expired");
+            if (_backchannel != null) await _backchannel.StopAsync().ConfigureAwait(false);
+            BackchannelChannel = channel;
+            _backchannel = new BackchannelReceiver(talk);
+        }
+        finally { _lifecycle.Release(); }
     }
 
-    public void FeedBackchannel(byte[] rtpPacket) => _backchannel?.OnRtp(rtpPacket);
+    public void FeedBackchannel(byte[] rtpPacket) { _backchannel?.OnRtp(rtpPacket); Touch(); }
 
-    public void Play(CancellationToken ct)
+    public void Play(CancellationToken ct) => _ = PlayAsync(ct);
+
+    public async Task PlayAsync(CancellationToken ct)
     {
-        // The backchannel is tied to the connection lifetime, not the media pump, so
-        // PAUSE doesn't cut talk; it ends on TEARDOWN or disconnect (via Stop).
-        _backchannel?.Start(ct);
-        if (Playing) return;
-        _pumpCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
-        var token = _pumpCts.Token;
-        _pumpTask = Task.Run(() => PumpAsync(token), CancellationToken.None);
+        await _lifecycle.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            if (_stopped) throw new IOException("RTSP session has expired");
+            Touch();
+            // PAUSE retains talk; TEARDOWN and disconnect close it.
+            _backchannel?.Start(ct);
+            if (Playing) return;
+            await StopPumpAsync().ConfigureAwait(false);
+            _pumpCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            var token = _pumpCts.Token;
+            _pumpTask = Task.Run(() => PumpAsync(token), CancellationToken.None);
+        }
+        finally { _lifecycle.Release(); }
     }
 
-    public void Pause()
+    public void Pause() => _ = PauseAsync();
+
+    public async Task PauseAsync()
+    {
+        await _lifecycle.WaitAsync().ConfigureAwait(false);
+        try { Touch(); await StopPumpAsync().ConfigureAwait(false); }
+        finally { _lifecycle.Release(); }
+    }
+
+    public void Stop() => _ = StopAsync();
+
+    public async Task StopAsync()
+    {
+        await _lifecycle.WaitAsync().ConfigureAwait(false);
+        try
+        {
+            lock (_stateGate) _stopped = true;
+            await StopPumpAsync().ConfigureAwait(false);
+            if (_backchannel != null) await _backchannel.StopAsync().ConfigureAwait(false);
+            lock (_stateGate) { Video?.Close(); Audio?.Close(); }
+        }
+        finally { _lifecycle.Release(); }
+    }
+
+    private async Task StopPumpAsync()
     {
         _pumpCts?.Cancel();
+        try { if (_pumpTask != null) await _pumpTask.ConfigureAwait(false); }
+        catch (OperationCanceledException) { }
+        catch (Exception ex) { Log.Debug($"RTSP media pump stopped: {ex.GetType().Name}"); }
         _pumpTask = null;
-    }
-
-    public void Stop()
-    {
-        _pumpCts?.Cancel();
-        _pumpTask = null;
-        _backchannel?.Stop();
-        Video?.Close();
-        Audio?.Close();
+        _pumpCts?.Dispose();
+        _pumpCts = null;
     }
 
     private async Task PumpAsync(CancellationToken ct)
@@ -772,10 +916,15 @@ internal sealed class RtspSession
         bool waitKeyframe = true; // always start on a keyframe
         // The explicit opt-in mount advertises/accepts video only. Audio's sample
         // clock has no shared camera PTS epoch and cannot use this normalization.
-        var playout = _mount.GopPlayout && Video != null && Audio == null
-            ? new GopVideoPlayout(hub.Codec ?? VideoCodec.H264, _mount.PlayoutDelayMs,
+        var playout = _mount.GopPlayout && Video != null && (Audio == null || _mount.GopAudio)
+            ? new GopVideoPlayout(_description.Codec ?? VideoCodec.H264, _mount.PlayoutDelayMs,
                 _conn.Server.PlayoutTimeProvider, _conn.Server.PlayoutWaiter)
             : null;
+        int aacRate = _mount.GopAudio && _description.Audio is { IsAac: true } describedAudio ? describedAudio.SampleRate : 0;
+        byte[]? aacAsc = aacRate > 0 ? _description.Audio!.AudioSpecificConfig?.ToArray() : null;
+        var aacTimeline = playout != null && Audio != null && aacRate > 0 ? new GopAacTimeline(aacRate, hub.SourceEpoch) : null;
+        long? lastRtcpAt = null;
+        string cname = "reolink-gop-" + Id.ToLowerInvariant();
         long sourceEpoch = hub.SourceEpoch;
         bool? uniformCadence = null;
         // Owned by THIS pump, reused per frame: each send is awaited before the
@@ -789,7 +938,7 @@ internal sealed class RtspSession
         Log.Info($"{hub.Name}: client started streaming (session {Id}" +
                  $"{(_opus ? ", Opus audio" : "")})");
         if (playout != null)
-            Log.Info($"{hub.Name}: RTSP GOP playout enabled, reserve={_mount.PlayoutDelayMs}ms (video-only)");
+            Log.Info($"{hub.Name}: RTSP GOP playout enabled, reserve={_mount.PlayoutDelayMs}ms ({(aacTimeline == null ? "video-only" : "original AAC; arrival-estimated synchronization")})");
         try
         {
             await foreach (var packet in reader.ReadAllAsync(ct).ConfigureAwait(false))
@@ -800,12 +949,14 @@ internal sealed class RtspSession
                 {
                     waitKeyframe = true;
                     playout?.Reset();
+                    aacTimeline?.Reset(hub.SourceEpoch);
                 }
                 if (playout != null && sourceEpoch != hub.SourceEpoch)
                 {
                     sourceEpoch = hub.SourceEpoch;
                     waitKeyframe = true;
                     playout.Reset();
+                    aacTimeline?.Reset(sourceEpoch);
                 }
 
                 switch (packet)
@@ -827,20 +978,51 @@ internal sealed class RtspSession
                                     $"pictures={complete.Pictures.Count}, duration={complete.Duration.TotalMilliseconds:F1}ms");
                             uniformCadence = complete.UniformCadence;
                             complete = playout.BeginGop(complete);
-                            foreach (var picture in complete.Pictures)
+                            var aacPlans = aacTimeline?.Plan(complete) ?? [];
+                            var presentation = complete.Pictures.Select(picture => (Offset: picture.Offset, Video: (GopPlayoutPicture?)picture, Audio: (GopAacPlan?)null))
+                                .Concat(aacPlans.Select(aac => (Offset: aac.Offset, Video: (GopPlayoutPicture?)null, Audio: (GopAacPlan?)aac)))
+                                .OrderBy(item => item.Offset).ThenBy(item => item.Video == null ? 1 : 0);
+                            foreach (var item in presentation)
                             {
-                                await playout.WaitAsync(picture.Offset, ct).ConfigureAwait(false);
+                                await playout.WaitAsync(item.Offset, ct).ConfigureAwait(false);
                                 // A source may stop during the deliberate wait.
                                 if (complete.SourceEpoch != hub.SourceEpoch)
                                 {
                                     waitKeyframe = true;
                                     playout.Reset();
+                                    aacTimeline?.Reset(hub.SourceEpoch);
                                     break;
                                 }
-                                await SendVideoAsync(hub, picture.AnnexB, picture.Keyframe, picture.HasSps,
-                                    picture.RtpTimestamp, batch, ct).ConfigureAwait(false);
-                                playout.MarkSent(picture);
+                                if (item.Video is { } picture)
+                                {
+                                    await SendVideoAsync(hub, picture.AnnexB, picture.Keyframe, picture.HasSps,
+                                        picture.RtpTimestamp, batch, ct).ConfigureAwait(false);
+                                    playout.MarkSent(picture);
+                                }
+                                else if (item.Audio is { } aac && Audio != null)
+                                {
+                                    if (hub.Audio is not { IsAac: true } actual || actual.SampleRate != aacRate)
+                                        throw new IOException("GOP AAC source format changed; reconnect for current SDP");
+                                    await SendAsync(Audio, Audio.Packetizer.PacketizeAac(aac.Packet.Au, aac.Packet.RtpTs), ct).ConfigureAwait(false);
+                                    aacTimeline!.MarkSent();
+                                }
+                                if (aacTimeline is { HaveAnchor: true } && Audio != null)
+                                {
+                                    var clock = _conn.Server.PlayoutTimeProvider;
+                                    long now = clock.GetTimestamp();
+                                    if (lastRtcpAt == null || clock.GetElapsedTime(lastRtcpAt.Value, now) >= TimeSpan.FromSeconds(1))
+                                    {
+                                        double elapsed = clock.GetElapsedTime(playout.PresentationTimestamp(TimeSpan.Zero), now).TotalSeconds;
+                                        uint videoTs = unchecked(complete.Pictures[0].RtpTimestamp + (uint)(long)Math.Round(elapsed * 90000));
+                                        uint audioTs = aacTimeline.RtpAtSourceTime(complete.SourceArrivalTimestamp / (double)complete.SourceArrivalFrequency + elapsed);
+                                        DateTimeOffset utc = clock.GetUtcNow();
+                                        await SendRtcpAsync(Video!, RtcpSenderReport.Build(Video!.Packetizer, videoTs, utc, cname), ct).ConfigureAwait(false);
+                                        await SendRtcpAsync(Audio, RtcpSenderReport.Build(Audio.Packetizer, audioTs, utc, cname), ct).ConfigureAwait(false);
+                                        lastRtcpAt = now;
+                                    }
+                                }
                             }
+                            if (aacTimeline != null) _conn.Server.ObserveGopAac(Id, aacTimeline.Diagnostics);
                             continue;
                         }
                         await SendVideoAsync(hub, v.AnnexB, v.Keyframe, v.HasSps, v.RtpTs, batch, ct).ConfigureAwait(false);
@@ -854,9 +1036,21 @@ internal sealed class RtspSession
                         await SendAsync(Audio, Audio.Packetizer.PacketizeOpus(o.Packet, o.RtpTs), ct).ConfigureAwait(false);
                         break;
                     case HubAudioAac a when Audio != null && !_opus:
+                        if (!RtspConnection.SameAudio(_description.Audio, hub.Audio))
+                            throw new IOException("RTSP audio source format changed; reconnect for current SDP");
+                        if (aacTimeline != null)
+                        {
+                            if (hub.Audio is not { IsAac: true } actual || actual.SampleRate != aacRate
+                                || aacAsc == null || actual.AudioSpecificConfig?.SequenceEqual(aacAsc) != true)
+                                throw new IOException("GOP AAC source format changed; reconnect for current SDP");
+                            aacTimeline.Push(a); break;
+                        }
                         await SendAsync(Audio, Audio.Packetizer.PacketizeAac(a.Au, a.RtpTs), ct).ConfigureAwait(false);
                         break;
                     case HubAudioPcm p when Audio != null && !_opus:
+                        if (!RtspConnection.SameAudio(_description.Audio, hub.Audio))
+                            throw new IOException("RTSP audio source format changed; reconnect for current SDP");
+                        if (aacTimeline != null) throw new IOException("GOP AAC source changed to PCM; reconnect for current SDP");
                         foreach (var rtp in Audio.Packetizer.PacketizePcm(p.Pcm, p.RtpTs))
                             await SendAsync(Audio, rtp, ct).ConfigureAwait(false);
                         break;
@@ -867,9 +1061,17 @@ internal sealed class RtspSession
         catch (Exception ex)
         {
             Log.Debug($"{hub.Name}: session {Id} pump ended: {Log.Flatten(ex)}");
+            _conn.Close(); // force a new SDP negotiation after a fatal media error
         }
         finally
         {
+            if (aacTimeline != null)
+            {
+                var diagnostic = aacTimeline.Diagnostics;
+                _conn.Server.ObserveGopAac(Id, diagnostic, completed: true);
+                Log.Info($"{hub.Name}: GOP AAC summary: sent={diagnostic.SentPackets}, dropped={diagnostic.DroppedPackets}, resets={diagnostic.Resets}, " +
+                    $"initialEstimatedOffsetMs={diagnostic.InitialAudioOffsetMs:F1}, maxArrivalEstimateDeviationMs={diagnostic.MaxArrivalEstimateDeviationMs:F1}; capture PTS unavailable");
+            }
             if (_opus) hub.ReleaseOpus();
             watch.Dispose();
             Log.Info($"{hub.Name}: client stopped streaming (session {Id})");
@@ -880,22 +1082,31 @@ internal sealed class RtspSession
         uint timestamp, RtpBatch batch, CancellationToken ct)
     {
         var video = Video ?? throw new InvalidOperationException("Video transport missing");
-        var codec = hub.Codec ?? VideoCodec.H264;
-        var au = keyframe ? EnsureParameterSets(hub, codec, annexB, hasSps) : annexB;
+        var codec = _description.Codec ?? VideoCodec.H264;
+        if (hub.Codec != codec) throw new IOException("RTSP source codec changed; reconnect for current SDP");
+        var au = keyframe ? EnsureParameterSets(_description, codec, annexB, hasSps) : annexB;
         // Packetization follows the cancellable wait, into this pump's private batch.
         video.Packetizer.PacketizeVideoInto(batch, codec, au, timestamp, video.RtpChannel);
         if (video.Tcp)
+        {
             await _conn.SendInterleavedRawAsync(batch.Framed, ct).ConfigureAwait(false);
+            for (int i = 0; i < batch.Count; i++) video.Packetizer.RecordSent(batch.PacketAt(i).Span);
+            Touch();
+        }
         else if (video.UdpSocket != null && video.ClientEndpoint != null)
             for (int i = 0; i < batch.Count; i++)
+            {
                 await video.UdpSocket.SendToAsync(batch.PacketAt(i), SocketFlags.None,
                     video.ClientEndpoint, ct).ConfigureAwait(false);
+                video.Packetizer.RecordSent(batch.PacketAt(i).Span);
+                Touch();
+            }
     }
 
     /// <summary>Prepends cached SPS/PPS(/VPS) to keyframes that lack them (players
     /// need them to decode). <paramref name="hasSps"/> comes from the hub's own
     /// keyframe scan, so no second scan of the buffer happens per viewer.</summary>
-    private static byte[] EnsureParameterSets(IStreamHub hub, VideoCodec codec, byte[] annexB, bool hasSps)
+    private static byte[] EnsureParameterSets(StreamDescriptionSnapshot hub, VideoCodec codec, byte[] annexB, bool hasSps)
     {
         if (hasSps) return annexB;
 
@@ -923,5 +1134,14 @@ internal sealed class RtspSession
         {
             await track.UdpSocket.SendToAsync(rtp, SocketFlags.None, track.ClientEndpoint, ct).ConfigureAwait(false);
         }
+        track.Packetizer.RecordSent(rtp);
+        Touch();
+    }
+
+    private async Task SendRtcpAsync(TrackTransport track, byte[] rtcp, CancellationToken ct)
+    {
+        if (track.Tcp) await _conn.SendInterleavedAsync((byte)(track.RtpChannel + 1), rtcp, ct).ConfigureAwait(false);
+        else if (track.UdpRtcpSocket != null && track.ClientEndpoint is { Port: < 65535 } peer)
+            await track.UdpRtcpSocket.SendToAsync(rtcp, SocketFlags.None, new IPEndPoint(peer.Address, peer.Port + 1), ct).ConfigureAwait(false);
     }
 }

@@ -11,6 +11,7 @@ using System.Net;
 using System.Net.Sockets;
 using System.Text;
 using System.Threading.Channels;
+using Neolink.Streaming;
 using Neolink.Bc;
 
 namespace Neolink.Protocol;
@@ -57,7 +58,7 @@ public sealed class BcUdpConnection : IBcConnection
     public IPEndPoint? RemoteEndpoint => _camera;
     private readonly BcContext _context;
 
-    private readonly Dictionary<uint, Channel<BcMessage>> _subscribers = new();
+    private readonly Dictionary<(uint Id, ushort? Number), Channel<BcMessage>> _subscribers = new();
     private readonly HashSet<uint> _reportedUnhandled = new();
     private readonly object _subGate = new();
 
@@ -181,24 +182,24 @@ public sealed class BcUdpConnection : IBcConnection
 
     // ------------------------------------------------------------------ IBcConnection
 
-    public BcSubscription Subscribe(uint msgId)
+    public BcSubscription Subscribe(uint msgId) => SubscribeCore(msgId, null);
+    public BcSubscription Subscribe(uint msgId, ushort messageNumber) => SubscribeCore(msgId, messageNumber);
+
+    private BcSubscription SubscribeCore(uint msgId, ushort? messageNumber)
     {
-        var channel = Channel.CreateUnbounded<BcMessage>(new UnboundedChannelOptions
-        {
-            SingleReader = true,
-            SingleWriter = true,
-        });
+        var channel = new ByteBoundedChannel<BcMessage>(16 * 1024 * 1024, 1024,
+            msg => checked((msg.Binary?.Length ?? 0) + (msg.Xml?.Serialize().Length ?? 0) + 128));
         lock (_subGate)
         {
-            if (!_subscribers.TryAdd(msgId, channel))
-                throw new InvalidOperationException($"Simultaneous subscription to message ID {msgId}");
+            if (!_subscribers.TryAdd((msgId, messageNumber), channel))
+                throw new InvalidOperationException($"Simultaneous subscription to message ID {msgId}, command number {messageNumber}");
         }
-        return new BcSubscription(msgId, channel.Reader, () => Unsubscribe(msgId));
+        return new BcSubscription(msgId, channel.Reader, () => Unsubscribe(msgId, messageNumber));
     }
 
-    private void Unsubscribe(uint msgId)
+    private void Unsubscribe(uint msgId, ushort? messageNumber)
     {
-        lock (_subGate) { _subscribers.Remove(msgId); }
+        lock (_subGate) { _subscribers.Remove((msgId, messageNumber)); }
     }
 
     /// <summary>Serialize the BC message exactly as for TCP, then chunk the bytes
@@ -662,7 +663,11 @@ public sealed class BcUdpConnection : IBcConnection
                     continue;
                 }
                 Channel<BcMessage>? target;
-                lock (_subGate) { _subscribers.TryGetValue(msg.Meta.MsgId, out target); }
+                lock (_subGate)
+                {
+                    if (!_subscribers.TryGetValue((msg.Meta.MsgId, msg.Meta.MsgNum), out target))
+                        _subscribers.TryGetValue((msg.Meta.MsgId, null), out target);
+                }
                 if (target != null)
                 {
                     target.Writer.TryWrite(msg);

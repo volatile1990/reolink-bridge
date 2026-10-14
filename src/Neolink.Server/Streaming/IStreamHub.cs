@@ -22,6 +22,10 @@ public readonly record struct VideoBufferDiagnostics(long TotalAccessUnits, long
     uint? LastCameraTimestampDeltaUs, long MaxCameraTimestampDeltaUs,
     long CameraTimestampZeroDeltas, long CameraTimestampBackwardCandidates);
 
+/// <summary>One coherent source-generation snapshot used for a single SDP response.</summary>
+public sealed record StreamDescriptionSnapshot(VideoCodec? Codec, byte[]? Sps, byte[]? Pps, byte[]? Vps,
+    uint Width, uint Height, AudioTrackInfo? Audio, long SourceEpoch, bool Available, bool VideoFresh);
+
 /// <summary>The publish side of a stream hub, fed by one camera stream.</summary>
 public interface IMediaSink
 {
@@ -51,13 +55,13 @@ public interface IStreamHub
     /// <summary>External watchers only (RTSP sessions + web players) — what "viewers" means to a human.</summary>
     int ViewerCount { get; }
 
-    /// <summary>True once codec parameters have been learned (DESCRIBE/init can be answered).</summary>
+    /// <summary>Codec parameters have been learned for the current publishing session.</summary>
     bool VideoReady { get; }
 
     /// <summary>Whether a decodable group of pictures is buffered RIGHT NOW — i.e. a
     /// publisher is live and a keyframe has been seen since it started. Unlike
-    /// <see cref="VideoReady"/>, which stays true for the rest of the run once codec
-    /// parameters are known, this goes false the moment the source stops. Anything
+    /// <see cref="VideoReady"/>, this also requires a buffered keyframe. Both
+    /// readiness states go false when the source stops. Anything
     /// that wants a frame without waiting asks this first.</summary>
     bool HasBufferedGop => false;
 
@@ -75,6 +79,12 @@ public interface IStreamHub
     uint Width { get; }
     uint Height { get; }
     AudioTrackInfo? Audio { get; }
+    /// <summary>Legacy hubs retain their existing readiness contract; live hubs override this atomically.</summary>
+    bool TryGetCurrentDescription(out StreamDescriptionSnapshot description)
+    {
+        description = new(Codec, Sps, Pps, Vps, Width, Height, Audio, SourceEpoch, VideoReady, VideoReady);
+        return VideoReady;
+    }
     /// <summary>A read-only snapshot; implementations without timing cannot claim freshness.</summary>
     VideoDiagnostics GetVideoDiagnostics() => new(0, 0, null, 0, 0);
     VideoBufferDiagnostics GetVideoBufferDiagnostics() => default;

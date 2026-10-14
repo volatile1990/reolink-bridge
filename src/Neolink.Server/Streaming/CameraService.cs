@@ -146,6 +146,24 @@ public sealed class CameraService : ILiveCameraSource
     };
     private readonly HashSet<string> _reportedAiTypes = new(StringComparer.Ordinal);
     private volatile IBcCamera? _live;
+    private Func<ByteQueueDiagnostics>? _mainQueueDiagnostics;
+    private readonly object _alarmGate = new();
+    private string _alarmState = "waiting-for-source";
+    private string? _alarmErrorType;
+    private long _alarmRetries;
+    private DateTimeOffset? _lastAlarmPush;
+
+    public object SourceDiagnostics()
+    {
+        var queue = _mainQueueDiagnostics?.Invoke();
+        lock (_alarmGate) return new { mediaInputQueue = queue == null ? null : new {
+                bytes = queue.Value.Bytes, peakBytes = queue.Value.PeakBytes, items = queue.Value.Items,
+                peakItems = queue.Value.PeakItems, oldestAgeMs = queue.Value.OldestAgeMs, overflows = queue.Value.Overflows },
+            alarmSubscription = new { state = _alarmState, lastErrorType = _alarmErrorType,
+                retryCount = _alarmRetries, lastCameraPushUtc = _lastAlarmPush,
+                confirmedByCameraPush = _lastAlarmPush != null && _alarmState == "watching" } };
+    }
+
     private volatile bool _batteryPowered;
     private volatile BatteryPush? _battery;
     private volatile int _wifiDbm = int.MinValue; // msg 464 NetInfo pushes; MinValue = none seen
@@ -233,6 +251,8 @@ public sealed class CameraService : ILiveCameraSource
     /// <summary>Headless bridge: only login and video; skip optional battery/port queries and status watches.
     /// Does not change the camera or its enabled services.</summary>
     public bool RelayOnly { get; init; }
+    /// <summary>Optional substream on the same logged-in session. Restricted to the always-running main relay.</summary>
+    public IMediaSink? SecondaryVideoSink { get; init; }
     public IBcCamera? LiveCamera => _live;
 
     /// <summary>
@@ -471,6 +491,8 @@ public sealed class CameraService : ILiveCameraSource
 
     public async Task RunAsync(CancellationToken ct)
     {
+        if (SecondaryVideoSink != null && (!RelayOnly || _kind != StreamKind.Main))
+            throw new InvalidOperationException("A shared substream requires a main relay service");
         if (_startupDelay > TimeSpan.Zero)
         {
             Log.Info($"{Tag}: delaying startup by {_startupDelay.TotalSeconds:0.#}s");
@@ -784,6 +806,7 @@ public sealed class CameraService : ILiveCameraSource
                     // but never repeat a rejected login or exit into Docker's
                     // restart policy. Fix the credentials, then restart the bridge.
                     _hub.SourceAuthenticationFailed();
+                    SecondaryVideoSink?.SourceAuthenticationFailed();
                     Log.Error($"{Tag}: camera authentication failed; login attempts are paused " +
                               "until the bridge is restarted with corrected credentials");
                     try { await Task.Delay(Timeout.InfiniteTimeSpan, ct).ConfigureAwait(false); }
@@ -1081,6 +1104,7 @@ public sealed class CameraService : ILiveCameraSource
         if (!RelayOnly && !_servicesAudited)
             _ = Task.Run(() => AuditServicePortsAsync(camera, linked.Token), CancellationToken.None);
         Task? videoTask = null;
+        Task? secondaryTask = null;
         // The status watch always runs: battery pushes keep the sidebar reading
         // fresh even without MQTT; other pushes go to the external sink if any.
         var externalStatusSink = StatusSink;
@@ -1155,16 +1179,15 @@ public sealed class CameraService : ILiveCameraSource
                 Log.Info($"{Tag}: {(DemandNow ? "viewer asked" : "recording switched on")} — starting the video stream");
             }
 
-            var binary = Channel.CreateUnbounded<byte[]>(new UnboundedChannelOptions
-            {
-                SingleReader = true,
-                SingleWriter = true,
-            });
+            var binary = new ByteBoundedChannel<byte[]>(16 * 1024 * 1024, 1024, block => block.Length);
+            _mainQueueDiagnostics = binary.Diagnostics;
             // Privacy mode (E1 Pro etc.) makes the camera go dark: no video is expected,
             // and losing the connection over it would make the camera — and the privacy
             // switch itself — Unavailable in Home Assistant. Hold the connection instead.
             videoTask = Task.Run(() => camera.StartVideoAsync(_kind, binary.Writer,
                 StallTolerable, linked.Token), CancellationToken.None);
+            if (SecondaryVideoSink is { } secondarySink)
+                secondaryTask = Task.Run(() => RunSecondaryVideoAsync(camera, secondarySink, linked.Token), CancellationToken.None);
             var reader = new MediaFrameReader(binary.Reader);
             long frames = 0;
 
@@ -1309,6 +1332,10 @@ public sealed class CameraService : ILiveCameraSource
             {
                 try { await videoTask.ConfigureAwait(false); } catch { }
             }
+            if (secondaryTask != null)
+            {
+                try { await secondaryTask.ConfigureAwait(false); } catch { }
+            }
             if (motionTask != null)
             {
                 try { await motionTask.ConfigureAwait(false); } catch { }
@@ -1318,6 +1345,54 @@ public sealed class CameraService : ILiveCameraSource
             {
                 try { await pingTask.ConfigureAwait(false); } catch { }
             }
+        }
+    }
+
+    /// <summary>A low preview failure releases/retries only that preview, preserving the main stream and login.</summary>
+    internal static async Task RunSecondaryVideoAsync(IBcCamera camera, IMediaSink sink, CancellationToken ct,
+        TimeSpan? startupDelay = null, TimeSpan? retryDelay = null)
+    {
+        try { await Task.Delay(startupDelay ?? TimeSpan.FromSeconds(2), ct).ConfigureAwait(false); }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested) { return; }
+        while (!ct.IsCancellationRequested)
+        {
+            using var attempt = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            var binary = new ByteBoundedChannel<byte[]>(8 * 1024 * 1024, 1024, block => block.Length);
+            var pump = Task.Run(() => camera.StartVideoAsync(StreamKind.Sub, binary.Writer, null, attempt.Token), CancellationToken.None);
+            try
+            {
+                var reader = new MediaFrameReader(binary.Reader);
+                while (!ct.IsCancellationRequested)
+                {
+                    MediaFrame frame;
+                    try { frame = await reader.ReadFrameAsync(attempt.Token).ConfigureAwait(false); }
+                    catch (EndOfStreamException)
+                    {
+                        await pump.ConfigureAwait(false);
+                        throw new IOException("Substream ended");
+                    }
+                    switch (frame)
+                    {
+                        case MediaInfo info: sink.PublishInfo(info); break;
+                        case VideoFrame video: sink.PublishVideo(video); break;
+                        case AacFrame aac: sink.PublishAac(aac); break;
+                        case AdpcmFrame adpcm: sink.PublishAdpcm(adpcm); break;
+                    }
+                }
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested) { return; }
+            catch (Exception error)
+            {
+                Log.Warn($"Optional substream failed ({error.GetType().Name}); retrying on the existing session");
+            }
+            finally
+            {
+                attempt.Cancel();
+                try { await pump.ConfigureAwait(false); } catch { }
+                sink.SourceStopped();
+            }
+            try { await Task.Delay(retryDelay ?? TimeSpan.FromSeconds(5), ct).ConfigureAwait(false); }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested) { return; }
         }
     }
 
@@ -1580,6 +1655,7 @@ public sealed class CameraService : ILiveCameraSource
         // its own log line even when event recording and MQTT are switched off.
         void LoggedSink(MotionPush push)
         {
+            lock (_alarmGate) { _lastAlarmPush = DateTimeOffset.UtcNow; _alarmState = "watching"; _alarmErrorType = null; }
             if (push.Active)
             {
                 Interlocked.Exchange(ref _lastMotionActiveTicks, DateTime.UtcNow.Ticks);
@@ -1604,20 +1680,44 @@ public sealed class CameraService : ILiveCameraSource
             sink(push);
         }
 
-        try
+        await WatchAlarmWithRetryAsync(token => camera.WatchMotionAsync(LoggedSink, token), (state, error) =>
         {
-            await camera.WatchMotionAsync(LoggedSink, ct).ConfigureAwait(false);
-        }
-        catch (OperationCanceledException) { }
-        catch (Exception ex) when (ex is CameraCommandException or TimeoutException)
+            lock (_alarmGate)
+            {
+                _alarmState = state; _alarmErrorType = error;
+                if (state == "retrying") _alarmRetries++;
+                if (state == "watching") _lastAlarmPush = null;
+            }
+        }, ct).ConfigureAwait(false);
+    }
+
+    internal static async Task WatchAlarmWithRetryAsync(Func<CancellationToken, Task> watch,
+        Action<string, string?> status, CancellationToken ct, TimeSpan? retryDelay = null)
+    {
+        int failures = 0;
+        while (!ct.IsCancellationRequested)
         {
-            Log.Warn($"{Tag}: camera declined motion pushes ({ex.Message}); no events this session");
+            try
+            {
+                status("watching", null);
+                await watch(ct).ConfigureAwait(false);
+                if (ct.IsCancellationRequested) break;
+                status("retrying", "SubscriptionEnded");
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested) { break; }
+            catch (CameraCommandException ex) when (ex.ResponseCode is 400 or 404 or 405 or 501)
+            { status("unsupported", nameof(CameraCommandException)); return; }
+            catch (CameraCommandException ex) when (ex.ResponseCode is 401 or 403)
+            { status("denied", nameof(CameraCommandException)); return; }
+            catch (Exception error) when (error is CameraCommandException or TimeoutException or QueueBudgetExceededException)
+            { status("retrying", error.GetType().Name); }
+            catch (Exception error) when (error is IOException or ObjectDisposedException)
+            { status("disconnected", error.GetType().Name); return; }
+            failures = Math.Min(5, failures + 1);
+            try { await Task.Delay(retryDelay ?? TimeSpan.FromSeconds(Math.Min(30, 1 << failures)), ct).ConfigureAwait(false); }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested) { break; }
         }
-        catch (Exception ex) when (ex is IOException or ObjectDisposedException)
-        {
-            // Connection died; the video loop notices and reconnects everything.
-            Log.Debug($"{Tag}: motion watch ended: {ex.Message}");
-        }
+        status("stopped", null);
     }
 
     /// <summary>
