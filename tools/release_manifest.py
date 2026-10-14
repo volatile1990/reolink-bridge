@@ -45,24 +45,47 @@ def source_digest(files):
     return digest.hexdigest()
 
 
-def manifest(root, artifact=None):
+def normalized_content(content):
+    """Normalize only UTF-8 text line endings; every other byte remains significant."""
+    if b"\0" in content:
+        return content
+    try:
+        content.decode("utf-8")
+    except UnicodeDecodeError:
+        return content
+    return content.replace(b"\r\n", b"\n")
+
+
+def normalized_source_digest(files):
+    digest = hashlib.sha256()
+    for name, path in files:
+        digest.update(name.encode("utf-8") + b"\0")
+        digest.update(hashlib.sha256(normalized_content(path.read_bytes())).digest())
+    return digest.hexdigest()
+
+
+def manifest(root, artifact=None, canonical=False):
     files = source_files(root)
     version = ET.parse(root / "src/Neolink.Server/Neolink.Server.csproj").findtext("./PropertyGroup/Version")
     revision = subprocess.check_output(["git", "-C", str(root), "rev-parse", "HEAD"], text=True).strip()
     dirty = bool(subprocess.check_output(["git", "-C", str(root), "status", "--porcelain"]))
     return {"schemaVersion": 1, "project": "reolink-bridge", "version": version,
-            "sourceRevision": revision, "sourceDirty": dirty, "sourceSha256": source_digest(files),
+            "sourceRevision": revision, "sourceDirty": dirty,
+            "sourceSha256": normalized_source_digest(files) if canonical else source_digest(files),
+            "workingTreeSourceSha256": source_digest(files), "normalizedSourceSha256": normalized_source_digest(files),
+            "canonicalLineEndings": canonical,
             "sourceFiles": len(files), "buildTime": datetime.datetime.now(datetime.timezone.utc).isoformat(),
             "artifactSha256": hashlib.sha256(artifact.read_bytes()).hexdigest() if artifact else None}
 
 
-def archive_sources(files, destination):
+def archive_sources(files, destination, canonical=False):
     with zipfile.ZipFile(destination, "x", zipfile.ZIP_DEFLATED) as archive:
         for name, path in files:
             info = zipfile.ZipInfo(name, date_time=(1980, 1, 1, 0, 0, 0))
             info.compress_type = zipfile.ZIP_DEFLATED
             info.external_attr = 0o100644 << 16
-            archive.writestr(info, path.read_bytes())
+            content = path.read_bytes()
+            archive.writestr(info, normalized_content(content) if canonical else content)
 
 
 def build_release(root, before, dotnet):
@@ -87,22 +110,25 @@ def main():
     parser.add_argument("--artifact", type=Path)
     parser.add_argument("--archive", type=Path)
     parser.add_argument("--build", action="store_true")
+    parser.add_argument("--canonical", action="store_true", help="Freeze UTF-8 sources with Git-compatible LF line endings")
     parser.add_argument("--dotnet", default=shutil.which("dotnet"))
     args = parser.parse_args()
     if args.output.exists() or args.output.is_symlink() or args.archive and (args.archive.exists() or args.archive.is_symlink()):
         parser.error("Use fresh output paths")
-    before = manifest(ROOT)
+    if args.canonical and args.build:
+        parser.error("Build the canonical source archive in the deployment worker")
+    before = manifest(ROOT, canonical=args.canonical)
     artifact = args.artifact
     if args.build:
         if not args.dotnet:
             parser.error(".NET 10 SDK is required")
         artifact = build_release(ROOT, before, args.dotnet)
-    value = manifest(ROOT, artifact)
+    value = manifest(ROOT, artifact, canonical=args.canonical)
     if value["sourceSha256"] != before["sourceSha256"]:
         raise SystemExit("Sources changed during release preparation")
     if args.archive:
         args.archive.parent.mkdir(parents=True, exist_ok=True)
-        archive_sources(source_files(ROOT), args.archive)
+        archive_sources(source_files(ROOT), args.archive, canonical=args.canonical)
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(value, indent=2) + "\n", encoding="utf-8")
     print(json.dumps(value))

@@ -13,6 +13,27 @@ spec.loader.exec_module(release)
 
 
 class ReleaseTests(unittest.TestCase):
+    def test_git_line_endings_do_not_change_frozen_release_but_binary_changes_do(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            text, binary = root / 'code.py', root / 'asset.bin'
+            text.write_bytes(b'one\r\ntwo\r\n')
+            binary.write_bytes(b'\0one\r\ntwo')
+            files = [('code.py', text), ('asset.bin', binary)]
+            exact = release.source_digest(files)
+            normalized = release.normalized_source_digest(files)
+            one, two = root / 'one.zip', root / 'two.zip'
+            release.archive_sources(files, one, canonical=True)
+            text.write_bytes(b'one\ntwo\n')
+            self.assertNotEqual(exact, release.source_digest(files))
+            self.assertEqual(normalized, release.normalized_source_digest(files))
+            release.archive_sources(files, two, canonical=True)
+            self.assertEqual(one.read_bytes(), two.read_bytes())
+            with zipfile.ZipFile(one) as archive:
+                self.assertEqual(archive.read('asset.bin'), b'\0one\r\ntwo')
+            binary.write_bytes(b'\0one\ntwo')
+            self.assertNotEqual(normalized, release.normalized_source_digest(files))
+
     def test_release_build_excludes_private_config_and_refuses_existing_output(self):
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)
