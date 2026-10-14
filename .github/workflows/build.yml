@@ -16,6 +16,8 @@ jobs:
       - uses: actions/setup-dotnet@v6
         with:
           dotnet-version: '10.0.x'
+      - name: Install media test dependencies
+        run: sudo apt-get update && sudo apt-get install --yes --no-install-recommends ffmpeg
       - name: Build .NET projects
         run: dotnet build src/Neolink.Server/Neolink.Server.csproj --configuration Release
       - name: Run upstream self-tests
