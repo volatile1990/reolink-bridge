@@ -75,11 +75,30 @@ def audit_recipe(original, owner):
 
 def isolated_command(docker, owner, name, image, command, detached=True):
     result = [docker, "run", "--detach" if detached else "--rm", "--name", name, "--label", OWNER_LABEL + "=" + owner,
-              "--network", "none", "--memory", "1g", "--cpuset-cpus", "0,1", "--pids-limit", "256", "--user", "1026:100",
+              "--network", "none", "--memory", "1g", "--cpuset-cpus", "0,1", "--pids-limit", "256", "--ulimit", "nproc=256:256", "--user", "1026:100",
               "--read-only", "--cap-drop", "ALL", "--security-opt", "no-new-privileges:true", "--tmpfs", "/tmp:rw,nosuid,nodev,size=512m,mode=1777",
               "--no-healthcheck", "--device", "/dev/dri/renderD128:/dev/dri/renderD128", "--group-add", "937",
               "--log-driver", "json-file", "--log-opt", "max-size=10m", "--log-opt", "max-file=1", "--entrypoint", command[0], image]
     return result + command[1:]
+
+
+def process_limiter(host):
+    pids = host.get("PidsLimit")
+    if type(pids) is int and pids == 256:
+        return "cgroup_pids"
+    limits = [row for row in (host.get("Ulimits") or []) if row.get("Name") == "nproc"]
+    need((pids is None or type(pids) is int and pids == 0) and len(limits) == 1
+         and type(limits[0].get("Soft")) is int and limits[0]["Soft"] == 256
+         and type(limits[0].get("Hard")) is int and limits[0]["Hard"] == 256,
+         "audit_process_limit_unavailable")
+    return "rlimit_nproc"
+
+
+def kernel_process_limit(output):
+    rows = [line for line in output.splitlines() if line.strip().startswith("Max processes")]
+    need(len(rows) == 1 and re.fullmatch(r"\s*Max processes\s+256\s+256\s+processes\s*", rows[0]),
+         "audit_kernel_process_limit_unconfirmed")
+    return 256
 
 
 def isolation(info, owner):
@@ -87,7 +106,8 @@ def isolation(info, owner):
     config = info.get("Config") or {}
     need((config.get("Labels") or {}).get(OWNER_LABEL) == owner, "audit_container_owner_mismatch")
     need(host.get("NetworkMode") == "none" and not host.get("PortBindings") and host.get("PublishAllPorts") is not True, "audit_network_not_isolated")
-    need(host.get("Memory") == 1024 ** 3 and host.get("CpusetCpus") == "0,1" and host.get("PidsLimit") == 256, "audit_resource_limits_changed")
+    need(host.get("Memory") == 1024 ** 3 and host.get("CpusetCpus") == "0,1", "audit_resource_limits_changed")
+    process_limiter(host)
     need(host.get("ReadonlyRootfs") is True and host.get("Privileged") is False and config.get("User") == "1026:100", "audit_runtime_privileges_changed")
     need("ALL" in (host.get("CapDrop") or []) and "no-new-privileges:true" in (host.get("SecurityOpt") or []), "audit_capabilities_changed")
     need(not any(mount.get("Type") in ("bind", "volume") for mount in info.get("Mounts", [])), "audit_private_mount_present")
@@ -166,6 +186,26 @@ class AuditBuilder:
         self.remove_container(name)
         return result
 
+    def process_limits(self, image):
+        name = "reolink-deploy-test-" + self.owner[:16] + "-limits"
+        self.containers.append(name)
+        started = self.call(isolated_command(self.backend.docker, self.owner, name, image,
+                                            ["cat", "/proc/self/limits"]), 30)
+        need(started.returncode == 0, "audit_limits_container_start_failed")
+        info = self.inspect_container(name) or {}
+        isolation(info, self.owner)
+        limiter = process_limiter(info["HostConfig"])
+        finished = self.call([self.backend.docker, "wait", name], 30)
+        log = self.call([self.backend.docker, "logs", name], 30)
+        need(finished.returncode == 0 and finished.stdout.strip() == b"0" and log.returncode == 0,
+             "audit_kernel_process_limit_read_failed")
+        self.backend.write_private(self.receipt, "limits.private.log", log.stdout)
+        limit = kernel_process_limit(log.stdout.decode(errors="replace"))
+        self.remove_container(name)
+        return {"processLimiter": limiter, "actualKernelMaxProcesses": limit,
+                "kernelProcessLimitVerified": True, "cgroupPidsLimit": limiter == "cgroup_pids",
+                "additionalRlimitScope": "shared_runtime_uid"}
+
     def dll(self, image, path, label):
         name = "reolink-deploy-test-" + self.owner[:16] + "-" + label
         self.containers.append(name)
@@ -235,6 +275,8 @@ class AuditBuilder:
                 stream.write(recipe)
             audit_tag = "reolink-bridge:audit-" + self.owner
             audit_id = self.build_image(root, "Dockerfile.audit", audit_tag, source, "audit_tests")
+            limits = self.process_limits(audit_id)
+            result.update(limits)
             outcomes = {}
             for kind, command in (("selftests", ["/app/neolink.net.dll", "selftest"]), ("contracts", ["/tests/Neolink.ProtectTests.dll"]), ("vaapi", ["/tests/Neolink.ProtectTests.dll", "--hardware-low-quality-only"])):
                 outcomes[kind] = self.test(kind, audit_id, command)
@@ -248,6 +290,7 @@ class AuditBuilder:
             result.update(ok=True, imageId=production_id, testsPassed=True, testedApplicationDllIdentical=True, applicationDllSha256=production_dll,
                           results=outcomes, productionInventoryPreserved=True, syntheticOnly=True,
                           isolation={"network":"none", "publishedPorts":False, "cpus":"0,1", "memoryMiB":1024, "runtimeUser":"1026:100", "renderDevice":"/dev/dri/renderD128", "renderGroup":"937"})
+            result["isolation"].update(limits)
             if "sourceRevision" in source:
                 result["sourceRevision"] = source["sourceRevision"]
         except Exception as error:

@@ -90,6 +90,17 @@ private logs and evidence remain in the receipt. Only a successful audit with
 confirmed cleanup returns a nested deployable `release` descriptor with
 `testsPassed` and `testedApplicationDllIdentical` as true.
 
+Every audit container requests both a 256-task cgroup limit and
+`RLIMIT_NPROC` with soft/hard limits of 256. The DSM kernel measured on this NAS
+has no pids controller: Docker reports `PidsLimit: null`. That specific fallback
+is accepted only when the inspected `nproc` limit is exactly 256/256. Before any
+application tests, an identically isolated owned container reads
+`/proc/self/limits`; its actual kernel `Max processes` must also be 256/256.
+The public result reports `processLimiter: "rlimit_nproc"`, the kernel proof and
+`cgroupPidsLimit: false`. This process/thread limit counts the shared runtime UID
+1026 across containers and is stricter than a per-container allowance. CPU and
+memory guards remain unchanged. Unsupported or unproven limits abort the audit.
+
 An orchestrator can freeze the public worker code once with `cli.source_bundle()`
 and pass it to every `cli.invoke(payload, connector, sources=frozen_modules)` call.
 The CLI equivalent is `--sources frozen-worker.json`. Exact module-name checks

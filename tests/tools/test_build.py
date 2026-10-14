@@ -39,6 +39,7 @@ def package(extra=None):
 def isolated_info(owner):
     return {"Config": {"User": "1026:100", "Labels": {build.OWNER_LABEL: owner}}, "Mounts": [],
             "HostConfig": {"NetworkMode": "none", "PortBindings": None, "PublishAllPorts": False, "Memory": 1024 ** 3, "CpusetCpus": "0,1", "PidsLimit": 256,
+                           "Ulimits": [{"Name": "nproc", "Soft": 256, "Hard": 256}],
                            "ReadonlyRootfs": True, "Privileged": False, "CapDrop": ["ALL"], "SecurityOpt": ["no-new-privileges:true"], "GroupAdd": ["937"],
                            "Devices": [{"PathOnHost": "/dev/dri/renderD128", "PathInContainer": "/dev/dri/renderD128", "CgroupPermissions": "rwm"}]}}
 
@@ -49,6 +50,8 @@ class BuildBackend:
     def __init__(self, root):
         self.root = Path(root); self.images = {}; self.containers = {}; self.calls = []
         self.fail_contract = False; self.dll_mismatch = False
+        self.pids_limit = 256
+        self.limits_output = b"Limit                     Soft Limit           Hard Limit           Units\nMax processes             256                  256                  processes\n"
         self.entries = [{"ip": "192.168.30.%d" % i, "id": "a" * 64, "name": "synthetic", "imageId": "sha256:" + "a" * 64, "imageRef": "reolink-bridge:existing",
                          "configSha256": "d" * 64, "composeSha256": {"/private/compose": "e" * 64}, "mac": "02:00:00:00:00:01", "network": "f" * 64, "project": "synthetic", "service": "camera"} for i in range(210,216)]
 
@@ -89,6 +92,7 @@ class BuildBackend:
         if args[1] == "run":
             name = args[args.index("--name")+1]; owner = args[args.index("--label")+1].split("=",1)[1]
             self.containers[name] = isolated_info(owner)
+            self.containers[name]["HostConfig"]["PidsLimit"] = self.pids_limit
             return result(value=name.encode())
         if args[1] == "inspect":
             return result(value=json.dumps([self.containers[args[2]]]).encode()) if args[2] in self.containers else result(1)
@@ -96,6 +100,7 @@ class BuildBackend:
             return result(value=b"1" if self.fail_contract and args[2].endswith("-contracts") else b"0")
         if args[1] == "logs":
             name = args[2]
+            if name.endswith("-limits"):return result(value=self.limits_output)
             if name.endswith("-selftests"):return result(value=b"159 passed, 0 failed\n")
             if name.endswith("-contracts"):return result(value=b"136 contract tests passed; 0 failed\n")
             if name.endswith("-vaapi"):return result(value=b"PASS vaapi surfaces confirmed by FFmpeg get_format\n4 GPU low-quality regressions passed: synthetic\n")
@@ -147,6 +152,42 @@ class BuildTests(unittest.TestCase):
     def test_runtime_isolation(self):
         self.assertTrue(build.isolation(isolated_info("a"*32),"a"*32))
 
+    def test_nproc_limit_is_requested_for_every_isolated_container(self):
+        args=build.isolated_command("docker","a"*32,"owned","synthetic",["cat","/proc/self/limits"])
+        self.assertEqual(args[args.index("--ulimit")+1],"nproc=256:256")
+        self.assertEqual(args[args.index("--pids-limit")+1],"256")
+
+    def test_fallback_requires_exact_nproc_limit_when_pids_controller_absent(self):
+        for missing in (None,0):
+            value=isolated_info("a"*32);value["HostConfig"]["PidsLimit"]=missing
+            self.assertTrue(build.isolation(value,"a"*32))
+            self.assertEqual(build.process_limiter(value["HostConfig"]),"rlimit_nproc")
+
+    def test_fallback_missing_wrong_or_duplicate_nproc_rejected(self):
+        invalid=[None,[],[{"Name":"nproc","Soft":256,"Hard":257}],
+                 [{"Name":"nproc","Soft":"256","Hard":256}],
+                 [{"Name":"nproc","Soft":256,"Hard":256}]*2]
+        for limits in invalid:
+            with self.subTest(limits=limits):
+                value=isolated_info("a"*32);value["HostConfig"].update(PidsLimit=None,Ulimits=limits)
+                with self.assertRaisesRegex(engine.GuardError,"audit_process_limit_unavailable"):
+                    build.isolation(value,"a"*32)
+
+    def test_unexpected_cgroup_limit_never_uses_fallback(self):
+        for limit in (128,257,-1,"256",False):
+            value=isolated_info("a"*32);value["HostConfig"]["PidsLimit"]=limit
+            with self.assertRaisesRegex(engine.GuardError,"audit_process_limit_unavailable"):
+                build.isolation(value,"a"*32)
+
+    def test_kernel_limits_require_exact_unique_process_limits_line(self):
+        self.assertEqual(build.kernel_process_limit("Max processes  256  256  processes\n"),256)
+        for output in ("", "claimed Max processes 256 256 processes", "Max processes 256 unlimited processes",
+                       "Max processes 257 256 processes", "Max processes 256 256 processes trailing",
+                       "Max processes 256 256 processes\nMax processes 256 256 processes"):
+            with self.subTest(output=output):
+                with self.assertRaisesRegex(engine.GuardError,"audit_kernel_process_limit_unconfirmed"):
+                    build.kernel_process_limit(output)
+
     def test_bound_volume_rejected(self):
         value=isolated_info("a"*32);value["Mounts"]=[{"Type":"bind","Source":"/private"}]
         with self.assertRaisesRegex(engine.GuardError,"audit_private_mount_present"):build.isolation(value,"a"*32)
@@ -167,12 +208,40 @@ class BuildTests(unittest.TestCase):
             result=build.AuditBuilder(backend,backend.run).run(package())
             self.assertTrue(result["ok"]);self.assertTrue(result["cleanupConfirmed"])
             self.assertTrue(result["release"]["testsPassed"]);self.assertTrue(result["release"]["testedApplicationDllIdentical"])
+            self.assertEqual(result["processLimiter"],"cgroup_pids")
+            self.assertEqual(result["actualKernelMaxProcesses"],256)
+            self.assertTrue(result["kernelProcessLimitVerified"])
             self.assertEqual(engine.release_descriptor(result["release"])["version"],"1.4.0")
             self.assertEqual(before,backend.inventory());self.assertFalse(backend.containers)
             self.assertEqual(len(backend.images),1);self.assertFalse((Path(result["receipt"])/"source").exists())
             builds=[args for args in backend.calls if args[1]=="build"]
             self.assertEqual(len(builds),2)
             self.assertTrue(all("--memory"in args and args[args.index("--memory")+1]=="1g" for args in builds))
+            runs=[args for args in backend.calls if args[1]=="run"]
+            self.assertTrue(all(args[args.index("--ulimit")+1]=="nproc=256:256" for args in runs))
+            limits=[args for args in runs if args[args.index("--name")+1].endswith("-limits")]
+            self.assertEqual(len(limits),1);self.assertEqual(limits[0][-1],"/proc/self/limits")
+            self.assertEqual(limits[0][limits[0].index("--entrypoint")+1],"cat")
+
+    def test_dsm_fallback_build_proves_actual_kernel_nproc_and_reports_scope(self):
+        with tempfile.TemporaryDirectory() as root:
+            backend=BuildBackend(root);backend.pids_limit=None
+            result=build.AuditBuilder(backend,backend.run).run(package())
+            self.assertTrue(result["ok"]);self.assertEqual(result["processLimiter"],"rlimit_nproc")
+            self.assertFalse(result["cgroupPidsLimit"]);self.assertEqual(result["actualKernelMaxProcesses"],256)
+            self.assertEqual(result["additionalRlimitScope"],"shared_runtime_uid")
+            self.assertTrue(result["isolation"]["kernelProcessLimitVerified"])
+            self.assertFalse(backend.containers)
+
+    def test_fabricated_kernel_proof_blocks_tests_and_deployable_release(self):
+        with tempfile.TemporaryDirectory() as root:
+            backend=BuildBackend(root);backend.pids_limit=None;backend.limits_output=b"configured nproc=256:256\n"
+            result=build.AuditBuilder(backend,backend.run).run(package())
+            self.assertFalse(result["ok"]);self.assertNotIn("release",result)
+            self.assertEqual(result["errorCode"],"audit_kernel_process_limit_unconfirmed")
+            self.assertTrue(result["cleanupConfirmed"]);self.assertFalse(backend.images);self.assertFalse(backend.containers)
+            tests=[args for args in backend.calls if args[1]=="run" and args[args.index("--name")+1].endswith("-selftests")]
+            self.assertFalse(tests)
 
     def test_failed_test_never_produces_a_deployable_release(self):
         with tempfile.TemporaryDirectory() as root:
