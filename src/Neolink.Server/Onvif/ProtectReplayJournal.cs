@@ -1,3 +1,5 @@
+using System.ComponentModel;
+using System.Runtime.InteropServices;
 using System.Text.Json;
 
 namespace Neolink.Onvif;
@@ -9,6 +11,7 @@ internal sealed class ProtectReplayJournal : IDisposable
     private readonly string _path;
     private readonly int _maxBytes;
     private readonly TimeSpan _retention;
+    private readonly Action<string> _syncDirectory;
     private FileStream? _stream;
     private readonly FileStream _lease;
     private Header _header;
@@ -21,11 +24,13 @@ internal sealed class ProtectReplayJournal : IDisposable
     public string State { get; private set; } = "ready";
     public long Failures { get; private set; }
 
-    public ProtectReplayJournal(string path, int maxBytes, TimeSpan retention, DateTimeOffset now)
+    public ProtectReplayJournal(string path, int maxBytes, TimeSpan retention, DateTimeOffset now,
+        Action<string>? syncDirectory = null)
     {
         if (!Path.IsPathFullyQualified(path) || maxBytes is < 65536 or > 67108864 || retention.TotalSeconds is < 60 or > 604800)
             throw new ArgumentException("Invalid persistent replay limits");
         _path = Path.GetFullPath(path); _maxBytes = maxBytes; _retention = retention;
+        _syncDirectory = syncDirectory ?? SyncDirectory;
         RejectLinks(_path);
         string directory = Path.GetDirectoryName(_path)!;
         if (!Directory.Exists(directory))
@@ -119,8 +124,37 @@ internal sealed class ProtectReplayJournal : IDisposable
         }
         _stream?.Dispose(); _stream = null;
         File.Move(temporary, _path, overwrite: true);
+        // File flush protects contents, not the new directory entry. Only
+        // resume appends once the rename itself is durable on the NAS.
+        _syncDirectory(Path.GetDirectoryName(_path)!);
         _stream = Open(_path, FileMode.Append);
     }
+
+    private static void SyncDirectory(string directory)
+    {
+        // Production is Linux. Windows FlushFileBuffers does not support an
+        // ordinary directory handle; retain its existing file-flush behavior.
+        if (!OperatingSystem.IsLinux()) return;
+        const int oDirectory = 0x10000, oCloexec = 0x80000;
+        int descriptor = NativeOpen(directory, oDirectory | oCloexec);
+        if (descriptor < 0)
+            throw new IOException("Persistent replay directory could not be opened for sync",
+                new Win32Exception(Marshal.GetLastPInvokeError()));
+        try
+        {
+            if (NativeFsync(descriptor) != 0)
+                throw new IOException("Persistent replay directory sync failed",
+                    new Win32Exception(Marshal.GetLastPInvokeError()));
+        }
+        finally { NativeClose(descriptor); }
+    }
+
+    [DllImport("libc", EntryPoint = "open", SetLastError = true)]
+    private static extern int NativeOpen([MarshalAs(UnmanagedType.LPUTF8Str)] string path, int flags);
+    [DllImport("libc", EntryPoint = "fsync", SetLastError = true)]
+    private static extern int NativeFsync(int descriptor);
+    [DllImport("libc", EntryPoint = "close", SetLastError = true)]
+    private static extern int NativeClose(int descriptor);
 
     private static void WriteLine(Stream stream, byte[] data) { stream.Write(data); stream.WriteByte((byte)'\n'); }
 

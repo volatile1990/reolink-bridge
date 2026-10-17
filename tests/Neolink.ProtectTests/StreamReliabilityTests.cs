@@ -170,4 +170,60 @@ internal static class StreamReliabilityTests
         }
         return Task.CompletedTask;
     }
+
+    public static Task DurableReplayRenameOrderingAndSyncFailure()
+    {
+        string folder = Path.Combine(Path.GetTempPath(), "synthetic-replay-sync-" + Guid.NewGuid().ToString("N"));
+        string path = Path.Combine(folder, "pushes.jsonl");
+        var now = DateTimeOffset.UtcNow;
+        int syncs = 0;
+        bool failSync = false;
+        Action<string> sync = directory =>
+        {
+            Check(Path.GetFullPath(directory) == Path.GetFullPath(folder), "sync escaped replay directory");
+            Check(File.Exists(path) && !File.Exists(path + ".new"), "directory sync preceded atomic rename");
+            Check(File.ReadAllLines(path).All(line => JsonSerializer.Deserialize<JsonElement>(line).ValueKind == JsonValueKind.Object),
+                "directory sync saw incomplete journal records");
+            syncs++;
+            if (failSync) throw new IOException("synthetic directory-sync failure");
+        };
+        try
+        {
+            using (var journal = new ProtectReplayJournal(path, 65536, TimeSpan.FromMinutes(1), now, sync))
+            {
+                Check(syncs == 1, "initial replay rename was not synchronized");
+                journal.Append(new(1, now, true, ["person"], [], "MD", 1), now);
+                Check(syncs == 1, "ordinary append unnecessarily replaced the journal");
+                journal.SetEpoch(2);
+                Check(syncs == 2 && journal.State == "ready", "epoch rename was not synchronized");
+                failSync = true;
+                journal.SetEpoch(3);
+                Check(journal.State == "write-failed" && journal.Failures == 1,
+                    "directory-sync failure falsely reported durable replay");
+                failSync = false;
+                journal.Append(new(2, now, false, [], [], "MD", 3), now);
+                Check(syncs == 4 && journal.State == "ready", "failed sync could not rebuild complete replay");
+                journal.Entries(now.AddMinutes(2));
+                Check(syncs == 5, "retention rename was not synchronized");
+            }
+            failSync = true;
+            try
+            {
+                using var refused = new ProtectReplayJournal(path, 65536, TimeSpan.FromMinutes(1), now, sync);
+                throw new Exception("initial sync failure was ignored");
+            }
+            catch (IOException) { }
+            failSync = false;
+            using var recovered = new ProtectReplayJournal(path, 65536, TimeSpan.FromMinutes(1), now, sync);
+            Check(recovered.Sequence == 2 && recovered.Epoch >= 3,
+                "failed constructor leaked the lease or lost preserved identity");
+        }
+        finally
+        {
+            Check(Path.GetFullPath(folder).StartsWith(Path.Combine(Path.GetTempPath(), "synthetic-replay-sync-"), StringComparison.Ordinal),
+                "refusing cleanup outside synthetic sync scope");
+            if (Directory.Exists(folder)) Directory.Delete(folder, true);
+        }
+        return Task.CompletedTask;
+    }
 }

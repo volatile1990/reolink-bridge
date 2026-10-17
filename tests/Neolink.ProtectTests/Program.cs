@@ -157,7 +157,8 @@ if (args.SequenceEqual(new[] { "--reliability-only" }))
         await StreamReliabilityTests.FreshDescriptionsAcrossEpochs(); await StreamReliabilityTests.PublicationOrderAndByteBudgets();
         await StreamReliabilityTests.AlarmSubscriptionRecovery(); await StreamReliabilityTests.LowFrameRatesAndCertificatePinning();
         await StreamReliabilityTests.DurableReplayAndRecovery();
-        Console.WriteLine("14 reliability contracts passed; synthetic media, temporary state and loopback peers only."); return 0;
+        await StreamReliabilityTests.DurableReplayRenameOrderingAndSyncFailure();
+        Console.WriteLine("15 reliability contracts passed; synthetic media, temporary state and loopback peers only."); return 0;
     }
     catch (Exception error) { Console.Error.WriteLine("FAIL reliability: " + error); return 1; }
 }
@@ -236,6 +237,7 @@ internal static class ContractTests
             await Test("alarm subscriptions recover independently from transient failures", StreamReliabilityTests.AlarmSubscriptionRecovery);
             await Test("low frame rates and camera certificate pins", StreamReliabilityTests.LowFrameRatesAndCertificatePinning);
             await Test("persistent camera replay survives restart and partial append", StreamReliabilityTests.DurableReplayAndRecovery);
+            await Test("persistent replay sync follows rename and fails closed", StreamReliabilityTests.DurableReplayRenameOrderingAndSyncFailure);
             await Test("single and dual quality preserve one device identity and strict headless configuration", () => DualStreamContractTests.Configurations(example));
             await Test("dual-quality configuration rejects mismatched codecs and unsafe conversions", () => DualStreamContractTests.InvalidConfigurations(example));
             await Test("main and low streams have independent media with one event owner", () => DualStreamContractTests.IndependentStreams(example));
