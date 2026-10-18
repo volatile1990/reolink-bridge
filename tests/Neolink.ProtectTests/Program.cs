@@ -36,6 +36,22 @@ if (args.SequenceEqual(new[] { "--gop-aac-only" }))
     catch (Exception error) { Console.Error.WriteLine("FAIL GOP AAC: " + error); return 1; }
 }
 
+if (args.SequenceEqual(new[] { "--gop-nal-only" }))
+{
+    try
+    {
+        await GopNalPacketizationTests.WireParityAndOwnership(); await GopNalPacketizationTests.BoundsLifetimeAndSessions();
+        await GopNalPacketizationTests.MissingParameterFallback();
+        await GopVideoPlayoutTests.DriftAndPacing(); await GopVideoPlayoutTests.WrapAndCancel();
+        await GopVideoPlayoutTests.BoundsAndRecovery(); await GopVideoPlayoutTests.MultiAuAndMetadata(); await GopVideoPlayoutTests.SourceClockFallback();
+        await GopPlayoutWireTests.ConfigAndMetadata(); await GopPlayoutWireTests.WireAliasesAndPictures(); await GopPlayoutWireTests.DefaultAndAudioScope();
+        await GopAacContractTests.TimelineAndRtcp(); await GopAacContractTests.LossEpochAndBounds();
+        await GopAacContractTests.ConfigAndObservedProfiles(); await GopAacContractTests.WirePayloadsAndSynchronization();
+        Console.WriteLine("15 GOP/NAL/video/AAC contracts passed; synthetic media and loopback peers only."); return 0;
+    }
+    catch (Exception error) { Console.Error.WriteLine("FAIL GOP NAL: " + error); return 1; }
+}
+
 if (args.SequenceEqual(new[] { "--listen-only" }))
 {
     try
@@ -382,6 +398,9 @@ internal static class ContractTests
             await Test("GOP playout bounds memory frames time and recovers only at complete keyframes", GopVideoPlayoutTests.BoundsAndRecovery);
             await Test("GOP playout splits pictures while preserving parameter slices and SEI", GopVideoPlayoutTests.MultiAuAndMetadata);
             await Test("GOP playout retains valid pictures when source clocks or AU bundles need uniform timing", GopVideoPlayoutTests.SourceClockFallback);
+            await Test("GOP NAL packetization preserves every TCP and UDP byte without copying source payloads", GopNalPacketizationTests.WireParityAndOwnership);
+            await Test("GOP NAL retention preserves bounds and independent sessions after reset", GopNalPacketizationTests.BoundsLifetimeAndSessions);
+            await Test("GOP keyframes missing SPS preserve original cached-parameter boundary rules", GopNalPacketizationTests.MissingParameterFallback);
             await Test("GOP config defaults aliases and source arrival metadata are correct", GopPlayoutWireTests.ConfigAndMetadata);
             await Test("actual RTSP aliases normalize AU timestamps markers and FU bytes", GopPlayoutWireTests.WireAliasesAndPictures);
             await Test("default RTSP is unchanged and GOP mounts explicitly refuse audio", GopPlayoutWireTests.DefaultAndAudioScope);

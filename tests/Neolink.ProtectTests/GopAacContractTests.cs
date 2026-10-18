@@ -38,7 +38,7 @@ internal static class GopAacContractTests
         var plans = audio.Plan(complete);
         Check(plans.Count == 4 && plans.Select(p => p.Offset.TotalMilliseconds).SequenceEqual(new[] { 0d, 64d, 128d, 192d }), "AAC sample cadence was stretched to video frame rate");
         Check(plans.Select(p => p.Packet).SequenceEqual(sourceAac), "AAC access-unit bytes or timestamps were replaced");
-        Check(complete.Pictures.SelectMany(v => H26x.SplitNals(v.AnnexB)).SelectMany(n => n.ToArray())
+        Check(complete.Pictures.SelectMany(v => v.Nals).SelectMany(n => n.ToArray())
             .SequenceEqual(H26x.SplitNals(bundle).Concat(H26x.SplitNals(Annex(P))).SelectMany(n => n.ToArray())), "GOP AAC changed video NAL contents");
         Check(video.PresentationTimestamp(TimeSpan.Zero) == 2_500_000, "AAC changed existing startup reserve");
         Check(audio.RtpAtSourceTime(0) == audioStart && audio.RtpAtSourceTime(0.128) == unchecked(audioStart + 2048), "Audio wrap/common time mapping failed");
@@ -59,7 +59,7 @@ internal static class GopAacContractTests
         var audio = new GopAacTimeline(16000, 0); audio.Push(Aac(0, 0, 0)); audio.Push(Aac(1, 2048, 128000));
         Check(audio.Diagnostics is { Resets: 1, DroppedPackets: 1, BufferedPackets: 1 }, "Audio queue loss replayed obsolete sample anchor");
         audio.Reset(1); audio.Push(Aac(2, 3072, 192000, 0)); audio.Push(Aac(3, 4096, 256000, 1));
-        var gop = new CompletedVideoGop([new(Annex(Idr), true, true, 1234, TimeSpan.Zero, 1)], TimeSpan.FromSeconds(1), 1)
+        var gop = new CompletedVideoGop([new([Idr], true, true, 1234, TimeSpan.Zero, 1)], TimeSpan.FromSeconds(1), 1)
         { SourceArrivalTimestamp = 256000, SourceArrivalFrequency = 1_000_000 };
         Check(audio.Plan(gop) is [var fresh] && fresh.Packet.SourceEpoch == 1 && fresh.Packet.RtpTs == 4096, "Source reconnect replayed old-epoch sound");
         var bounded = new GopAacTimeline(16000, 0);

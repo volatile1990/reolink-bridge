@@ -4,7 +4,9 @@ using Neolink.Streaming;
 
 namespace Neolink.Rtsp;
 
-internal sealed record GopPlayoutPicture(byte[] AnnexB, bool Keyframe, bool HasSps,
+// Each slice keeps its immutable HubVideo payload alive through the awaited send.
+// A picture owns only its NAL list, never a pooled or reusable payload buffer.
+internal sealed record GopPlayoutPicture(IReadOnlyList<ReadOnlyMemory<byte>> Nals, bool Keyframe, bool HasSps,
     uint RtpTimestamp, TimeSpan Offset, long SourceEpoch);
 internal sealed record CompletedVideoGop(IReadOnlyList<GopPlayoutPicture> Pictures, TimeSpan Duration,
     long SourceEpoch, bool UniformCadence = false)
@@ -189,7 +191,7 @@ internal sealed class GopVideoPlayout
                 bool key = unit.Keyframe || (buffer.Video.Keyframe && pictureIndex == 0);
                 bool hasSps = pending.Any(nal => nal.Length > 0 &&
                     (_codec == VideoCodec.H265 ? H26x.H265NalType(nal.Span) == 33 : H26x.H264NalType(nal.Span) == 7));
-                pictures.Add(new GopPlayoutPicture(RtpAccessUnitSplitter.AnnexB(pending), key, hasSps,
+                pictures.Add(new GopPlayoutPicture(pending.ToArray(), key, hasSps,
                     unchecked(start + (uint)position), TimeSpan.FromSeconds(position / 90000d), first.SourceEpoch));
                 pending.Clear(); pictureIndex++;
             }
@@ -200,10 +202,7 @@ internal sealed class GopVideoPlayout
             int tailBytes = pending.Sum(nal => checked(4 + nal.Length));
             if (outputBytes + tailBytes > MaxBytes) return null;
             var old = pictures[^1];
-            byte[] tail = RtpAccessUnitSplitter.AnnexB(pending);
-            byte[] joined = new byte[old.AnnexB.Length + tail.Length];
-            old.AnnexB.CopyTo(joined, 0); tail.CopyTo(joined, old.AnnexB.Length);
-            pictures[^1] = old with { AnnexB = joined };
+            pictures[^1] = old with { Nals = old.Nals.Concat(pending).ToArray() };
         }
         _haveOutputTimestamp = true;
         _nextOutputTimestamp = unchecked(start + (uint)durationTicks);

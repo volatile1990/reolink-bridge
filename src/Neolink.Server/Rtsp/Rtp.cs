@@ -49,8 +49,15 @@ public sealed class RtpPacketizer
     public void PacketizeVideoInto(RtpBatch batch, VideoCodec codec, ReadOnlyMemory<byte> annexB, uint ts,
         byte channel)
     {
+        PacketizeVideoNalsInto(batch, codec, H26x.SplitNals(annexB), ts, channel);
+    }
+
+    /// <summary>The same packetization for an access unit already split by GOP
+    /// playout. NAL slices must remain immutable until the batch send completes.</summary>
+    internal void PacketizeVideoNalsInto(RtpBatch batch, VideoCodec codec,
+        IReadOnlyList<ReadOnlyMemory<byte>> nals, uint ts, byte channel)
+    {
         batch.Reset(channel);
-        var nals = H26x.SplitNals(annexB);
         for (int n = 0; n < nals.Count; n++)
         {
             var nal = nals[n];

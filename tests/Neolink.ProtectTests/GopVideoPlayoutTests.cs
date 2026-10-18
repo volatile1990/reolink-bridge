@@ -68,7 +68,7 @@ internal static class GopVideoPlayoutTests
             var picture = completed.Pictures[i];
             Near(picture.Offset.TotalSeconds, i * 0.056, 1d / 90000, "GOP wall normalization left the original media-clock drift");
             Check(unchecked(picture.RtpTimestamp - first) == (uint)(i * 5040), "RTP delta and paced picture offset disagree");
-            Check(picture.AnnexB.SequenceEqual(originals[i]), "normalization changed encoded picture bytes");
+            Check(RtpAccessUnitSplitter.AnnexB(picture.Nals).SequenceEqual(originals[i]), "normalization changed encoded picture bytes");
         }
         long begun = clock.GetTimestamp();
         playout.BeginGop(completed);
@@ -206,7 +206,7 @@ internal static class GopVideoPlayoutTests
             "exact byte-cap GOP was emitted before closing");
         Check(bytes.BufferedBytes == byteCap && bytes.BufferedFrames == 1, "exact 6 MiB boundary was rejected or miscounted");
         var exactBytes = Close(bytes, Packet(1, 90_000, 1_000_000, true));
-        Check(exactBytes.Pictures.Count == 1 && exactBytes.Pictures[0].AnnexB.Length == byteCap,
+        Check(exactBytes.Pictures.Count == 1 && exactBytes.Pictures[0].Nals.Sum(nal => 4 + nal.Length) == byteCap,
             "closing an exactly bounded GOP changed its bytes");
 
         var overflow = new GopVideoPlayout(VideoCodec.H265, 0);
@@ -300,7 +300,7 @@ internal static class GopVideoPlayoutTests
                     "bad source clock was not replaced by actual-GOP-duration/actual-picture-count");
                 Check(unchecked(complete.Pictures[i].RtpTimestamp - first) == i * 9000,
                     "uniform fallback output timestamp disagrees with its paced position");
-                Check(complete.Pictures[i].AnnexB.SequenceEqual(originals[i]),
+                Check(RtpAccessUnitSplitter.AnnexB(complete.Pictures[i].Nals).SequenceEqual(originals[i]),
                     "source-clock fallback changed original encoded picture bytes");
             }
         }
@@ -317,7 +317,7 @@ internal static class GopVideoPlayoutTests
         for (int i = 0; i < five.Pictures.Count; i++)
             Near(five.Pictures[i].Offset.TotalMilliseconds, i * 60, 0.02,
                 "bundled GOP used per-buffer PTS interpolation or an invented fixed FPS");
-        Check(five.Pictures.Skip(1).SelectMany(picture => H26x.SplitNals(picture.AnnexB))
+        Check(five.Pictures.Skip(1).SelectMany(picture => picture.Nals)
             .SelectMany(nal => nal.ToArray()).SequenceEqual(H26x.SplitNals(fourPictures).SelectMany(nal => nal.ToArray())),
             "uniform bundled fallback changed encoded picture bytes");
 
@@ -357,8 +357,8 @@ internal static class GopVideoPlayoutTests
         Check(complete.Pictures[0].Keyframe && !complete.Pictures[1].Keyframe,
             "a keyframe anywhere in the source buffer was copied to every split picture");
         Check(complete.Pictures[0].HasSps && !complete.Pictures[1].HasSps, "parameter sets were stripped or assigned to every AU");
-        var first = H26x.SplitNals(complete.Pictures[0].AnnexB);
-        var second = H26x.SplitNals(complete.Pictures[1].AnnexB);
+        var first = complete.Pictures[0].Nals;
+        var second = complete.Pictures[1].Nals;
         Check(first.Count == 7 && second.Count == 4, "AUD/prefix/suffix metadata was lost or assigned to the wrong picture");
         Check(first.Select(nal => H26x.H265NalType(nal.Span)).SequenceEqual(new[] { 32, 33, 34, 35, 39, 19, 40 })
             && second.Select(nal => H26x.H265NalType(nal.Span)).SequenceEqual(new[] { 35, 39, 1, 1 }),
@@ -381,7 +381,7 @@ internal static class GopVideoPlayoutTests
         samePtsMetadata.Push(Packet(2, 5500, 50_000));
         var withMetadata = Close(samePtsMetadata, Packet(3, 10_000, 100_000, true));
         Check(withMetadata.Pictures.Count == 2, "same-PTS metadata invented an extra picture");
-        Check(withMetadata.Pictures.SelectMany(picture => H26x.SplitNals(picture.AnnexB))
+        Check(withMetadata.Pictures.SelectMany(picture => picture.Nals)
             .Select(nal => H26x.H265NalType(nal.Span)).SequenceEqual(new[] { 19, 39, 1 }),
             "same-PTS metadata changed encoded NAL order or was dropped");
         var multiSlice = new GopVideoPlayout(VideoCodec.H265, 0);
@@ -397,7 +397,7 @@ internal static class GopVideoPlayoutTests
         var avcGop = Close(h264, Packet(1, 10_000, 100_000, true, Annex([0x65, 0x80, 0x80])));
         Check(avcGop.Pictures.Count == 2 && avcGop.Pictures[0].Keyframe && !avcGop.Pictures[1].Keyframe,
             "H264 Exp-Golomb zero/continuation boundaries were misclassified");
-        Check(avcGop.Pictures.SelectMany(picture => H26x.SplitNals(picture.AnnexB))
+        Check(avcGop.Pictures.SelectMany(picture => picture.Nals)
             .SelectMany(nal => nal.ToArray()).SequenceEqual(H26x.SplitNals(avc).SelectMany(nal => nal.ToArray())),
             "H264 split stripped parameter/AUD NAL bytes");
         return Task.CompletedTask;

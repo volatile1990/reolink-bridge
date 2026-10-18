@@ -995,7 +995,7 @@ internal sealed class RtspSession
                                 }
                                 if (item.Video is { } picture)
                                 {
-                                    await SendVideoAsync(hub, picture.AnnexB, picture.Keyframe, picture.HasSps,
+                                    await SendVideoNalsAsync(hub, picture.Nals, picture.Keyframe, picture.HasSps,
                                         picture.RtpTimestamp, batch, ct).ConfigureAwait(false);
                                     playout.MarkSent(picture);
                                 }
@@ -1087,6 +1087,29 @@ internal sealed class RtspSession
         var au = keyframe ? EnsureParameterSets(_description, codec, annexB, hasSps) : annexB;
         // Packetization follows the cancellable wait, into this pump's private batch.
         video.Packetizer.PacketizeVideoInto(batch, codec, au, timestamp, video.RtpChannel);
+        await SendVideoBatchAsync(video, batch, ct).ConfigureAwait(false);
+    }
+
+    private async Task SendVideoNalsAsync(IStreamHub hub, IReadOnlyList<ReadOnlyMemory<byte>> nals,
+        bool keyframe, bool hasSps, uint timestamp, RtpBatch batch, CancellationToken ct)
+    {
+        // Preserve the original parameter-set insertion and Annex-B boundary
+        // rules for keyframes missing SPS, including malformed cached metadata.
+        if (keyframe && !hasSps)
+        {
+            await SendVideoAsync(hub, RtpAccessUnitSplitter.AnnexB(nals), true, false,
+                timestamp, batch, ct).ConfigureAwait(false);
+            return;
+        }
+        var video = Video ?? throw new InvalidOperationException("Video transport missing");
+        var codec = _description.Codec ?? VideoCodec.H264;
+        if (hub.Codec != codec) throw new IOException("RTSP source codec changed; reconnect for current SDP");
+        video.Packetizer.PacketizeVideoNalsInto(batch, codec, nals, timestamp, video.RtpChannel);
+        await SendVideoBatchAsync(video, batch, ct).ConfigureAwait(false);
+    }
+
+    private async Task SendVideoBatchAsync(TrackTransport video, RtpBatch batch, CancellationToken ct)
+    {
         if (video.Tcp)
         {
             await _conn.SendInterleavedRawAsync(batch.Framed, ct).ConfigureAwait(false);
