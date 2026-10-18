@@ -53,10 +53,12 @@ internal static class AuthParkingTests
 
     public static async Task TransportFailureStillReconnects()
     {
-        await using var fake = new FakeBaichuanCamera(500, emptyReply: false, dropBeforeNonce: true);
+        await DropScenarioCleanupIsScoped();
+        using var stop = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+        await using var fake = new FakeBaichuanCamera(500, emptyReply: false, dropBeforeNonce: true,
+            dropScenarioCancellation: stop.Token);
         var hub = new StreamHub("synthetic-transport");
         var source = Source(fake.Port, hub, "synthetic-transport");
-        using var stop = new CancellationTokenSource(TimeSpan.FromSeconds(5));
         Task running = source.RunAsync(stop.Token);
         try
         {
@@ -67,6 +69,45 @@ internal static class AuthParkingTests
         {
             stop.Cancel();
             await running.WaitAsync(TimeSpan.FromSeconds(2));
+        }
+    }
+
+    private static async Task DropScenarioCleanupIsScoped()
+    {
+        // Deterministically close a peer before its first upgrade header, rather
+        // than relying on the transport test's Accept/cancellation scheduling.
+        using var sourceStop = new CancellationTokenSource();
+        await using (var expected = new FakeBaichuanCamera(500, false, true, sourceStop.Token))
+        {
+            using var peer = new TcpClient();
+            await peer.ConnectAsync(IPAddress.Loopback, expected.Port);
+            await Until(() => expected.Connections == 1, TimeSpan.FromSeconds(2));
+            sourceStop.Cancel(); peer.Dispose();
+            await expected.Completion.WaitAsync(TimeSpan.FromSeconds(2));
+        }
+
+        // EOF before source cancellation, and EOF outside the drop scenario even
+        // with a cancelled token, must still expose a malformed fixture exchange.
+        foreach (bool dropBeforeNonce in new[] { true, false })
+        {
+            var unexpected = new FakeBaichuanCamera(500, false, dropBeforeNonce,
+                dropBeforeNonce ? CancellationToken.None : sourceStop.Token);
+            try
+            {
+                using var peer = new TcpClient();
+                await peer.ConnectAsync(IPAddress.Loopback, unexpected.Port);
+                await Until(() => unexpected.Connections == 1, TimeSpan.FromSeconds(2));
+                peer.Dispose();
+                bool failed = false;
+                try { await unexpected.Completion.WaitAsync(TimeSpan.FromSeconds(2)); }
+                catch (EndOfStreamException) { failed = true; }
+                Check(failed, "unexpected handshake EOF was hidden outside cancelled drop-scenario cleanup");
+            }
+            finally
+            {
+                try { await unexpected.DisposeAsync(); }
+                catch (EndOfStreamException) { } // the fault asserted immediately above
+            }
         }
     }
 
@@ -184,13 +225,17 @@ internal static class AuthParkingTests
         private readonly Task _serving;
         private readonly ushort _responseCode;
         private readonly bool _emptyReply, _dropBeforeNonce;
+        private readonly CancellationToken _dropScenarioCancellation;
         private int _connections, _modernLogins;
         public int Port { get; }
         public int Connections => Volatile.Read(ref _connections);
         public int ModernLogins => Volatile.Read(ref _modernLogins);
-        public FakeBaichuanCamera(ushort responseCode, bool emptyReply, bool dropBeforeNonce = false)
+        public Task Completion => _serving;
+        public FakeBaichuanCamera(ushort responseCode, bool emptyReply, bool dropBeforeNonce = false,
+            CancellationToken dropScenarioCancellation = default)
         {
             _responseCode = responseCode; _emptyReply = emptyReply; _dropBeforeNonce = dropBeforeNonce;
+            _dropScenarioCancellation = dropScenarioCancellation;
             _listener.Start(); Port = ((IPEndPoint)_listener.LocalEndpoint).Port;
             _serving = Serve();
         }
@@ -232,6 +277,10 @@ internal static class AuthParkingTests
             }
             catch (OperationCanceledException) when (_stop.IsCancellationRequested) { }
             catch (SocketException) when (_stop.IsCancellationRequested) { }
+            // The reconnect assertion counts Accept, before the upgrade is read.
+            // Cancelling that source can close its second socket before 20 bytes
+            // arrive. Only this explicitly aborted drop fixture permits the EOF.
+            catch (EndOfStreamException) when (_dropBeforeNonce && _dropScenarioCancellation.IsCancellationRequested) { }
         }
         public async ValueTask DisposeAsync()
         {
