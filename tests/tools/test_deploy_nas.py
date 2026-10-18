@@ -4,7 +4,10 @@ import importlib.util
 import json
 from pathlib import Path
 import sys
+import tempfile
+import types
 import unittest
+from unittest.mock import Mock, patch
 
 ROOT = Path(__file__).resolve().parents[2]
 for name in ("engine", "nas"):
@@ -87,6 +90,81 @@ class AdapterTests(unittest.TestCase):
         self.metrics["events"]["subscriptions"] = 0
         with self.assertRaisesRegex(engine.GuardError, "event_subscription_not_ready"):
             self.adapter.sample(self.entry)
+
+
+class DedicatedComposeHostTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.scope = Path(self.temp.name) / 'bridges'
+        self.scope.mkdir()
+        self.adapter = nas.DockerNas({'scope': str(self.scope), 'runtimeUid': 1026, 'renderGroup': 992,
+            'restartPolicy': 'unless-stopped', 'maintenanceMode': 'deployment-lock'})
+        self.items, self.services = [], {}
+        for index, ip in enumerate(nas.DEFAULT_IPS):
+            name = 'camera-' + str(index)
+            path = self.scope / (name + '.json')
+            mac = '02:42:c0:a8:1e:%02x' % (210 + index)
+            path.write_text(json.dumps({'onvif': {'advertised_host': ip, 'mac': mac,
+                'low_quality_encoder': 'vaapi'}, 'users': [{'name': 'synthetic', 'pass': SECRET}],
+                'cameras': [{'address': 'synthetic-source'}]}))
+            mount = {'Type': 'bind', 'Source': str(path), 'Destination': '/run/secrets/bridge-config.json', 'RW': False}
+            self.services[name] = {'image': 'synthetic-image', 'read_only': True, 'restart': 'unless-stopped',
+                'networks': {'camera-network': {'ipv4_address': ip}}, 'volumes': [
+                    {'source': str(path), 'target': mount['Destination'], 'read_only': True}]}
+            self.items.append({'Id': str(index) * 64, 'Name': '/' + name, 'Image': 'synthetic-image-id',
+                'Config': {'Image': 'synthetic-image', 'User': '1026:100', 'Env': [], 'Labels': {
+                    'com.docker.compose.project': self.adapter.project,
+                    'com.docker.compose.project.config_files': str(self.adapter.base),
+                    'com.docker.compose.project.working_dir': str(self.scope), 'com.docker.compose.service': name}},
+                'HostConfig': {'ReadonlyRootfs': True, 'Privileged': False,
+                    'RestartPolicy': {'Name': 'unless-stopped'}, 'GroupAdd': ['992'], 'Devices': [
+                        {'PathOnHost': '/dev/dri/renderD128', 'PathInContainer': '/dev/dri/renderD128', 'CgroupPermissions': 'rwm'}]},
+                'State': {'Running': True}, 'Mounts': [mount], 'NetworkSettings': {'Networks': {
+                    'camera-network': {'IPAddress': ip, 'MacAddress': mac, 'NetworkID': 'synthetic-network'}}}})
+        self.adapter.base.write_text(json.dumps({'services': self.services}))
+        self.adapter.resolved = lambda: {'services': self.services}
+        def command(args, **kwargs):
+            if args[1:3] == ['ps', '-q']:
+                return b'synthetic-ids'
+            if args[1] == 'inspect':
+                return json.dumps(self.items).encode()
+            if args[1:3] == ['network', 'inspect']:
+                return b'[{"Driver":"macvlan"}]'
+            raise AssertionError('unexpected non-read-only command')
+        self.adapter.command = command
+
+    def test_clean_scope_native_gid_and_unless_stopped_are_supported(self):
+        result = self.adapter.inventory()
+        self.assertEqual(len(result), 6)
+        self.assertTrue(all(Path(row['directory']) == self.scope for row in result))
+        self.assertNotIn(SECRET, json.dumps(engine.projected(result)))
+
+    def test_legacy_gid_or_restart_policy_drift_is_not_silently_adopted(self):
+        self.items[0]['HostConfig']['GroupAdd'] = ['937']
+        with self.assertRaisesRegex(engine.GuardError, 'existing_render_group_required'):
+            self.adapter.inventory()
+        self.items[0]['HostConfig']['GroupAdd'] = ['992']
+        self.services['camera-0']['restart'] = 'always'
+        with self.assertRaisesRegex(engine.GuardError, 'existing_restart_policy_required'):
+            self.adapter.inventory()
+
+    def test_dedicated_release_uses_only_local_lock_without_watchdog_marker(self):
+        lock = Mock()
+        stub = types.SimpleNamespace(LOCK_EX=2, LOCK_NB=4, flock=lock)
+        with patch.object(nas, 'fcntl', stub):
+            with self.adapter.maintenance():
+                self.assertTrue((self.scope / '.reolink-release.lock').is_file())
+                self.assertFalse((self.scope / 'maintenance').exists())
+        lock.assert_called_once()
+
+    def test_legacy_defaults_stay_compatible_and_invalid_settings_fail(self):
+        legacy = nas.DockerNas({'scope': str(self.scope)})
+        self.assertEqual((legacy.runtime_uid, legacy.render_group, legacy.restart_policy, legacy.maintenance_mode),
+                         (1026, 937, 'always', 'watchdog'))
+        for key, value in (('renderGroup', True), ('renderGroup', -1), ('restartPolicy', 'on-failure'), ('maintenanceMode', 'none')):
+            with self.subTest(key=key, value=value), self.assertRaises(engine.GuardError):
+                nas.DockerNas({'scope': str(self.scope), key: value})
 
 
 if __name__ == "__main__":

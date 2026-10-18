@@ -11,6 +11,7 @@ import sys
 import tempfile
 from types import SimpleNamespace
 import unittest
+from unittest import mock
 import zipfile
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -115,6 +116,10 @@ class BuildBackend:
 
 
 class BuildTests(unittest.TestCase):
+    def setUp(self):
+        patcher = mock.patch.object(build, "render_groups", return_value=("937",))
+        patcher.start(); self.addCleanup(patcher.stop)
+
     def test_frozen_source_verified_exactly(self):
         source, files = build.frozen_archive(package())
         self.assertEqual(len(files),3); self.assertEqual(source["imageTag"], "reolink-bridge:managed-"+source["sourceSha256"][:12])
@@ -156,6 +161,19 @@ class BuildTests(unittest.TestCase):
         args=build.isolated_command("docker","a"*32,"owned","synthetic",["cat","/proc/self/limits"])
         self.assertEqual(args[args.index("--ulimit")+1],"nproc=256:256")
         self.assertEqual(args[args.index("--pids-limit")+1],"256")
+
+    def test_actual_render_group_replaces_legacy_without_changing_user(self):
+        with mock.patch.object(build, "render_groups", return_value=("992",)):
+            args = build.isolated_command("docker", "a"*32, "owned", "synthetic", ["cat", "/proc/self/limits"])
+            self.assertEqual([args[i+1] for i, value in enumerate(args) if value == "--group-add"], ["992"])
+            self.assertEqual(args[args.index("--user")+1], "1026:100")
+            value = isolated_info("a"*32)
+            with self.assertRaisesRegex(engine.GuardError, "audit_render_access_changed"):
+                build.isolation(value, "a"*32)
+            value["HostConfig"]["GroupAdd"].append("992")
+            self.assertTrue(build.isolation(value, "a"*32))
+            value["HostConfig"]["GroupAdd"] = ["992"]
+            self.assertTrue(build.isolation(value, "a"*32))
 
     def test_fallback_requires_exact_nproc_limit_when_pids_controller_absent(self):
         for missing in (None,0):
@@ -256,6 +274,22 @@ class BuildTests(unittest.TestCase):
             result=build.AuditBuilder(backend,backend.run).run(package())
             self.assertFalse(result["ok"]);self.assertEqual(result["errorCode"],"tested_application_dll_mismatch")
             self.assertFalse(backend.images);self.assertFalse(backend.containers)
+
+
+class RenderDeviceGroups(unittest.TestCase):
+    def test_real_device_gid_is_used_without_a_legacy_host_group(self):
+        for gid, expected in ((937, ("937",)), (992, ("992",))):
+            with self.subTest(gid=gid), mock.patch.object(build.os, "lstat", return_value=SimpleNamespace(st_mode=stat.S_IFCHR | 0o660, st_gid=gid)):
+                self.assertEqual(build.render_groups(), expected)
+
+    def test_missing_symlink_regular_or_invalid_device_cannot_guess_a_group(self):
+        with mock.patch.object(build.os, "lstat", side_effect=FileNotFoundError):
+            with self.assertRaisesRegex(engine.GuardError, "audit_render_device_unavailable"):
+                build.render_groups()
+        for mode, gid in ((stat.S_IFREG, 992), (stat.S_IFLNK, 992), (stat.S_IFCHR, -1), (stat.S_IFCHR, 4294967295)):
+            with self.subTest(mode=mode, gid=gid), mock.patch.object(build.os, "lstat", return_value=SimpleNamespace(st_mode=mode, st_gid=gid)):
+                with self.assertRaisesRegex(engine.GuardError, "audit_render_device_invalid"):
+                    build.render_groups()
 
 
 if __name__=="__main__":unittest.main()

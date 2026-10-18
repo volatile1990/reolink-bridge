@@ -74,12 +74,27 @@ def audit_recipe(original, owner):
 
 
 def isolated_command(docker, owner, name, image, command, detached=True):
+    groups = render_groups()
     result = [docker, "run", "--detach" if detached else "--rm", "--name", name, "--label", OWNER_LABEL + "=" + owner,
               "--network", "none", "--memory", "1g", "--cpuset-cpus", "0,1", "--pids-limit", "256", "--ulimit", "nproc=256:256", "--user", "1026:100",
               "--read-only", "--cap-drop", "ALL", "--security-opt", "no-new-privileges:true", "--tmpfs", "/tmp:rw,nosuid,nodev,size=512m,mode=1777",
-              "--no-healthcheck", "--device", "/dev/dri/renderD128:/dev/dri/renderD128", "--group-add", "937",
+              "--no-healthcheck", "--device", "/dev/dri/renderD128:/dev/dri/renderD128"]
+    for group in groups:
+        result += ["--group-add", group]
+    result += [
               "--log-driver", "json-file", "--log-opt", "max-size=10m", "--log-opt", "max-file=1", "--entrypoint", command[0], image]
     return result + command[1:]
+
+
+def render_groups():
+    """Use only this host's actual render character-device group."""
+    try:
+        device = os.lstat("/dev/dri/renderD128")
+    except OSError:
+        raise GuardError("audit_render_device_unavailable") from None
+    need(stat.S_ISCHR(device.st_mode) and type(device.st_gid) is int and 0 <= device.st_gid < 4294967295,
+         "audit_render_device_invalid")
+    return (str(device.st_gid),)
 
 
 def process_limiter(host):
@@ -112,7 +127,7 @@ def isolation(info, owner):
     need("ALL" in (host.get("CapDrop") or []) and "no-new-privileges:true" in (host.get("SecurityOpt") or []), "audit_capabilities_changed")
     need(not any(mount.get("Type") in ("bind", "volume") for mount in info.get("Mounts", [])), "audit_private_mount_present")
     devices = host.get("Devices") or []
-    need(len(devices) == 1 and devices[0].get("PathOnHost") == "/dev/dri/renderD128" and devices[0].get("PathInContainer") == "/dev/dri/renderD128" and devices[0].get("CgroupPermissions") == "rwm" and "937" in (host.get("GroupAdd") or []), "audit_render_access_changed")
+    need(len(devices) == 1 and devices[0].get("PathOnHost") == "/dev/dri/renderD128" and devices[0].get("PathInContainer") == "/dev/dri/renderD128" and devices[0].get("CgroupPermissions") == "rwm" and set(render_groups()) <= set(host.get("GroupAdd") or []), "audit_render_access_changed")
     return True
 
 
@@ -289,7 +304,7 @@ class AuditBuilder:
             need(projected(before) == projected(after), "production_inventory_changed_during_audit")
             result.update(ok=True, imageId=production_id, testsPassed=True, testedApplicationDllIdentical=True, applicationDllSha256=production_dll,
                           results=outcomes, productionInventoryPreserved=True, syntheticOnly=True,
-                          isolation={"network":"none", "publishedPorts":False, "cpus":"0,1", "memoryMiB":1024, "runtimeUser":"1026:100", "renderDevice":"/dev/dri/renderD128", "renderGroup":"937"})
+                          isolation={"network":"none", "publishedPorts":False, "cpus":"0,1", "memoryMiB":1024, "runtimeUser":"1026:100", "renderDevice":"/dev/dri/renderD128", "renderGroup":render_groups()[0], "renderGroups":list(render_groups())})
             result["isolation"].update(limits)
             if "sourceRevision" in source:
                 result["sourceRevision"] = source["sourceRevision"]

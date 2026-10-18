@@ -1,4 +1,4 @@
-"""Real Synology Docker/Compose adapter; secrets stay in process memory/private receipts."""
+"""Docker/Compose host adapter; secrets stay in process memory/private receipts."""
 import base64
 import contextlib
 import hashlib
@@ -36,6 +36,12 @@ class DockerNas:
         self.state_dir = Path(settings.get("watchdogDirectory", "/var/lib/reolink-camera-resilience"))
         self.runtime_uid = settings.get("runtimeUid", 1026)
         need(type(self.runtime_uid) is int and self.runtime_uid > 0, "runtime_uid_invalid")
+        self.render_group = settings.get("renderGroup", 937)
+        need(type(self.render_group) is int and 0 <= self.render_group < 4294967295, "render_group_invalid")
+        self.restart_policy = settings.get("restartPolicy", "always")
+        need(self.restart_policy in ("always", "unless-stopped"), "restart_policy_invalid")
+        self.maintenance_mode = settings.get("maintenanceMode", "watchdog")
+        need(self.maintenance_mode in ("watchdog", "deployment-lock"), "maintenance_mode_invalid")
         need(self.scope.is_absolute() and self.scope.is_dir() and not self.scope.is_symlink(), "existing_scope_required")
         self.docker = shutil.which("docker") or "/usr/local/bin/docker"
         self._compose = None
@@ -106,7 +112,7 @@ class DockerNas:
             need(len(config.get("cameras", [])) == 1 and config.get("users"), "single_authenticated_camera_required")
             host = item["HostConfig"]
             need(item["State"].get("Running") is True and host.get("ReadonlyRootfs") is True and host.get("Privileged") is False, "running_unprivileged_readonly_required")
-            need(host.get("RestartPolicy", {}).get("Name") == "always" and service.get("restart") == "always", "existing_restart_policy_required")
+            need(host.get("RestartPolicy", {}).get("Name") == self.restart_policy and service.get("restart") == self.restart_policy, "existing_restart_policy_required")
             need(str(item["Config"].get("User", "")).split(":")[0] == str(self.runtime_uid), "runtime_uid_drift")
             need(service.get("read_only") is True and service.get("image") == item["Config"]["Image"], "resolved_image_or_readonly_drift")
             static_ips = [value.get("ipv4_address") for value in (service.get("networks") or {}).values() if isinstance(value, dict)]
@@ -124,7 +130,7 @@ class DockerNas:
                 device = onvif.get("low_quality_device", "/dev/dri/renderD128")
                 need(re.fullmatch(r"/dev/dri/renderD[0-9]{1,4}", device), "render_device_invalid")
                 need(any(value.get("PathOnHost") == device and value.get("PathInContainer") == device and value.get("CgroupPermissions") == "rwm" for value in host.get("Devices", [])), "existing_render_device_required")
-                need("937" in (host.get("GroupAdd") or []), "existing_render_group_required")
+                need(str(self.render_group) in (host.get("GroupAdd") or []), "existing_render_group_required")
             rows.append({"ip": network["IPAddress"], "id": item["Id"], "name": item["Name"].lstrip("/"), "imageId": item["Image"], "imageRef": item["Config"]["Image"],
                          "directory": str(self.scope), "compose": [str(self.base)], "project": self.project, "service": service_name, "config": str(path), "mac": mac,
                          "network": network["NetworkID"], "inspect": item, "configuration": config, "resolved": resolved, "configSha256": digest(raw), "composeSha256": dict(hashes)})
@@ -198,6 +204,18 @@ class DockerNas:
     @contextlib.contextmanager
     def maintenance(self):
         need(fcntl is not None, "linux_flock_required")
+        if self.maintenance_mode == "deployment-lock":
+            # A dedicated Compose host has no external watchdog to suspend.
+            # Serialize release writers without any NAS marker or service.
+            path = self.scope / ".reolink-release.lock"
+            fd = os.open(str(path), os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o600)
+            try:
+                need(stat.S_ISREG(os.fstat(fd).st_mode), "deployment_lock_invalid")
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                yield
+            finally:
+                os.close(fd)
+            return
         need(self.state_dir.is_dir() and not self.state_dir.is_symlink() and self.state_dir.stat().st_uid == 0, "watchdog_directory_invalid")
         lock_path, marker = self.state_dir / "watchdog.lock", self.state_dir / "maintenance"
         need(not lock_path.is_symlink(), "watchdog_lock_symlink")
