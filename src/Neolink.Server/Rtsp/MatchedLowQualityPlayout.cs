@@ -5,6 +5,20 @@ using System.Threading.Channels;
 
 namespace Neolink.Rtsp;
 
+internal enum MatchedLowQualityFailureReason
+{
+    None = 0,
+    MissingSendConfirmation = 1, SubscriberIndexGap = 2, OriginalAacRequired = 3,
+    SentPacketMismatch = 4, PendingBudgetExceeded = 5, StartupTimeout = 6,
+    HqTimingUnavailable = 7, LowSourceChangedOrStale = 8, HqTimingChanged = 9,
+    InitialHqTimingTimeout = 10, MissingVideoArrival = 11, VideoSourceNotIncreasing = 12,
+    AudioSampleGap = 13, AudioClockJump = 14, UnsupportedPacket = 15, WaitTooLong = 16,
+    HqPlanChanged = 17, NonadvancingClock = 18, DeadlineMiss = 19, ClockFrequency = 20,
+    VideoEpochMismatch = 21, VideoPayloadBound = 22, MissingVideoOutputArrival = 23,
+    AudioProvenance = 24, AudioFormatChanged = 25, AudioMetadataBound = 26,
+    MainSourceChangedOrStale = 27
+}
+
 /// <summary>Schedules a bounded set of encoded packet references against HQ timing. Encoded bytes,
 /// RTP timestamps and AAC samples stay unchanged. Input provenance subtracts encoder
 /// latency instead of blindly adding a fixed delay to the encoded output arrival.</summary>
@@ -17,6 +31,7 @@ internal sealed class MatchedLowQualityPlayout(IStreamHub hub, HqPlayoutReferenc
     private readonly TimeProvider _clock = clock ?? TimeProvider.System;
     private readonly Func<TimeSpan, CancellationToken, Task>? _wait = wait;
     private readonly long _lowEpoch = hub.SourceEpoch;
+    private readonly long _mainEpoch = reference.CurrentSourceEpoch;
     private HqPlayoutSnapshot? _binding;
     private long? _previousVideoSource;
     private uint? _previousAudioRtp;
@@ -35,6 +50,12 @@ internal sealed class MatchedLowQualityPlayout(IStreamHub hub, HqPlayoutReferenc
     private long? _startupBegan;
     private long _startupDiscardedGops, _startupDiscardedPackets, _startupDiscardedBytes;
     private double _maximumStartupDiscardLateMs;
+    private long _startupReferenceResyncs;
+    private MatchedLowQualityFailureReason _lastFailureReason;
+
+    // This is a pre-send control signal, never a recorded failure. Old plans
+    // must be discarded before a new HQ owner or mapping can be bound.
+    private sealed class StartupReferenceResyncException : Exception { }
 
     private sealed record PlannedPacket(HubPacket Packet, long SourceTimestamp, long Frequency,
         double Due, HqPlayoutSnapshot Timing, double? EncoderAgeMs, double? InputQueueAgeMs);
@@ -51,25 +72,59 @@ internal sealed class MatchedLowQualityPlayout(IStreamHub hub, HqPlayoutReferenc
         _readerActive = true;
         _startupBegan ??= _clock.GetTimestamp();
         long? lastIndex = null;
-        bool started = !videoEnabled, inputCompleted = false;
+        bool started = !videoEnabled, inputCompleted = false, waitingForReference = false;
         try
+        {
+            while (true)
+            {
+                PlannedPacket? ready;
+                try { ready = await PrepareNextAsync().ConfigureAwait(false); }
+                catch (StartupReferenceResyncException)
+                {
+                    ResetStartupPlans(); _binding = null;
+                    _startupReferenceResyncs++;
+                    started = !videoEnabled; waitingForReference = true;
+                    continue;
+                }
+                if (ready == null) yield break;
+                _readyPacket = ready;
+                // Both readiness/timer tasks have completed before handing a packet to the sender.
+                yield return ready.Packet;
+            }
+        }
+        finally
+        {
+            _videoQueue.Clear(); _audioQueue.Clear(); _heads.Clear();
+            _pendingBytes = _pendingPackets = 0; _readyPacket = null; _readerActive = false;
+        }
+
+        async Task<PlannedPacket?> PrepareNextAsync()
         {
             while (true)
             {
                 ct.ThrowIfCancellationRequested();
                 CheckStartupDeadline();
-                CheckLowFresh();
-                if (_readyPacket != null) throw Failure("Matched LQ previous packet was not marked sent");
+                CheckSourcesFresh();
+                if (_readyPacket != null) throw Failure(MatchedLowQualityFailureReason.MissingSendConfirmation);
+                if (waitingForReference)
+                {
+                    if (reference.TryGetSnapshot(out var current))
+                    {
+                        BindReference(current); waitingForReference = false;
+                    }
+                }
+                else if (_binding != null) CheckedReference();
                 while (reader.TryRead(out var packet))
                 {
-                    ct.ThrowIfCancellationRequested(); CheckStartupDeadline(); CheckLowFresh();
+                    ct.ThrowIfCancellationRequested(); CheckStartupDeadline(); CheckSourcesFresh();
                     if (lastIndex is { } previous && packet.Index != previous + 1)
-                        throw Failure("Matched LQ subscriber lost packets; reconnect at a keyframe");
+                        throw Failure(MatchedLowQualityFailureReason.SubscriberIndexGap);
                     lastIndex = packet.Index; // Includes Opus packets ignored by original-AAC sessions.
                     if (packet is HubVideo video)
                     {
                         if (!videoEnabled) continue;
                         ValidateVideoEnvelope(video);
+                        if (waitingForReference) continue;
                         if (!started && !video.Keyframe) continue;
                         started = true;
                     }
@@ -77,10 +132,11 @@ internal sealed class MatchedLowQualityPlayout(IStreamHub hub, HqPlayoutReferenc
                     {
                         if (audio == null) continue;
                         ValidateAudioEnvelope(aac, audio);
+                        if (waitingForReference) continue;
                         if (!started) continue;
                     }
                     else if (packet is HubAudioPcm && audio != null)
-                        throw Failure("Matched LQ requires original AAC");
+                        throw Failure(MatchedLowQualityFailureReason.OriginalAacRequired);
                     else continue;
                     Enqueue(await PlanAsync(packet, audio, ct).ConfigureAwait(false));
                     // The cached first GOP can age while its first HQ reference
@@ -90,7 +146,10 @@ internal sealed class MatchedLowQualityPlayout(IStreamHub hub, HqPlayoutReferenc
                 }
                 if (!_heads.TryPeek(out var next, out _))
                 {
-                    if (inputCompleted || !await WaitForInputAsync(reader, ct).ConfigureAwait(false)) yield break;
+                    if (inputCompleted) return null;
+                    if (waitingForReference)
+                        inputCompleted = await WaitForInputOrReferenceAsync(reader, ct).ConfigureAwait(false);
+                    else if (!await WaitForInputAsync(reader, ct).ConfigureAwait(false)) return null;
                     continue;
                 }
                 VerifyPlan(next);
@@ -108,15 +167,8 @@ internal sealed class MatchedLowQualityPlayout(IStreamHub hub, HqPlayoutReferenc
                 if (videoEnabled && DiscardExpiredStartupGop()) { started = false; continue; }
                 VerifyDeadline(next);
                 Dequeue(next);
-                _readyPacket = next;
-                // Both readiness/timer tasks have completed before handing a packet to the sender.
-                yield return next.Packet;
+                return next;
             }
-        }
-        finally
-        {
-            _videoQueue.Clear(); _audioQueue.Clear(); _heads.Clear();
-            _pendingBytes = _pendingPackets = 0; _readyPacket = null; _readerActive = false;
         }
     }
 
@@ -124,7 +176,7 @@ internal sealed class MatchedLowQualityPlayout(IStreamHub hub, HqPlayoutReferenc
     {
         var ready = _readyPacket;
         if (ready == null || !ReferenceEquals(ready.Packet, packet))
-            throw Failure("Matched LQ sent packet does not match its ready head");
+            throw Failure(MatchedLowQualityFailureReason.SentPacketMismatch);
         RecordSent(ready); _readyPacket = null;
         return new(_lowEpoch, ready.Due, ready.Frequency);
     }
@@ -133,7 +185,7 @@ internal sealed class MatchedLowQualityPlayout(IStreamHub hub, HqPlayoutReferenc
     {
         int bytes = PayloadBytes(packet.Packet);
         if (_pendingPackets >= MaxPendingPackets || _pendingBytes + bytes > MaxPendingBytes)
-            throw Failure("Matched LQ pending packet budget exceeded");
+            throw Failure(MatchedLowQualityFailureReason.PendingBudgetExceeded);
         var queue = packet.Packet is HubVideo ? _videoQueue : _audioQueue;
         queue.Enqueue(packet);
         if (queue.Count == 1) _heads.Enqueue(packet, (packet.Due, packet.Packet.Index));
@@ -155,13 +207,28 @@ internal sealed class MatchedLowQualityPlayout(IStreamHub hub, HqPlayoutReferenc
 
     private bool HasSent => _videoPackets != 0 || _audioPackets != 0;
 
+    private bool CanResynchronizeReference => _readerActive && !HasSent && _readyPacket == null;
+
+    private Exception ReferenceProblem(MatchedLowQualityFailureReason reason)
+        => CanResynchronizeReference ? new StartupReferenceResyncException() : Failure(reason);
+
+    private void ResetStartupPlans()
+    {
+        _videoQueue.Clear(); _audioQueue.Clear(); _heads.Clear();
+        _pendingPackets = 0; _pendingBytes = 0;
+        _previousVideoSource = null; _previousAudioRtp = null;
+        _audioSamples = 0; _audioAnchor = _audioPhase = 0;
+        // Preserve fixed audio format, both source epochs, ingress sequence,
+        // original startup deadline and every high-water/failure observation.
+    }
+
     private double StartupRemainingSeconds => _startupBegan is { } began
         ? MaximumStartupSeconds - _clock.GetElapsedTime(began).TotalSeconds : MaximumStartupSeconds;
 
     private void CheckStartupDeadline()
     {
         if (_readerActive && !HasSent && StartupRemainingSeconds <= 0)
-            throw Failure("Matched LQ initial keyframe and timing timed out");
+            throw Failure(MatchedLowQualityFailureReason.StartupTimeout);
     }
 
     private bool DiscardExpiredStartupGop()
@@ -177,10 +244,7 @@ internal sealed class MatchedLowQualityPlayout(IStreamHub hub, HqPlayoutReferenc
         _startupDiscardedGops++;
         _startupDiscardedPackets += _pendingPackets; _startupDiscardedBytes += _pendingBytes;
         _maximumStartupDiscardLateMs = Math.Max(_maximumStartupDiscardLateMs, late * 1000);
-        _videoQueue.Clear(); _audioQueue.Clear(); _heads.Clear();
-        _pendingPackets = 0; _pendingBytes = 0;
-        _previousVideoSource = null; _previousAudioRtp = null;
-        _audioSamples = 0; _audioAnchor = _audioPhase = 0;
+        ResetStartupPlans();
         // Keep the fixed audio format, source/HQ binding, input sequence and all
         // high-water/failure history. This is only a pre-send GOP resynchronization.
         return true;
@@ -191,7 +255,7 @@ internal sealed class MatchedLowQualityPlayout(IStreamHub hub, HqPlayoutReferenc
         CheckStartupDeadline();
         if (HasSent) return await reader.WaitToReadAsync(ct).ConfigureAwait(false);
         double remaining = StartupRemainingSeconds;
-        if (remaining <= 0) throw Failure("Matched LQ initial keyframe and timing timed out");
+        if (remaining <= 0) throw Failure(MatchedLowQualityFailureReason.StartupTimeout);
         using var wake = CancellationTokenSource.CreateLinkedTokenSource(ct);
         Task<bool> input = reader.WaitToReadAsync(wake.Token).AsTask();
         try
@@ -200,9 +264,10 @@ internal sealed class MatchedLowQualityPlayout(IStreamHub hub, HqPlayoutReferenc
         }
         catch (TimeoutException)
         {
-            CheckLowFresh();
+            CheckSourcesFresh();
+            CheckStartupDeadline();
             if (_binding != null) CheckedReference();
-            throw Failure("Matched LQ initial keyframe and timing timed out");
+            throw Failure(MatchedLowQualityFailureReason.StartupTimeout);
         }
         finally
         {
@@ -216,25 +281,32 @@ internal sealed class MatchedLowQualityPlayout(IStreamHub hub, HqPlayoutReferenc
 
     private HqPlayoutSnapshot CheckedReference()
     {
-        CheckLowFresh();
+        CheckSourcesFresh();
         if (!reference.TryGetSnapshot(out var current))
-            throw Failure("Matched LQ HQ timing unavailable");
+            throw ReferenceProblem(MatchedLowQualityFailureReason.HqTimingUnavailable);
         return BindReference(current);
     }
 
-    private void CheckLowFresh()
+    private void CheckSourcesFresh()
     {
         if (hub.SourceEpoch != _lowEpoch || !hub.LiveVideo
             || hub.GetVideoDiagnostics().LastVideoAgeMs is not (>= 0 and <= 5000))
-            throw Failure("Matched LQ source changed or became stale");
+            throw Failure(MatchedLowQualityFailureReason.LowSourceChangedOrStale);
+        if (reference.CurrentSourceEpoch != _mainEpoch || !reference.SourceIsFresh)
+            throw Failure(MatchedLowQualityFailureReason.MainSourceChangedOrStale);
     }
 
     private HqPlayoutSnapshot BindReference(HqPlayoutSnapshot current)
     {
+        // Recheck after the snapshot read: source changes cannot be treated as
+        // a temporary owner/reference gap, including an initial unbound epoch.
+        CheckSourcesFresh();
+        if (current.SourceEpoch != _mainEpoch)
+            throw Failure(MatchedLowQualityFailureReason.MainSourceChangedOrStale);
         if (_binding is { } previous && (previous.SourceEpoch != current.SourceEpoch
             || previous.Generation != current.Generation
             || Math.Abs(previous.DelaySeconds - current.DelaySeconds) > MaximumLateSeconds))
-            throw Failure("Matched LQ HQ timing changed; reconnect");
+            throw ReferenceProblem(MatchedLowQualityFailureReason.HqTimingChanged);
         _binding = current;
         return current;
     }
@@ -247,11 +319,12 @@ internal sealed class MatchedLowQualityPlayout(IStreamHub hub, HqPlayoutReferenc
         {
             ct.ThrowIfCancellationRequested();
             CheckStartupDeadline();
-            CheckLowFresh();
+            CheckSourcesFresh();
             if (reference.TryGetSnapshot(out var current)) return BindReference(current);
-            if (_binding != null) throw Failure("Matched LQ HQ timing unavailable");
+            if (_binding != null || (_readerActive && _startupReferenceResyncs != 0))
+                throw ReferenceProblem(MatchedLowQualityFailureReason.HqTimingUnavailable);
             if (++polls > 160 || _clock.GetElapsedTime(started).TotalSeconds >= MaximumStartupSeconds)
-                throw Failure("Matched LQ initial HQ timing timed out");
+                throw Failure(MatchedLowQualityFailureReason.InitialHqTimingTimeout);
             await DelayAsync(0.05, ct).ConfigureAwait(false);
             _startupWaitMs = _clock.GetElapsedTime(started).TotalMilliseconds;
         }
@@ -288,9 +361,9 @@ internal sealed class MatchedLowQualityPlayout(IStreamHub hub, HqPlayoutReferenc
                     sourceTimestamp = arrival;
                     frequency = video.ArrivalTimestampFrequency;
                 }
-                else throw Failure("Matched LQ video lacks arrival provenance");
+                else throw Failure(MatchedLowQualityFailureReason.MissingVideoArrival);
                 if (_previousVideoSource is { } previous && sourceTimestamp <= previous)
-                    throw Failure("Matched LQ video provenance is not increasing");
+                    throw Failure(MatchedLowQualityFailureReason.VideoSourceNotIncreasing);
                 _previousVideoSource = sourceTimestamp;
                 long published = video.ArrivalTimestamp!.Value;
                 encoderAge = (published - (double)sourceTimestamp) * 1000 / frequency;
@@ -306,12 +379,12 @@ internal sealed class MatchedLowQualityPlayout(IStreamHub hub, HqPlayoutReferenc
                 if (_previousAudioRtp is { } previousRtp)
                 {
                     if (unchecked(audio.RtpTs - previousRtp) != 1024)
-                        throw Failure("Matched LQ AAC lost sample continuity");
+                        throw Failure(MatchedLowQualityFailureReason.AudioSampleGap);
                     _audioSamples += 1024;
                     double predicted = _audioAnchor + _audioSamples / (double)format.SampleRate;
                     double deviation = observed - predicted - _audioPhase;
                     if (Math.Abs(deviation) > 5)
-                        throw Failure("Matched LQ AAC source clock jumped");
+                        throw Failure(MatchedLowQualityFailureReason.AudioClockJump);
                     // Gradual ADC/arrival drift is corrected within one percent of the
                     // sample duration. TCP burst gaps do not become single-sample holds.
                     double step = 1024d / format.SampleRate * 0.01;
@@ -323,13 +396,13 @@ internal sealed class MatchedLowQualityPlayout(IStreamHub hub, HqPlayoutReferenc
                     + _audioSamples / (double)format.SampleRate + _audioPhase) * frequency));
                 break;
             default:
-                throw Failure("Matched LQ supports only video and original AAC");
+                throw Failure(MatchedLowQualityFailureReason.UnsupportedPacket);
         }
 
         double due = sourceTimestamp + timing.DelaySeconds * frequency;
         double remaining = (due - _clock.GetTimestamp()) / frequency;
         if (remaining > HqPlayoutReference.MaximumDelaySeconds)
-            throw Failure("Matched LQ wait exceeds its bound");
+            throw Failure(MatchedLowQualityFailureReason.WaitTooLong);
         return new(packet, sourceTimestamp, frequency, due, timing, encoderAge, inputQueueAge);
     }
 
@@ -340,7 +413,7 @@ internal sealed class MatchedLowQualityPlayout(IStreamHub hub, HqPlayoutReferenc
         var current = CheckedReference();
         if (current.SourceEpoch != packet.Timing.SourceEpoch || current.Generation != packet.Timing.Generation
             || Math.Abs(current.DelaySeconds - packet.Timing.DelaySeconds) > MaximumLateSeconds)
-            throw Failure("Matched LQ HQ delay moved during its wait");
+            throw ReferenceProblem(MatchedLowQualityFailureReason.HqPlanChanged);
     }
 
     private async Task DelayAsync(double seconds, CancellationToken ct)
@@ -360,7 +433,7 @@ internal sealed class MatchedLowQualityPlayout(IStreamHub hub, HqPlayoutReferenc
         while (Remaining(packet) > 0)
         {
             ct.ThrowIfCancellationRequested(); CheckStartupDeadline(); VerifyPlan(packet);
-            if (++waits > 64) throw Failure("Matched LQ clock failed to advance");
+            if (++waits > 64) throw Failure(MatchedLowQualityFailureReason.NonadvancingClock);
             long began = _clock.GetTimestamp();
             try { await DelayAsync(Remaining(packet), ct).ConfigureAwait(false); }
             finally { _totalWaitMs += _clock.GetElapsedTime(began).TotalMilliseconds; }
@@ -394,7 +467,40 @@ internal sealed class MatchedLowQualityPlayout(IStreamHub hub, HqPlayoutReferenc
         ct.ThrowIfCancellationRequested(); CheckStartupDeadline(); VerifyPlan(packet);
         if (timerWon && _clock.GetTimestamp() <= began)
         {
-            if (++_unchangedTimerWakeups >= 64) throw Failure("Matched LQ clock failed to advance");
+            if (++_unchangedTimerWakeups >= 64) throw Failure(MatchedLowQualityFailureReason.NonadvancingClock);
+        }
+        else _unchangedTimerWakeups = 0;
+        return completed;
+    }
+
+    private async Task<bool> WaitForInputOrReferenceAsync(ChannelReader<HubPacket> reader, CancellationToken ct)
+    {
+        CheckStartupDeadline(); CheckSourcesFresh();
+        using var wake = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        Task<bool> input = reader.WaitToReadAsync(wake.Token).AsTask();
+        long began = _clock.GetTimestamp();
+        Task timer = DelayAsync(0.05, wake.Token);
+        bool completed = false, timerWon = false;
+        try
+        {
+            var winner = await Task.WhenAny(input, timer).ConfigureAwait(false);
+            if (winner == input) completed = !await input.ConfigureAwait(false);
+            else { await timer.ConfigureAwait(false); timerWon = true; }
+        }
+        finally
+        {
+            wake.Cancel();
+            // Neither contender consumes input. Observe cancellation/failure of
+            // both before returning, so no timer/readiness task survives a resync.
+            try { await Task.WhenAll(input, timer).ConfigureAwait(false); }
+            catch (OperationCanceledException) when (wake.IsCancellationRequested) { }
+            finally { _startupWaitMs += _clock.GetElapsedTime(began).TotalMilliseconds; }
+        }
+        ct.ThrowIfCancellationRequested(); CheckStartupDeadline(); CheckSourcesFresh();
+        if (timerWon && _clock.GetTimestamp() <= began)
+        {
+            if (++_unchangedTimerWakeups >= 64)
+                throw Failure(MatchedLowQualityFailureReason.NonadvancingClock);
         }
         else _unchangedTimerWakeups = 0;
         return completed;
@@ -406,7 +512,7 @@ internal sealed class MatchedLowQualityPlayout(IStreamHub hub, HqPlayoutReferenc
         double late = (_clock.GetTimestamp() - packet.Due) / packet.Frequency;
         _maximumLateMs = Math.Max(_maximumLateMs, late * 1000);
         if (late > MaximumLateSeconds)
-            throw Failure("Matched LQ packet missed its HQ deadline");
+            throw Failure(MatchedLowQualityFailureReason.DeadlineMiss);
     }
 
     private void RecordSent(PlannedPacket packet)
@@ -426,36 +532,36 @@ internal sealed class MatchedLowQualityPlayout(IStreamHub hub, HqPlayoutReferenc
     private void ValidateFrequency(long frequency)
     {
         if (frequency <= 0 || frequency != _clock.TimestampFrequency)
-            throw Failure("Matched LQ provenance uses another monotonic clock");
+            throw Failure(MatchedLowQualityFailureReason.ClockFrequency);
     }
 
     private void ValidateVideoEnvelope(HubVideo video)
     {
         if (video.SourceEpoch != _lowEpoch)
-            throw Failure("Matched LQ received video from another source epoch");
+            throw Failure(MatchedLowQualityFailureReason.VideoEpochMismatch);
         if (video.AnnexB.Length is < 1 or > 6 * 1024 * 1024)
-            throw Failure("Matched LQ video exceeds its payload bound");
+            throw Failure(MatchedLowQualityFailureReason.VideoPayloadBound);
         if (video.SourceArrivalTimestamp == null && video.ArrivalTimestamp == null)
-            throw Failure("Matched LQ video lacks arrival provenance");
+            throw Failure(MatchedLowQualityFailureReason.MissingVideoArrival);
         ValidateFrequency(video.SourceArrivalTimestamp != null
             ? video.SourceArrivalTimestampFrequency : video.ArrivalTimestampFrequency);
         if (video.ArrivalTimestamp == null)
-            throw Failure("Matched LQ video lacks output arrival");
+            throw Failure(MatchedLowQualityFailureReason.MissingVideoOutputArrival);
         ValidateFrequency(video.ArrivalTimestampFrequency);
     }
 
     private void ValidateAudioEnvelope(HubAudioAac audio, AudioTrackInfo? format)
     {
         if (audio.SourceEpoch != _lowEpoch || audio.ArrivalTimestamp == null)
-            throw Failure("Matched LQ AAC lacks current arrival provenance");
+            throw Failure(MatchedLowQualityFailureReason.AudioProvenance);
         if (format is not { IsAac: true, SampleRate: >= 8000 and <= 96000, Channels: >= 1 and <= 2,
                 AudioSpecificConfig.Length: >= 2 } || !SameAudio(format, hub.Audio)
             || (_audioFormat != null && !SameAudio(format, _audioFormat)))
-            throw Failure("Matched LQ requires unchanged original AAC");
+            throw Failure(MatchedLowQualityFailureReason.AudioFormatChanged);
         ValidateFrequency(audio.ArrivalTimestampFrequency);
         if (audio.BlockUnits is < 1 or > 512 || audio.BlockIndex < 0 || audio.BlockIndex >= audio.BlockUnits
             || audio.Au.Length is < 1 or > 8184)
-            throw Failure("Matched LQ AAC metadata exceeds its bounds");
+            throw Failure(MatchedLowQualityFailureReason.AudioMetadataBound);
     }
 
     private static bool SameAudio(AudioTrackInfo? expected, AudioTrackInfo? actual) => expected != null
@@ -463,19 +569,56 @@ internal sealed class MatchedLowQualityPlayout(IStreamHub hub, HqPlayoutReferenc
         && expected.Channels == actual.Channels && expected.AudioSpecificConfig != null
         && actual.AudioSpecificConfig != null && expected.AudioSpecificConfig.SequenceEqual(actual.AudioSpecificConfig);
 
-    private InvalidDataException Failure(string message)
+    private InvalidDataException Failure(MatchedLowQualityFailureReason reason)
     {
         _failures++;
-        return new InvalidDataException(message);
+        _lastFailureReason = reason;
+        return new InvalidDataException(reason switch
+        {
+            MatchedLowQualityFailureReason.MissingSendConfirmation => "Matched LQ previous packet was not marked sent",
+            MatchedLowQualityFailureReason.SubscriberIndexGap => "Matched LQ subscriber lost packets; reconnect at a keyframe",
+            MatchedLowQualityFailureReason.OriginalAacRequired => "Matched LQ requires original AAC",
+            MatchedLowQualityFailureReason.SentPacketMismatch => "Matched LQ sent packet does not match its ready head",
+            MatchedLowQualityFailureReason.PendingBudgetExceeded => "Matched LQ pending packet budget exceeded",
+            MatchedLowQualityFailureReason.StartupTimeout => "Matched LQ initial keyframe and timing timed out",
+            MatchedLowQualityFailureReason.HqTimingUnavailable => "Matched LQ HQ timing unavailable",
+            MatchedLowQualityFailureReason.LowSourceChangedOrStale => "Matched LQ source changed or became stale",
+            MatchedLowQualityFailureReason.HqTimingChanged => "Matched LQ HQ timing changed; reconnect",
+            MatchedLowQualityFailureReason.InitialHqTimingTimeout => "Matched LQ initial HQ timing timed out",
+            MatchedLowQualityFailureReason.MissingVideoArrival => "Matched LQ video lacks arrival provenance",
+            MatchedLowQualityFailureReason.VideoSourceNotIncreasing => "Matched LQ video provenance is not increasing",
+            MatchedLowQualityFailureReason.AudioSampleGap => "Matched LQ AAC lost sample continuity",
+            MatchedLowQualityFailureReason.AudioClockJump => "Matched LQ AAC source clock jumped",
+            MatchedLowQualityFailureReason.UnsupportedPacket => "Matched LQ supports only video and original AAC",
+            MatchedLowQualityFailureReason.WaitTooLong => "Matched LQ wait exceeds its bound",
+            MatchedLowQualityFailureReason.HqPlanChanged => "Matched LQ HQ delay moved during its wait",
+            MatchedLowQualityFailureReason.NonadvancingClock => "Matched LQ clock failed to advance",
+            MatchedLowQualityFailureReason.DeadlineMiss => "Matched LQ packet missed its HQ deadline",
+            MatchedLowQualityFailureReason.ClockFrequency => "Matched LQ provenance uses another monotonic clock",
+            MatchedLowQualityFailureReason.VideoEpochMismatch => "Matched LQ received video from another source epoch",
+            MatchedLowQualityFailureReason.VideoPayloadBound => "Matched LQ video exceeds its payload bound",
+            MatchedLowQualityFailureReason.MissingVideoOutputArrival => "Matched LQ video lacks output arrival",
+            MatchedLowQualityFailureReason.AudioProvenance => "Matched LQ AAC lacks current arrival provenance",
+            MatchedLowQualityFailureReason.AudioFormatChanged => "Matched LQ requires unchanged original AAC",
+            MatchedLowQualityFailureReason.AudioMetadataBound => "Matched LQ AAC metadata exceeds its bounds",
+            MatchedLowQualityFailureReason.MainSourceChangedOrStale => "Matched LQ HQ source changed or became stale",
+            _ => throw new ArgumentOutOfRangeException(nameof(reason))
+        });
     }
 
     public object Diagnostics() => new
     {
         sourceEpoch = _lowEpoch, videoPackets = _videoPackets, audioPackets = _audioPackets,
+        expectedMainSourceEpoch = _mainEpoch, currentMainSourceEpoch = reference.CurrentSourceEpoch,
+        boundHqGeneration = _binding?.Generation,
+        currentHqGeneration = reference.TryGetSnapshot(out var current) ? (long?)current.Generation : null,
+        hasSent = HasSent, packetIssued = _readyPacket != null,
+        lastFailureReason = (int)_lastFailureReason,
         failures = _failures, targetDelayMs = _lastDelayMs, estimatedEncoderAgeMs = _lastEncoderAgeMs,
         maximumLateMs = _maximumLateMs, totalWaitMs = _totalWaitMs, maximumAllowedLateMs = MaximumLateSeconds * 1000,
         deliveredSourceAgeMs = _lastDeliveredSourceAgeMs, inputQueueAgeMs = _lastQueueAgeMs,
         initialReferenceWaitMs = _startupWaitMs,
+        startupReferenceResyncs = _startupReferenceResyncs, maximumStartupWaitMs = MaximumStartupSeconds * 1000,
         startupDiscardedGops = _startupDiscardedGops, startupDiscardedPackets = _startupDiscardedPackets,
         startupDiscardedBytes = _startupDiscardedBytes, maximumStartupDiscardLateMs = _maximumStartupDiscardLateMs,
         pendingPackets = _pendingPackets, pendingBytes = _pendingBytes,

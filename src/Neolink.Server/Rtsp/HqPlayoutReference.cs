@@ -18,6 +18,11 @@ internal sealed class HqPlayoutReference(IStreamHub source, TimeProvider? clock 
     private long _epoch = -1, _generation, _sequence, _accepted, _rejected;
     private sealed record Observation(long Epoch, double DelaySeconds, long At, long Order);
 
+    // A missing owner observation is different from a changed/stale source.
+    // Startup recovery must retain the actual hub epoch, even before its first observation.
+    public long CurrentSourceEpoch => source.SourceEpoch;
+    public bool SourceIsFresh => SourceFresh(source.SourceEpoch);
+
     public bool Observe(string owner, CompletedVideoGop gop, long presentationTimestamp)
     {
         if (string.IsNullOrWhiteSpace(owner) || owner.Length > 128 || !SourceFresh(gop.SourceEpoch)

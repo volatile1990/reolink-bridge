@@ -404,10 +404,12 @@ internal static class LowQualityAlignmentTests
         var staleWait = await waits.Next(); main.SourceStopped(); staleWait.Release();
         await RejectAsync(() => stalePending, "source reset emitted a previously queued LQ picture");
 
+        main.PublishVideo(Key()); // Missing owner is distinct from a stopped main source.
         long noReferenceStarted = clock.GetTimestamp();
         var noReference = new MatchedLowQualityPlayout(low, new HqPlayoutReference(main, clock), clock, (delay, token) =>
         {
-            token.ThrowIfCancellationRequested(); clock.Advance(delay); low.PublishVideo(Key((uint)clock.GetTimestamp())); return Task.CompletedTask;
+            token.ThrowIfCancellationRequested(); clock.Advance(delay);
+            main.PublishVideo(Key((uint)clock.GetTimestamp())); low.PublishVideo(Key((uint)clock.GetTimestamp())); return Task.CompletedTask;
         });
         await RejectAsync(() => noReference.WaitAsync(Video(0, clock.GetTimestamp(), clock.GetTimestamp()), low.Audio, CancellationToken.None), "missing HQ reference silently served a differently delayed picture");
         Check(clock.GetElapsedTime(noReferenceStarted).TotalSeconds is >= 7.9 and <= 8.1, "missing initial HQ timing was not given a bounded startup grace period");
@@ -429,6 +431,10 @@ internal static class LowQualityAlignmentTests
         await InitialCachedGopResynchronizesBeforeFirstSend();
         await StartupBudgetIncludesReferenceAndChannelWait();
         await StartupResynchronizationPreservesFatalBoundaries();
+        await StartupReferenceLossAndChangeRebindCleanly();
+        await StartupReferenceWaitPreservesBudgetAndIngressGuards();
+        await IssuedOrSentReferenceChangesRemainFatal();
+        await StartupReferenceCancellationCleansReaderAndTimer();
     }
 
     private static async Task InitialCachedGopResynchronizesBeforeFirstSend()
@@ -643,7 +649,7 @@ internal static class LowQualityAlignmentTests
             clock.AdvanceTimestampTicks(350_000); input.Writer.TryWrite(Video(1, 1_050_000, 1_250_000, key: false));
             await RejectAsync(async () => { await output.MoveNextAsync(); }, "post-first-send lateness became a silent keyframe resync");
         }
-        foreach (string failure in new[] { "index-gap", "low-epoch", "hq-generation", "cancel" })
+        foreach (string failure in new[] { "index-gap", "low-epoch", "cancel" })
         {
             var startupClock = new StartupTimeProvider(); var hq = StartupHub("resync-bound-main", startupClock);
             var lq = StartupHub("resync-bound-low", startupClock); startupClock.AdvanceTimestampTicks(2_600_000);
@@ -668,11 +674,6 @@ internal static class LowQualityAlignmentTests
                 else
                 {
                     if (failure == "low-epoch") { lq.SourceStopped(); lq.PublishVideo(Key()); }
-                    if (failure == "hq-generation")
-                    {
-                        shared.Release("hq");
-                        Check(Observe(shared, "replacement", hq.SourceEpoch, 600_000, 1_000_000, 2_600_000, 1_000_000), "resync-bound replacement unavailable");
-                    }
                     channel.Writer.TryWrite(Video(failure == "index-gap" ? 2 : 1, 2_600_000, 2_600_000, epoch: lq.SourceEpoch));
                     await RejectAsync(async () => { await next.WaitAsync(TimeSpan.FromSeconds(2)); }, "startup resync hid fatal " + failure);
                 }
@@ -685,6 +686,213 @@ internal static class LowQualityAlignmentTests
                 try { await next.WaitAsync(TimeSpan.FromSeconds(1)); } catch (OperationCanceledException) { } catch (InvalidDataException) { }
             }
         }
+    }
+
+    private static (ManualTimeProvider Clock, StreamHub Main, StreamHub Low, HqPlayoutReference Reference, AudioTrackInfo Audio)
+        ReferenceFixture(string name)
+    {
+        var clock = new ManualTimeProvider(); var main = Hub(name + "-main", clock); var low = Hub(name + "-low", clock);
+        low.PublishAac(new AacFrame([0xff, 0xf1, 0x60, 0x40, 0x01, 0x9f, 0xfc, 1, 2, 3, 4, 5]));
+        clock.AdvanceTimestampTicks(2_000_000); var reference = new HqPlayoutReference(main, clock);
+        Check(Observe(reference, "hq", main.SourceEpoch, 0, 1_000_000, 2_000_000, 1_000_000), "reference-resync HQ fixture unavailable");
+        return (clock, main, low, reference, low.Audio!);
+    }
+
+    private sealed class BeforePacketReader(ChannelReader<HubPacket> inner, int position, Action action) : ChannelReader<HubPacket>
+    {
+        private int _reads;
+        public override Task Completion => inner.Completion;
+        public override bool TryRead(out HubPacket packet)
+        { bool read = inner.TryRead(out packet!); if (read && ++_reads == position) action(); return read; }
+        public override ValueTask<bool> WaitToReadAsync(CancellationToken ct = default) => inner.WaitToReadAsync(ct);
+    }
+
+    private static async Task StartupReferenceLossAndChangeRebindCleanly()
+    {
+        foreach (string change in new[] { "missing", "owner", "mapping" })
+        {
+            var f = ReferenceFixture("reference-" + change); var input = Channel.CreateUnbounded<HubPacket>();
+            input.Writer.TryWrite(Video(0, 1_000_000, 1_200_000)); input.Writer.TryWrite(Aac(1, 1_064_000));
+            input.Writer.TryWrite(Video(2, 1_050_000, 1_250_000, key: false)); input.Writer.TryWrite(Aac(3, 1_128_000));
+            var freshKey = Video(4, 1_900_000, 2_000_000);
+            var freshAac = Aac(5, 1_964_000) with { RtpTs = uint.MaxValue - 511 };
+            bool reacquire = change == "missing";
+            if (!reacquire) { input.Writer.TryWrite(freshKey); input.Writer.TryWrite(freshAac); input.Writer.Complete(); }
+            var reader = new BeforePacketReader(input.Reader, 4, () =>
+            {
+                if (change == "mapping") Check(Observe(f.Reference, "hq", f.Main.SourceEpoch, 0, 1_000_000, 2_500_000, 1_000_000), "changed HQ mapping unavailable");
+                else
+                {
+                    f.Reference.Release("hq");
+                    if (change == "owner") Check(Observe(f.Reference, "successor", f.Main.SourceEpoch, 0, 1_000_000, 2_000_000, 1_000_000), "successor HQ owner unavailable");
+                }
+            });
+            Task Wait(TimeSpan delay, CancellationToken ct)
+            {
+                ct.ThrowIfCancellationRequested();
+                f.Clock.Advance(reacquire ? TimeSpan.FromMilliseconds(500) : delay);
+                f.Main.PublishVideo(Key()); f.Low.PublishVideo(Key());
+                if (reacquire)
+                {
+                    reacquire = false;
+                    Check(Observe(f.Reference, "reacquired", f.Main.SourceEpoch, 0, 1_000_000, 2_000_000, 1_000_000), "same-epoch HQ reference could not return");
+                    input.Writer.TryWrite(freshKey); input.Writer.TryWrite(freshAac); input.Writer.Complete();
+                }
+                return Task.CompletedTask;
+            }
+            var playout = new MatchedLowQualityPlayout(f.Low, f.Reference, f.Clock, Wait);
+            var sender = new LowQualityRtpSenderClock(f.Low, f.Clock); var seen = new List<HubPacket>();
+            await foreach (var packet in playout.ReadAsync(reader, f.Audio, CancellationToken.None))
+            {
+                Check(packet.Index >= 4, "reference resync replayed an old queued plan or its discovering AAC packet");
+                seen.Add(packet); var confirmed = playout.MarkSent(packet);
+                Check(sender.ObserveMatchedSent(packet, confirmed), "fresh reference-resync packet could not confirm sender anchor");
+                if (packet is HubVideo) Check(!sender.TryGetReport(true, true, out _), "discarded AAC became a sent RTCP anchor");
+            }
+            Check(seen.Count == 2 && ReferenceEquals(seen[0], freshKey) && ReferenceEquals(seen[1], freshAac), "reference resync changed or lost fresh Key/AAC references");
+            Check(sender.TryGetReport(true, true, out var report), "fresh reference-resync tracks did not produce paired RTCP mapping");
+            double utc = (report.UtcTimestamp - DateTimeOffset.UnixEpoch).TotalSeconds;
+            double shift = change == "mapping" ? .5 : 0;
+            Check(Math.Abs(utc - unchecked(report.VideoRtpTimestamp!.Value - freshKey.RtpTs) / 90000d - 1.9 - shift) < .00002
+                && Math.Abs(utc - unchecked(report.AudioRtpTimestamp!.Value - freshAac.RtpTs) / 16000d - 1.964 - shift) < .00007,
+                "reference resync retained an old presentation or AAC sample anchor");
+            var d = System.Text.Json.JsonSerializer.SerializeToNode(playout.Diagnostics())!;
+            Check(d["failures"]!.GetValue<long>() == 0 && d["lastFailureReason"]!.GetValue<int>() == 0
+                && d["startupReferenceResyncs"]!.GetValue<long>() == 1 && d["maximumPendingPackets"]!.GetValue<int>() >= 3
+                && d["pendingPackets"]!.GetValue<int>() == 0 && d["pendingBytes"]!.GetValue<long>() == 0
+                && d["expectedMainSourceEpoch"]!.GetValue<long>() == 0 && d["currentMainSourceEpoch"]!.GetValue<long>() == 0
+                && d["maximumStartupWaitMs"]!.GetValue<double>() == 8000,
+                "successful pre-send reference resync altered failures, epochs, queue history or original budget");
+        }
+    }
+
+    private sealed class TrackingWaitReader(ChannelReader<HubPacket> inner) : ChannelReader<HubPacket>
+    {
+        private int _active;
+        public int ActiveWaits => Volatile.Read(ref _active);
+        public override Task Completion => inner.Completion;
+        public override bool TryRead(out HubPacket packet) => inner.TryRead(out packet!);
+        public override async ValueTask<bool> WaitToReadAsync(CancellationToken ct = default)
+        { Interlocked.Increment(ref _active); try { return await inner.WaitToReadAsync(ct); } finally { Interlocked.Decrement(ref _active); } }
+    }
+
+    private static async Task StartupReferenceWaitPreservesBudgetAndIngressGuards()
+    {
+        // A disappearance, return and second disappearance must not restart the
+        // original eight-second clock while none of the queued plans is sent.
+        var f = ReferenceFixture("reference-budget"); long began = f.Clock.GetTimestamp();
+        var input = Channel.CreateUnbounded<HubPacket>(); input.Writer.TryWrite(Video(0, 1_000_000, 1_200_000)); input.Writer.TryWrite(Aac(1, 1_064_000));
+        var reader = new BeforePacketReader(input.Reader, 2, () => f.Reference.Release("hq")); int phase = 0;
+        Task Wait(TimeSpan delay, CancellationToken ct)
+        {
+            ct.ThrowIfCancellationRequested();
+            f.Clock.Advance(phase == 1 ? TimeSpan.FromMilliseconds(Math.Min(delay.TotalMilliseconds, 100)) : delay);
+            f.Main.PublishVideo(Key()); f.Low.PublishVideo(Key());
+            double elapsed = f.Clock.GetElapsedTime(began).TotalSeconds;
+            if (phase == 0 && elapsed >= 2)
+            {
+                Check(Observe(f.Reference, "returned", f.Main.SourceEpoch, f.Clock.GetTimestamp() - 2_000_000,
+                    1_000_000, f.Clock.GetTimestamp(), 1_000_000), "budget reference return unavailable");
+                input.Writer.TryWrite(Video(2, f.Clock.GetTimestamp() - 100_000, f.Clock.GetTimestamp()));
+                input.Writer.TryWrite(Aac(3, f.Clock.GetTimestamp() - 36_000)); phase = 1;
+            }
+            else if (phase == 1 && elapsed >= 2.1) { f.Reference.Release("returned"); phase = 2; }
+            return Task.CompletedTask;
+        }
+        var bounded = new MatchedLowQualityPlayout(f.Low, f.Reference, f.Clock, Wait);
+        using (var stop = new CancellationTokenSource())
+        {
+            async Task Drain() { await foreach (var packet in bounded.ReadAsync(reader, f.Audio, stop.Token)) throw new Exception("reference-budget emitted a packet"); }
+            Task pending = Drain();
+            try { await RejectAsync(() => pending.WaitAsync(TimeSpan.FromSeconds(3)), "reference resync extended startup beyond eight seconds"); }
+            finally { stop.Cancel(); try { await pending.WaitAsync(TimeSpan.FromSeconds(1)); } catch (OperationCanceledException) { } catch (InvalidDataException) { } }
+        }
+        var timeout = System.Text.Json.JsonSerializer.SerializeToNode(bounded.Diagnostics())!;
+        Check(f.Clock.GetElapsedTime(began).TotalSeconds is >= 7.99 and <= 8.05
+            && timeout["startupReferenceResyncs"]!.GetValue<long>() >= 2
+            && timeout["lastFailureReason"]!.GetValue<int>() == (int)MatchedLowQualityFailureReason.StartupTimeout,
+            "repeated reference loss changed original budget or hid final startup timeout");
+
+        foreach (string kind in new[] { "main-epoch", "low-epoch", "index-gap", "format", "video-envelope", "aac-envelope" })
+        {
+            var q = ReferenceFixture("reference-guard-" + kind); var channel = Channel.CreateUnbounded<HubPacket>();
+            channel.Writer.TryWrite(Video(0, 1_000_000, 1_200_000));
+            var waits = new GopPlayoutWireTests.ControlledWait(q.Clock); var playout = new MatchedLowQualityPlayout(q.Low, q.Reference, q.Clock, waits.Wait);
+            using var cancel = new CancellationTokenSource(); await using var output = playout.ReadAsync(channel.Reader, q.Audio, cancel.Token).GetAsyncEnumerator();
+            Task<bool> pending = output.MoveNextAsync().AsTask(); var oldTimer = await waits.Next();
+            q.Reference.Release("hq"); channel.Writer.TryWrite(Aac(1, 1_064_000));
+            var gapTimer = await waits.Next(); await oldTimer.Cancelled.Task.WaitAsync(TimeSpan.FromSeconds(2));
+            try
+            {
+                var reason = MatchedLowQualityFailureReason.None;
+                if (kind == "main-epoch") { q.Main.SourceStopped(); q.Main.PublishVideo(Key()); reason = MatchedLowQualityFailureReason.MainSourceChangedOrStale; gapTimer.Release(); }
+                else if (kind == "low-epoch") { q.Low.SourceStopped(); q.Low.PublishVideo(Key()); reason = MatchedLowQualityFailureReason.LowSourceChangedOrStale; gapTimer.Release(); }
+                else if (kind == "index-gap") { channel.Writer.TryWrite(new HubAudioOpus(3, [1], 0)); reason = MatchedLowQualityFailureReason.SubscriberIndexGap; }
+                else if (kind == "format")
+                {
+                    q.Low.PublishAac(new AacFrame([0xff, 0xf1, 0x4c, 0x40, 0x01, 0x9f, 0xfc, 1, 2, 3, 4, 5]));
+                    channel.Writer.TryWrite(Aac(2, 1_128_000)); reason = MatchedLowQualityFailureReason.AudioFormatChanged;
+                }
+                else if (kind == "video-envelope") { channel.Writer.TryWrite(Video(2, 1_100_000, 1_300_000, key: false) with { SourceArrivalTimestampFrequency = 90000 }); reason = MatchedLowQualityFailureReason.ClockFrequency; }
+                else { channel.Writer.TryWrite(Aac(2, 1_128_000) with { BlockUnits = 0 }); reason = MatchedLowQualityFailureReason.AudioMetadataBound; }
+                await RejectAsync(async () => { await pending.WaitAsync(TimeSpan.FromSeconds(2)); }, "reference gap hid fatal " + kind);
+                var d = System.Text.Json.JsonSerializer.SerializeToNode(playout.Diagnostics())!;
+                Check(d["lastFailureReason"]!.GetValue<int>() == (int)reason && d["failures"]!.GetValue<long>() >= 1
+                    && d["videoPackets"]!.GetValue<long>() == 0 && d["audioPackets"]!.GetValue<long>() == 0,
+                    "reference-gap failure reason or no-send accounting changed: " + kind);
+            }
+            finally { cancel.Cancel(); try { await pending.WaitAsync(TimeSpan.FromSeconds(1)); } catch (OperationCanceledException) { } catch (InvalidDataException) { } }
+        }
+    }
+
+    private static async Task IssuedOrSentReferenceChangesRemainFatal()
+    {
+        foreach (bool confirmed in new[] { false, true })
+        foreach (string change in new[] { "missing", "owner", "mapping" })
+        {
+            var f = ReferenceFixture("reference-issued"); var channel = Channel.CreateUnbounded<HubPacket>(); channel.Writer.TryWrite(Video(0, 1_000_000, 1_200_000));
+            Task Wait(TimeSpan delay, CancellationToken ct) { ct.ThrowIfCancellationRequested(); f.Clock.Advance(delay); return Task.CompletedTask; }
+            var playout = new MatchedLowQualityPlayout(f.Low, f.Reference, f.Clock, Wait);
+            using var stop = new CancellationTokenSource(); await using var output = playout.ReadAsync(channel.Reader, null, stop.Token).GetAsyncEnumerator();
+            Check(await output.MoveNextAsync(), "issued-reference fixture did not issue first packet");
+            if (confirmed) playout.MarkSent(output.Current);
+            if (change == "mapping") Check(Observe(f.Reference, "hq", f.Main.SourceEpoch, 0, 1_000_000, 2_500_000, 1_000_000), "issued mapping update unavailable");
+            else
+            {
+                f.Reference.Release("hq");
+                if (change == "owner") Check(Observe(f.Reference, "new", f.Main.SourceEpoch, 0, 1_000_000, 2_000_000, 1_000_000), "issued owner update unavailable");
+            }
+            if (confirmed)
+            {
+                channel.Writer.TryWrite(Video(1, 1_050_000, 1_250_000, key: false));
+                await RejectAsync(async () => { await output.MoveNextAsync(); }, "sent stream silently resynchronized a changed HQ reference");
+            }
+            else await RejectAsync(() => { playout.MarkSent(output.Current); return Task.CompletedTask; }, "socket-inflight packet silently resynchronized after issue");
+            var d = System.Text.Json.JsonSerializer.SerializeToNode(playout.Diagnostics())!;
+            Check(d["startupReferenceResyncs"]!.GetValue<long>() == 0 && d["failures"]!.GetValue<long>() >= 1
+                && d["lastFailureReason"]!.GetValue<int>() == (int)(change == "missing" ? MatchedLowQualityFailureReason.HqTimingUnavailable : MatchedLowQualityFailureReason.HqTimingChanged),
+                "issued/sent failure was reclassified as a permitted startup resync");
+        }
+    }
+
+    private static async Task StartupReferenceCancellationCleansReaderAndTimer()
+    {
+        var f = ReferenceFixture("reference-cancel"); var input = Channel.CreateUnbounded<HubPacket>(); input.Writer.TryWrite(Video(0, 1_000_000, 1_200_000));
+        var reader = new TrackingWaitReader(input.Reader); var gates = new GopPlayoutWireTests.ControlledWait(f.Clock); int activeTimers = 0;
+        async Task Wait(TimeSpan delay, CancellationToken ct)
+        { Interlocked.Increment(ref activeTimers); try { await gates.Wait(delay, ct); } finally { Interlocked.Decrement(ref activeTimers); } }
+        var playout = new MatchedLowQualityPlayout(f.Low, f.Reference, f.Clock, Wait);
+        using var stop = new CancellationTokenSource(); await using var output = playout.ReadAsync(reader, f.Audio, stop.Token).GetAsyncEnumerator();
+        Task<bool> pending = output.MoveNextAsync().AsTask(); var oldTimer = await gates.Next();
+        f.Reference.Release("hq"); input.Writer.TryWrite(Aac(1, 1_064_000));
+        var gapTimer = await gates.Next(); await oldTimer.Cancelled.Task.WaitAsync(TimeSpan.FromSeconds(2)); stop.Cancel();
+        bool cancelled = false;
+        try { await pending.WaitAsync(TimeSpan.FromSeconds(2)); } catch (OperationCanceledException) { cancelled = true; }
+        await gapTimer.Cancelled.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        var d = System.Text.Json.JsonSerializer.SerializeToNode(playout.Diagnostics())!;
+        Check(cancelled && reader.ActiveWaits == 0 && Volatile.Read(ref activeTimers) == 0
+            && d["failures"]!.GetValue<long>() == 0 && d["startupReferenceResyncs"]!.GetValue<long>() == 1,
+            "reference-gap cancellation left its reader/timer loser alive or manufactured a failure");
     }
 
     private static async Task ScheduledReaderBoundsAndDiscontinuities()
