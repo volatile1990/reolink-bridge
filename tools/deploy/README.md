@@ -43,6 +43,15 @@ UID `1026`, render group `937` and watchdog directory
 `/var/lib/reolink-camera-resilience`. Optional `settings` can supply `scope`,
 `runtimeUid` and `watchdogDirectory`; the current six IPs and project remain exact.
 
+Event readiness is selected explicitly with `settings.eventDeliveryMode`. The
+default `onvif-pullpoint` requires exactly one external ONVIF subscription.
+`native-replay` instead requires an existing `event_replay_path`, enabled and
+ready durable replay with zero failures, and a connected camera event publisher.
+External PullPoint subscriptions must remain an integer from zero through eight;
+the native consumer reads HTTP replay and does not create a PullPoint. This mode
+is independent of `maintenanceMode` and does not create or change replay settings.
+Consumer capture and Protect event delivery still need their independent gates.
+
 1. `plan`: send `mode` and `release`. The response contains `baseline`, projected
    `bridges` and ordered `pendingIps`. Root-private baseline/config/Compose copies
    and a checkpoint stay on the NAS, with directory mode 0700 and file mode 0600.

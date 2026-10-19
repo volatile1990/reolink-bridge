@@ -42,6 +42,8 @@ class DockerNas:
         need(self.restart_policy in ("always", "unless-stopped"), "restart_policy_invalid")
         self.maintenance_mode = settings.get("maintenanceMode", "watchdog")
         need(self.maintenance_mode in ("watchdog", "deployment-lock"), "maintenance_mode_invalid")
+        self.event_delivery_mode = settings.get("eventDeliveryMode", "onvif-pullpoint")
+        need(self.event_delivery_mode in ("onvif-pullpoint", "native-replay"), "event_delivery_mode_invalid")
         need(self.scope.is_absolute() and self.scope.is_dir() and not self.scope.is_symlink(), "existing_scope_required")
         self.docker = shutil.which("docker") or "/usr/local/bin/docker"
         self._compose = None
@@ -166,10 +168,21 @@ class DockerNas:
                 need(isinstance(decoder, dict) and decoder.get("backend") == "vaapi" and decoder.get("hardwareDecodeRequested") is True and decoder.get("noSilentFallback") is True and encoder.get("decoder") == "vaapi", "hardware_decoder_selection_drift")
         else:
             need(encoder is None and decoder is None, "native_passthrough_conversion_present")
-        replay = (metrics.get("events") or {}).get("replay") or {}
-        if config["onvif"].get("event_replay_path"):
-            need(replay.get("enabled") is True and replay.get("state") == "ready" and replay.get("failures") == 0, "durable_replay_not_ready")
-        need((metrics.get("events") or {}).get("subscriptions") == 1, "event_subscription_not_ready")
+        events = metrics.get("events") or {}
+        replay = events.get("replay") or {}
+        replay_path = config["onvif"].get("event_replay_path")
+        if self.event_delivery_mode == "native-replay":
+            need(isinstance(replay_path, str) and bool(replay_path), "native_replay_configuration_required")
+        if replay_path:
+            need(replay.get("enabled") is True and replay.get("state") == "ready"
+                 and type(replay.get("failures")) is int and replay.get("failures") == 0, "durable_replay_not_ready")
+        subscriptions = events.get("subscriptions")
+        if self.event_delivery_mode == "native-replay":
+            source = events.get("source") or {}
+            need(isinstance(source, dict) and source.get("connected") is True, "native_event_source_not_connected")
+            need(type(subscriptions) is int and 0 <= subscriptions <= 8, "event_subscription_count_invalid")
+        else:
+            need(type(subscriptions) is int and subscriptions == 1, "event_subscription_not_ready")
         return {"at": self.monotonic(), "streams": streams}
 
     def read_compose(self):

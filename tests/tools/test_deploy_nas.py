@@ -23,6 +23,7 @@ class AdapterTests(unittest.TestCase):
     def setUp(self):
         self.adapter = nas.DockerNas.__new__(nas.DockerNas)
         self.adapter.docker = "synthetic-docker"
+        self.adapter.event_delivery_mode = "onvif-pullpoint"
         self.adapter.monotonic = lambda: 20
         self.commands = []
         self.entry = {"id": "a" * 64, "configuration": {"users": [{"name": "synthetic", "pass": SECRET}], "onvif": {
@@ -32,7 +33,8 @@ class AdapterTests(unittest.TestCase):
                         "audio": {"available": True, "metadataCurrent": True, "isAac": True, "sampleRate": 16000, "channels": 1}}],
                         "lowQualityEncoder": {"state": "active", "encoder": "hevc_vaapi", "failures": 0, "softwareFallback": False, "decoder": "vaapi"},
                         "lowQualityDecoder": {"backend": "vaapi", "hardwareDecodeRequested": True, "noSilentFallback": True},
-                        "events": {"subscriptions": 1, "replay": {"enabled": True, "state": "ready", "failures": 0}}, "privateValue": SECRET}
+                        "events": {"subscriptions": 1, "source": {"connected": True},
+                            "replay": {"enabled": True, "state": "ready", "failures": 0}}, "privateValue": SECRET}
         def command(args, data=None, **kwargs):
             self.commands.append((args, data))
             return json.dumps(self.metrics).encode()
@@ -90,6 +92,63 @@ class AdapterTests(unittest.TestCase):
         self.metrics["events"]["subscriptions"] = 0
         with self.assertRaisesRegex(engine.GuardError, "event_subscription_not_ready"):
             self.adapter.sample(self.entry)
+
+    def test_native_replay_accepts_zero_external_pullpoints_and_bounded_counts(self):
+        self.adapter.event_delivery_mode = "native-replay"
+        for count in (0, 1, 8):
+            with self.subTest(count=count):
+                self.metrics["events"]["subscriptions"] = count
+                result = self.adapter.sample(self.entry)
+                self.assertEqual(result["streams"][0]["profile"], "main")
+                self.assertNotIn(SECRET, json.dumps(result))
+
+    def test_native_replay_requires_existing_replay_configuration(self):
+        self.adapter.event_delivery_mode = "native-replay"; self.metrics["events"]["subscriptions"] = 0
+        for value in (None, "", False, 123):
+            with self.subTest(path_shape=type(value).__name__):
+                self.entry["configuration"]["onvif"]["event_replay_path"] = value
+                with self.assertRaisesRegex(engine.GuardError, "native_replay_configuration_required"):
+                    self.adapter.sample(self.entry)
+        self.entry["configuration"]["onvif"].pop("event_replay_path")
+        with self.assertRaisesRegex(engine.GuardError, "native_replay_configuration_required"):
+            self.adapter.sample(self.entry)
+
+    def test_native_replay_requires_connected_event_publisher(self):
+        self.adapter.event_delivery_mode = "native-replay"; self.metrics["events"]["subscriptions"] = 0
+        for source in (None, {}, {"connected": False}, {"connected": 1}, {"connected": "true"}, "connected"):
+            with self.subTest(source_shape=type(source).__name__):
+                self.metrics["events"]["source"] = source
+                with self.assertRaisesRegex(engine.GuardError, "native_event_source_not_connected"):
+                    self.adapter.sample(self.entry)
+
+    def test_native_replay_requires_enabled_ready_replay_without_failures(self):
+        self.adapter.event_delivery_mode = "native-replay"; self.metrics["events"]["subscriptions"] = 0
+        for replay in ({}, {"enabled": False, "state": "ready", "failures": 0},
+                       {"enabled": True, "state": "loading", "failures": 0},
+                       {"enabled": True, "state": "ready", "failures": 1},
+                       {"enabled": True, "state": "ready", "failures": False}):
+            with self.subTest(replay=replay):
+                self.metrics["events"]["replay"] = replay
+                with self.assertRaisesRegex(engine.GuardError, "durable_replay_not_ready"):
+                    self.adapter.sample(self.entry)
+
+    def test_native_replay_refuses_invalid_external_subscription_counts(self):
+        self.adapter.event_delivery_mode = "native-replay"
+        for count in (-1, 9, True, False, 1.0, "1", None):
+            with self.subTest(count=count):
+                self.metrics["events"]["subscriptions"] = count
+                with self.assertRaisesRegex(engine.GuardError, "event_subscription_count_invalid"):
+                    self.adapter.sample(self.entry)
+
+    def test_native_replay_preserves_video_audio_and_hardware_readiness_guards(self):
+        self.adapter.event_delivery_mode = "native-replay"; self.metrics["events"]["subscriptions"] = 0
+        original = copy.deepcopy(self.metrics)
+        for mutate, expected in (
+            (lambda value: value["streams"][0].update(lastVideoAgeMs=6000), "source_video_not_fresh"),
+            (lambda value: value["streams"][0]["audio"].update(available=False), "source_aac_not_fresh"),
+            (lambda value: value["lowQualityEncoder"].update(failures=1), "hardware_encoder_not_ready")):
+            self.metrics = copy.deepcopy(original); mutate(self.metrics)
+            with self.assertRaisesRegex(engine.GuardError, expected): self.adapter.sample(self.entry)
 
 
 class DedicatedComposeHostTests(unittest.TestCase):
@@ -160,11 +219,22 @@ class DedicatedComposeHostTests(unittest.TestCase):
 
     def test_legacy_defaults_stay_compatible_and_invalid_settings_fail(self):
         legacy = nas.DockerNas({'scope': str(self.scope)})
-        self.assertEqual((legacy.runtime_uid, legacy.render_group, legacy.restart_policy, legacy.maintenance_mode),
-                         (1026, 937, 'always', 'watchdog'))
-        for key, value in (('renderGroup', True), ('renderGroup', -1), ('restartPolicy', 'on-failure'), ('maintenanceMode', 'none')):
+        self.assertEqual((legacy.runtime_uid, legacy.render_group, legacy.restart_policy, legacy.maintenance_mode, legacy.event_delivery_mode),
+                         (1026, 937, 'always', 'watchdog', 'onvif-pullpoint'))
+        self.assertEqual(self.adapter.event_delivery_mode, 'onvif-pullpoint')
+        for key, value in (('renderGroup', True), ('renderGroup', -1), ('restartPolicy', 'on-failure'),
+                           ('maintenanceMode', 'none'), ('eventDeliveryMode', 'unknown'), ('eventDeliveryMode', None)):
             with self.subTest(key=key, value=value), self.assertRaises(engine.GuardError):
                 nas.DockerNas({'scope': str(self.scope), key: value})
+
+    def test_native_event_delivery_requires_explicit_setting_independent_of_maintenance(self):
+        for maintenance in ('watchdog', 'deployment-lock'):
+            with self.subTest(maintenance=maintenance):
+                explicit = nas.DockerNas({'scope': str(self.scope), 'maintenanceMode': maintenance,
+                    'eventDeliveryMode': 'native-replay'})
+                self.assertEqual(explicit.event_delivery_mode, 'native-replay')
+                implicit = nas.DockerNas({'scope': str(self.scope), 'maintenanceMode': maintenance})
+                self.assertEqual(implicit.event_delivery_mode, 'onvif-pullpoint')
 
 
 if __name__ == "__main__":
