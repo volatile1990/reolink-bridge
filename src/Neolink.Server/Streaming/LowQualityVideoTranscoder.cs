@@ -137,7 +137,7 @@ public sealed class LowQualityVideoTranscoder
             var firstTimestamp = new TaskCompletionSource<uint>(TaskCreationOptions.RunContinuationsAsynchronously);
             // Equal rates retain every source picture. Its actual wall duration may
             // differ from the configured ceiling (e.g. 12.5 fps during night exposure).
-            var pictureTimes = _frameRate == _sourceFrameRate ? Channel.CreateBounded<uint>(new BoundedChannelOptions(2048)
+            var pictureTimes = _frameRate == _sourceFrameRate ? Channel.CreateBounded<LowQualityPictureTiming>(new BoundedChannelOptions(2048)
                 { FullMode = BoundedChannelFullMode.Wait, SingleReader = true, SingleWriter = true }) : null;
             var feed = FeedAsync(proc.StandardInput.BaseStream, reader, epoch, firstTimestamp, pictureTimes?.Writer, token);
             long lastOutput = Stopwatch.GetTimestamp();
@@ -250,7 +250,7 @@ public sealed class LowQualityVideoTranscoder
     }
 
     private async Task FeedAsync(Stream stdin, ChannelReader<HubPacket> reader, long epoch,
-        TaskCompletionSource<uint> firstTimestamp, ChannelWriter<uint>? pictureTimes, CancellationToken ct)
+        TaskCompletionSource<uint> firstTimestamp, ChannelWriter<LowQualityPictureTiming>? pictureTimes, CancellationToken ct)
     {
         bool started = false;
         long? lastIndex = null;
@@ -281,8 +281,8 @@ public sealed class LowQualityVideoTranscoder
             {
                 int pictures = RtpAccessUnitSplitter.Split(_source.Codec!.Value, video.AnnexB).Count(unit => unit.HasVcl);
                 if (pictures > 0)
-                    foreach (uint timestamp in timeline.Map(video, pictures))
-                        await pictureTimes!.WriteAsync(timestamp, ct).ConfigureAwait(false);
+                    foreach (var timing in timeline.MapWithProvenance(video, pictures))
+                        await pictureTimes!.WriteAsync(timing, ct).ConfigureAwait(false);
             }
             await stdin.WriteAsync(video.AnnexB, ct).ConfigureAwait(false);
             await stdin.FlushAsync(ct).ConfigureAwait(false);
@@ -309,7 +309,7 @@ public sealed class LowQualityVideoTranscoder
     }
 
     private async Task ReadOutputAsync(Stream stdout, long epoch, Task<uint> firstTimestamp,
-        ChannelReader<uint>? pictureTimes, Action onFrame, CancellationToken ct)
+        ChannelReader<LowQualityPictureTiming>? pictureTimes, Action onFrame, CancellationToken ct)
     {
         var assembler = new HevcAccessUnitReader();
         var buffer = new byte[16 * 1024];
@@ -322,7 +322,12 @@ public sealed class LowQualityVideoTranscoder
                 // SourceStopped is synchronous upstream. Reject any buffered output from its old generation.
                 if (_source.SourceEpoch != epoch || !_source.LiveVideo || ct.IsCancellationRequested) return;
                 uint timestamp;
-                if (pictureTimes != null) timestamp = await pictureTimes.ReadAsync(ct).ConfigureAwait(false);
+                LowQualityPictureTiming? provenance = null;
+                if (pictureTimes != null)
+                {
+                    provenance = await pictureTimes.ReadAsync(ct).ConfigureAwait(false);
+                    timestamp = provenance.Value.Microseconds;
+                }
                 else
                 {
                     uint origin = await firstTimestamp.WaitAsync(ct).ConfigureAwait(false);
@@ -339,7 +344,8 @@ public sealed class LowQualityVideoTranscoder
                 }
                 if (width > 0 && height > 0 && (frame == 1 || _output.Width != width || _output.Height != height))
                     _output.PublishInfo(new MediaInfo(width, height, (byte)_frameRate));
-                _output.PublishVideo(new VideoFrame(VideoCodec.H265, unit.Keyframe, timestamp, null, unit.Data));
+                _output.PublishVideo(new VideoFrame(VideoCodec.H265, unit.Keyframe, timestamp, null, unit.Data),
+                    provenance?.SourceArrivalTimestamp, provenance?.SourceArrivalTimestampFrequency ?? 0);
                 onFrame();
             }
         }

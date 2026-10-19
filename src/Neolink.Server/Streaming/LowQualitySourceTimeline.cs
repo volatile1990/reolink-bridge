@@ -1,6 +1,10 @@
 // Source arrival provenance for one-to-one LQ pictures; AGPL-3.0.
 namespace Neolink.Streaming;
 
+/// <summary>One-to-one input timing carried around the timestamp-free encoder pipe.</summary>
+internal readonly record struct LowQualityPictureTiming(uint Microseconds, long SourceArrivalTimestamp,
+    long SourceArrivalTimestampFrequency);
+
 /// <summary>Raw elementary-stream pipes lose timestamps. For a one-to-one encoder,
 /// retain the observed source elapsed time outside ffmpeg. Camera clocks
 /// are used only for the initial numeric origin, never for duration: some cameras
@@ -19,19 +23,25 @@ internal sealed class LowQualitySourceTimeline(int frameRate)
     private uint _origin;
     public long Pictures { get; private set; }
 
-    public uint[] Map(HubVideo video, int pictureCount)
+    public uint[] Map(HubVideo video, int pictureCount) => MapWithProvenance(video, pictureCount)
+        .Select(value => value.Microseconds).ToArray();
+
+    public LowQualityPictureTiming[] MapWithProvenance(HubVideo video, int pictureCount)
     {
         if (pictureCount is < 1 or > 900 || video.ArrivalTimestamp == null || video.ArrivalTimestampFrequency <= 0)
             throw new InvalidDataException("LQ source lacks bounded picture arrival metadata");
-        var output = new uint[pictureCount];
+        var output = new LowQualityPictureTiming[pictureCount];
+        LowQualityPictureTiming Timing(long elapsedUs) => new(unchecked(_origin + (uint)elapsedUs),
+            checked(_firstArrival + (long)Math.Round((elapsedUs - _initialBundleUs)
+                * (double)_frequency / 1_000_000)), _frequency);
         if (_lastArrival == null)
         {
             _origin = video.CameraMicroseconds ?? (uint)((ulong)video.RtpTs * 1000 / 90);
             _frequency = video.ArrivalTimestampFrequency;
             _firstArrival = video.ArrivalTimestamp.Value;
-            for (int i = 0; i < pictureCount; i++)
-                output[i] = unchecked(_origin + (uint)((ulong)i * 1_000_000 / (ulong)frameRate));
             _elapsedUs = _initialBundleUs = (pictureCount - 1) * 1_000_000L / frameRate;
+            for (int i = 0; i < pictureCount; i++)
+                output[i] = Timing((long)i * 1_000_000 / frameRate);
         }
         else
         {
@@ -54,7 +64,7 @@ internal sealed class LowQualitySourceTimeline(int frameRate)
             long maximumSpan = checked(Math.Max(nominalUs, Math.Min(200_000, nominalUs * 4)) * pictureCount);
             long spanUs = (long)Math.Clamp(Math.Round(nominalSpan + correction), minimumSpan, maximumSpan);
             for (int i = 0; i < pictureCount; i++)
-                output[i] = unchecked(_origin + (uint)(_elapsedUs + spanUs * (i + 1) / pictureCount));
+                output[i] = Timing(_elapsedUs + spanUs * (i + 1) / pictureCount);
             _elapsedUs += spanUs;
         }
         _lastArrival = video.ArrivalTimestamp;

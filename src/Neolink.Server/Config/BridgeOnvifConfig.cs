@@ -46,6 +46,8 @@ public sealed class BridgeOnvifConfig
     public bool GopAudio { get; set; }
     /// <summary>Additional startup reserve when GopPlayout is enabled.</summary>
     public int PlayoutDelayMs { get; set; }
+    /// <summary>Delay the Protect substream to the observed main GOP presentation clock; direct alias stays unbuffered.</summary>
+    public bool LowQualityMatchHqDelay { get; set; }
     /// <summary>Explicit H264 substream to H265 conversion for Protect's matching HQ/LQ codec requirement.</summary>
     public string? LowQualityTranscode { get; set; }
     /// <summary>Actual native substream frame rate, used to clock raw input during low-quality conversion.</summary>
@@ -96,6 +98,7 @@ public sealed class BridgeOnvifConfig
                 case "playoutdelayms": result.PlayoutDelayMs = property.Value.GetInt32(); break;
                 case "gopplayout": result.GopPlayout = property.Value.GetBoolean(); break;
                 case "gopaudio": result.GopAudio = property.Value.GetBoolean(); break;
+                case "lowqualitymatchhqdelay": result.LowQualityMatchHqDelay = property.Value.GetBoolean(); break;
                 case "lowqualitytranscode": result.LowQualityTranscode = property.Value.GetString(); break;
                 case "lowqualitysourcefps": result.LowQualitySourceFps = property.Value.GetInt32(); break;
                 case "lowqualityencoder": result.LowQualityEncoder = property.Value.GetString() ?? ""; break;
@@ -148,6 +151,11 @@ public sealed class BridgeOnvifConfig
             throw new FormatException("Native talk requires at least one authorized control user");
         if (Talk && !Controls) throw new FormatException("onvif.talk requires onvif.controls");
         if (GopAudio && (!Controls || !GopPlayout)) throw new FormatException("onvif.gop_audio requires controls and gop_playout");
+        if (LowQualityMatchHqDelay && (!GopPlayout || !GopAudio || Profiles.Count != 2
+            || Profiles[0].Stream != "mainStream" || Profiles[1].Stream != "subStream"))
+            throw new FormatException("onvif.low_quality_match_hq_delay requires GOP video/audio and main/sub profiles");
+        if (LowQualityMatchHqDelay && LowQualityTranscode != null && Profiles[1].Fps != LowQualitySourceFps)
+            throw new FormatException("Matched low-quality conversion requires one-to-one source/output frame rates");
         if (NativeTalkPort is < 0 or > 65535 || (NativeTalkPort > 0 && (!Talk || NativeTalkPort == Port)))
             throw new FormatException("Native talk requires enabled controls/talk and a distinct UDP port 1-65535");
         if (NativeTalkPort > 0 && (NativeTalkSenders.Count is < 1 or > 4 || NativeTalkSenders.Distinct().Count() != NativeTalkSenders.Count))

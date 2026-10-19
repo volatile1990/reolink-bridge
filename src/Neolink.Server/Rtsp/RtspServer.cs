@@ -62,6 +62,15 @@ public sealed class RtspMount
         && actual.Audio is { IsAac: true, SampleRate: >= 8000 and <= 96000, Channels: >= 1 and <= 2, AudioSpecificConfig.Length: >= 2 };
     /// <summary>Additional startup reserve after the first complete GOP has arrived.</summary>
     public int PlayoutDelayMs { get; init; }
+    /// <summary>Shared per-camera reference published by an existing HQ GOP consumer.</summary>
+    internal HqPlayoutReference? PublishHqTiming { get; init; }
+    /// <summary>Opt-in delayed Protect LQ; the direct LQ alias never uses this reference.</summary>
+    internal HqPlayoutReference? MatchHqTiming { get; init; }
+    internal bool SameMediaPolicy(RtspMount other) => ReferenceEquals(Hub, other.Hub)
+        && GopPlayout == other.GopPlayout && GopAudio == other.GopAudio
+        && PlayoutDelayMs == other.PlayoutDelayMs && Opus == other.Opus
+        && ReferenceEquals(PublishHqTiming, other.PublishHqTiming)
+        && ReferenceEquals(MatchHqTiming, other.MatchHqTiming);
 }
 
 /// <summary>Pure .NET RTSP server (RFC 2326 subset: OPTIONS/DESCRIBE/SETUP/PLAY/PAUSE/GET_PARAMETER/TEARDOWN).</summary>
@@ -93,6 +102,21 @@ public sealed class RtspServer
         activeSessions = _gopAacSessions.Count,
         timeBasis = "arrival-estimate-and-aac-samples", captureSynchronizationVerified = false,
         sessions = _gopAacSessions.Values.ToArray(), lastCompleted = _lastGopAac
+    };
+    private readonly ConcurrentDictionary<string, object> _matchedLowSessions = new();
+    private object? _lastMatchedLowSession;
+    internal void ObserveMatchedLow(string session, object value, bool completed = false)
+    {
+        if (completed) { _matchedLowSessions.TryRemove(session, out _); _lastMatchedLowSession = value; }
+        else _matchedLowSessions[session] = value;
+    }
+    public object LowQualityTimingDiagnostics() => new
+    {
+        timeBasis = "source-arrival-estimate-and-observed-hq-presentation", captureSynchronizationVerified = false,
+        references = _mounts.Values.Select(m => m.PublishHqTiming).OfType<HqPlayoutReference>()
+            .Distinct().Select(reference => reference.Diagnostics()).ToArray(),
+        activeSessions = _matchedLowSessions.Count, sessions = _matchedLowSessions.Values.ToArray(),
+        lastCompleted = _lastMatchedLowSession
     };
 
     public RtspServer(IReadOnlyDictionary<string, string> users)

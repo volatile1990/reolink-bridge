@@ -264,3 +264,21 @@ Nach der abgeschlossenen Messung des früheren Piloten wurden alle vier Bridge-C
 ## Herkunft
 
 Die Upstream-Selbsttests und der übernommene Server stammen aus [Neolink.NET v1.1.0](UPSTREAM.md) von Oluwabori Olaleye. Die ursprünglichen Copyright-Hinweise und die [AGPL-3.0-Lizenz](LICENSE) bleiben erhalten; die zusätzlichen ONVIF-Vertragstests und der Headless-Pilot sind Erweiterungen dieser Bridge.
+# Protect-LQ presentation alignment, 19 October 2026
+
+Version 1.5.0 adds optional `low_quality_match_hq_delay` and a separate authenticated
+`/camera/subStream/direct` alias. Seven new alignment contracts pass with the existing
+.NET 10.0.401 SDK. They exercise default-off configuration, required GOP/AAC and
+one-to-one encoder rates, stable HQ reference ownership, source epochs and expiry,
+encoder input provenance, original video/AAC bytes and RTP clocks, actual loopback
+RTSP pacing, bounded initial reference wait, cancellation, oversized input,
+deadline failure and real subscriber-channel overflow. Initial bundled-frame
+provenance ends at the observed arrival and never invents future source arrivals.
+
+The existing 15 GOP/NAL/video/AAC, three LQ cadence (including real FFmpeg), and
+five LQ encoder contracts also pass: 30 focused contracts total. These local checks
+use synthetic media and loopback peers. A candidate still requires the isolated
+Linux selftests, full contracts and VAAPI regressions, followed by actual Protect
+HQ/LQ/Automatic, fresh recording and direct Frigate acceptance before deployment
+is considered complete. Source-arrival/presentation alignment does not establish
+sensor capture synchronization or handset playback latency.

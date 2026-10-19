@@ -38,7 +38,8 @@ public static class ProtectBridgeHost
             onvif: new OnvifClient(camera.OnvifAddress ?? camera.Host, camera.Username, camera.Password, camera.Name)) : null;
         var rtsp = new RtspServer(users) { TcpOnly = true };
         AddRtspMounts(rtsp, camera.Name, hub, permitted, onvif.GopPlayout, onvif.PlayoutDelayMs, pipeline.LowHub,
-            onvif.Talk ? control : null, onvif.GopAudio, onvif.ControlUsers?.ToHashSet(StringComparer.Ordinal));
+            onvif.Talk ? control : null, onvif.GopAudio, onvif.ControlUsers?.ToHashSet(StringComparer.Ordinal),
+            onvif.LowQualityMatchHqDelay);
         var snapshots = new NativeProtectSnapshotProvider(() => source.LiveCamera,
             () => !hub.AuthenticationFailed && hub.LiveVideo && hub.VideoReady
                 && hub.GetVideoDiagnostics().LastVideoAgeMs is >= 0 and <= 5000,
@@ -53,6 +54,7 @@ public static class ProtectBridgeHost
         if (cameraControls != null) cameraControls.ListenMetadata = endpoint.ListenMetadata;
         endpoint.SourceDiagnostics = source.SourceDiagnostics;
         if (onvif.GopAudio) endpoint.GopAudioDiagnostics = rtsp.GopAudioDiagnostics;
+        endpoint.LowQualityTimingDiagnostics = rtsp.LowQualityTimingDiagnostics;
         if (pipeline.Transcoder is { } lowEncoder)
         {
             endpoint.LowQualityEncoderDiagnostics = lowEncoder.Diagnostics;
@@ -193,17 +195,29 @@ public static class ProtectBridgeHost
     /// <summary>Main aliases retain their source and playout policy. Optional low output has its own media and audio.</summary>
     internal static void AddRtspMounts(RtspServer rtsp, string cameraName, IStreamHub hub,
         HashSet<string> permitted, bool gopPlayout, int playoutDelayMs, IStreamHub? lowHub = null, ICameraControl? talk = null,
-        bool gopAudio = false, HashSet<string>? talkPermittedUsers = null)
+        bool gopAudio = false, HashSet<string>? talkPermittedUsers = null, bool lowQualityMatchHqDelay = false)
     {
+        var timing = lowQualityMatchHqDelay && gopPlayout && lowHub != null
+            ? new HqPlayoutReference(hub, rtsp.PlayoutTimeProvider) : null;
         rtsp.AddMount(new RtspMount { Path = "/" + cameraName + "/mainStream", Hub = hub,
             PermittedUsers = permitted, GopPlayout = gopPlayout, GopAudio = gopAudio, PlayoutDelayMs = playoutDelayMs,
+            PublishHqTiming = timing,
             Talk = gopPlayout ? null : talk, TalkPermittedUsers = talkPermittedUsers });
         rtsp.AddMount(new RtspMount { Path = "/" + cameraName, Hub = hub,
             PermittedUsers = permitted, GopPlayout = gopPlayout, GopAudio = gopAudio, PlayoutDelayMs = playoutDelayMs,
+            PublishHqTiming = timing,
             Talk = gopPlayout ? null : talk, TalkPermittedUsers = talkPermittedUsers });
         if (lowHub != null)
+        {
             rtsp.AddMount(new RtspMount { Path = "/" + cameraName + "/subStream", Hub = lowHub,
-                PermittedUsers = permitted, GopPlayout = false, PlayoutDelayMs = 0, Talk = talk, TalkPermittedUsers = talkPermittedUsers });
+                PermittedUsers = permitted, GopPlayout = false, PlayoutDelayMs = 0, MatchHqTiming = timing,
+                Talk = talk, TalkPermittedUsers = talkPermittedUsers });
+            // Separate consumer policy, same source and authentication. Frigate can
+            // retain its original latency without creating another camera pull/encoder.
+            rtsp.AddMount(new RtspMount { Path = "/" + cameraName + "/subStream/direct", Hub = lowHub,
+                PermittedUsers = permitted, GopPlayout = false, PlayoutDelayMs = 0,
+                Talk = talk, TalkPermittedUsers = talkPermittedUsers });
+        }
     }
 
     private static async Task RunLowQualityAsync(LowQualityVideoTranscoder transcoder, CancellationToken ct)

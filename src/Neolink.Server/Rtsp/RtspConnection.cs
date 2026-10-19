@@ -32,7 +32,7 @@ public sealed class RtspConnection
     /// resolve control URIs strictly per RFC 3986 and drop the query.</summary>
     private bool? _describedOpus;
     private StreamDescriptionSnapshot? _description;
-    private IStreamHub? _describedHub;
+    private RtspMount? _describedMount;
     private long _lastActivity;
     private CancellationToken _connectionToken;
     private int _readLen;
@@ -323,6 +323,8 @@ public sealed class RtspConnection
             return;
         }
         bool opus = !mount.GopPlayout && (audioChoice ?? mount.Opus);
+        if (mount.MatchHqTiming != null && opus)
+        { await RespondAsync(req, 404, "Matched LQ Requires Original AAC", ct: ct).ConfigureAwait(false); return; }
         if (mount.GopAacAvailable && audioChoice == true)
         { await RespondAsync(req, 404, "Unsupported Audio Format", ct: ct).ConfigureAwait(false); return; }
 
@@ -371,8 +373,10 @@ public sealed class RtspConnection
             return;
         }
         if (mount.GopPlayout && !mount.GopAacAvailable) description = description with { Audio = null };
+        if (mount.MatchHqTiming != null && description.Audio is { IsAac: false })
+        { await RespondAsync(req, 503, "Matched LQ Requires Original AAC", "Retry-After: 5", ct: ct).ConfigureAwait(false); return; }
         _description = description;
-        _describedHub = mount.Hub;
+        _describedMount = mount;
         _describedOpus = opus;
         string sdp = Sdp.Build(description, mount.Hub.Name, backchannel: backchannel, opus: opus);
         string contentBase = req.Uri.Split('?')[0].TrimEnd('/') + "/";
@@ -406,6 +410,8 @@ public sealed class RtspConnection
             await RespondAsync(req, 404, "Not Found", ct: ct).ConfigureAwait(false);
             return;
         }
+        if (mount.MatchHqTiming != null && audio == "opus")
+        { await RespondAsync(req, 404, "Matched LQ Requires Original AAC", ct: ct).ConfigureAwait(false); return; }
 
         var transportHeader = req.Header("Transport");
         if (transportHeader == null)
@@ -427,12 +433,13 @@ public sealed class RtspConnection
             _sessions.TryGetValue(sessionId.Split(';')[0].Trim(), out session);
             if (session == null)
             { await RespondAsync(req, 454, "Session Not Found", ct: ct).ConfigureAwait(false); return; }
-            if (!ReferenceEquals(session.Hub, mount.Hub) || session.Playing)
+            if (!session.SameMediaPolicy(mount) || session.Playing)
             { await RespondAsync(req, 455, "Method Not Valid in This State", sessionId: session.Id, ct: ct).ConfigureAwait(false); return; }
         }
         if (!mount.Hub.TryGetCurrentDescription(out var current))
         { await RespondAsync(req, 503, "Service Unavailable", ct: ct).ConfigureAwait(false); return; }
-        var description = ReferenceEquals(_describedHub, mount.Hub) && _description is { } described
+        bool describedPolicyMatches = _describedMount?.SameMediaPolicy(mount) is true;
+        var description = describedPolicyMatches && _description is { } described
             ? described : current;
         if (description.SourceEpoch != current.SourceEpoch || description.Codec != current.Codec
             || trackId == 1 && (description.Audio == null || !SameAudio(description.Audio, current.Audio)))
@@ -446,7 +453,9 @@ public sealed class RtspConnection
             // else what the DESCRIBE on this connection settled on, else the mount
             // default. Unknown values were already policed at DESCRIBE.
             bool opus = !mount.GopPlayout && ((TryMapAudio(audio, out var choice) ? choice : null)
-                ?? (ReferenceEquals(_describedHub, mount.Hub) ? _describedOpus : null) ?? mount.Opus);
+                ?? (describedPolicyMatches ? _describedOpus : null) ?? mount.Opus);
+            if (mount.MatchHqTiming != null && opus)
+            { await RespondAsync(req, 404, "Matched LQ Requires Original AAC", ct: ct).ConfigureAwait(false); return; }
             if (opus && !Media.Ffmpeg.SupportsOpus)
                 opus = false; // DESCRIBE-less client; never promise silence
             session = new RtspSession(this, mount, opus, description);
@@ -773,6 +782,7 @@ internal sealed class TrackTransport
 
 internal sealed class RtspSession
 {
+    internal bool SameMediaPolicy(RtspMount mount) => _mount.SameMediaPolicy(mount);
     public string Id { get; } = Convert.ToHexString(Guid.NewGuid().ToByteArray()[..8]);
     public TrackTransport? Video { get; private set; }
     public TrackTransport? Audio { get; private set; }
@@ -923,6 +933,8 @@ internal sealed class RtspSession
         int aacRate = _mount.GopAudio && _description.Audio is { IsAac: true } describedAudio ? describedAudio.SampleRate : 0;
         byte[]? aacAsc = aacRate > 0 ? _description.Audio!.AudioSpecificConfig?.ToArray() : null;
         var aacTimeline = playout != null && Audio != null && aacRate > 0 ? new GopAacTimeline(aacRate, hub.SourceEpoch) : null;
+        var matchedLow = _mount.MatchHqTiming is { } timing
+            ? new MatchedLowQualityPlayout(hub, timing, _conn.Server.PlayoutTimeProvider, _conn.Server.PlayoutWaiter) : null;
         long? lastRtcpAt = null;
         string cname = "reolink-gop-" + Id.ToLowerInvariant();
         long sourceEpoch = hub.SourceEpoch;
@@ -947,6 +959,7 @@ internal sealed class RtspSession
                 lastIndex = packet.Index;
                 if (gap)
                 {
+                    if (matchedLow != null) throw new IOException("Matched low-quality subscriber lost packets; reconnect at a keyframe");
                     waitKeyframe = true;
                     playout?.Reset();
                     aacTimeline?.Reset(hub.SourceEpoch);
@@ -978,6 +991,7 @@ internal sealed class RtspSession
                                     $"pictures={complete.Pictures.Count}, duration={complete.Duration.TotalMilliseconds:F1}ms");
                             uniformCadence = complete.UniformCadence;
                             complete = playout.BeginGop(complete);
+                            _mount.PublishHqTiming?.Observe(Id, complete, playout.PresentationTimestamp(TimeSpan.Zero));
                             var aacPlans = aacTimeline?.Plan(complete) ?? [];
                             var presentation = complete.Pictures.Select(picture => (Offset: picture.Offset, Video: (GopPlayoutPicture?)picture, Audio: (GopAacPlan?)null))
                                 .Concat(aacPlans.Select(aac => (Offset: aac.Offset, Video: (GopPlayoutPicture?)null, Audio: (GopAacPlan?)aac)))
@@ -1025,6 +1039,11 @@ internal sealed class RtspSession
                             if (aacTimeline != null) _conn.Server.ObserveGopAac(Id, aacTimeline.Diagnostics);
                             continue;
                         }
+                        if (matchedLow != null)
+                        {
+                            await matchedLow.WaitAsync(v, _description.Audio, ct).ConfigureAwait(false);
+                            _conn.Server.ObserveMatchedLow(Id, matchedLow.Diagnostics());
+                        }
                         await SendVideoAsync(hub, v.AnnexB, v.Keyframe, v.HasSps, v.RtpTs, batch, ct).ConfigureAwait(false);
                         break;
                     }
@@ -1033,6 +1052,7 @@ internal sealed class RtspSession
                     // skipped; on an original session it's the exact opposite. Both
                     // kinds flow through the hub side by side.
                     case HubAudioOpus o when Audio != null && _opus:
+                        if (matchedLow != null) throw new IOException("Matched low-quality requires original AAC");
                         await SendAsync(Audio, Audio.Packetizer.PacketizeOpus(o.Packet, o.RtpTs), ct).ConfigureAwait(false);
                         break;
                     case HubAudioAac a when Audio != null && !_opus:
@@ -1045,9 +1065,16 @@ internal sealed class RtspSession
                                 throw new IOException("GOP AAC source format changed; reconnect for current SDP");
                             aacTimeline.Push(a); break;
                         }
+                        if (matchedLow != null)
+                        {
+                            if (Video != null && waitKeyframe) break;
+                            await matchedLow.WaitAsync(a, _description.Audio, ct).ConfigureAwait(false);
+                            _conn.Server.ObserveMatchedLow(Id, matchedLow.Diagnostics());
+                        }
                         await SendAsync(Audio, Audio.Packetizer.PacketizeAac(a.Au, a.RtpTs), ct).ConfigureAwait(false);
                         break;
                     case HubAudioPcm p when Audio != null && !_opus:
+                        if (matchedLow != null) throw new IOException("Matched low-quality requires original AAC");
                         if (!RtspConnection.SameAudio(_description.Audio, hub.Audio))
                             throw new IOException("RTSP audio source format changed; reconnect for current SDP");
                         if (aacTimeline != null) throw new IOException("GOP AAC source changed to PCM; reconnect for current SDP");
@@ -1065,6 +1092,8 @@ internal sealed class RtspSession
         }
         finally
         {
+            _mount.PublishHqTiming?.Release(Id);
+            if (matchedLow != null) _conn.Server.ObserveMatchedLow(Id, matchedLow.Diagnostics(), completed: true);
             if (aacTimeline != null)
             {
                 var diagnostic = aacTimeline.Diagnostics;

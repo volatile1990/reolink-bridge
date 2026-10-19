@@ -13,6 +13,22 @@ using Neolink.Media;
 using Neolink.Onvif;
 using Neolink.Streaming;
 
+if (args.SequenceEqual(new[] { "--lq-alignment-only" }))
+{
+    try
+    {
+        await LowQualityAlignmentTests.ConfigurationAndMountIsolation();
+        await LowQualityAlignmentTests.SharedReferenceOwnershipAndExpiry();
+        await LowQualityAlignmentTests.CommonClockAndEncoderProvenance();
+        await LowQualityAlignmentTests.FailClosedAndCancellation();
+        await LowQualityAlignmentTests.DirectAndMatchedWirePayloads();
+        await LowQualityAlignmentTests.SubscriberBackpressureFailsClosed();
+        await LowQualityAlignmentTests.SessionMediaPolicyIsolation();
+        Console.WriteLine("7 LQ alignment contracts passed; synthetic media, controlled clocks and loopback RTSP peers only."); return 0;
+    }
+    catch (Exception error) { Console.Error.WriteLine("FAIL LQ alignment: " + error); return 1; }
+}
+
 if (args.SequenceEqual(new[] { "--lq-cadence-only" }))
 {
     try
@@ -273,6 +289,13 @@ internal static class ContractTests
             await Test("one-to-one low quality retains night cadence and rejects camera clock jumps", LowQualityCadenceTests.SourceCadenceAndBurstClock);
             await Test("real night encoder preserves source duration, HEVC pictures and original AAC", LowQualityCadenceTests.RealNightEncoderAndAacPreservation);
             await Test("real TCP burst encoder retains positive native millisecond durations and original AAC", LowQualityCadenceTests.RealTcpBurstEncoderAndNativeMilliseconds);
+            await Test("optional LQ delay shares HQ aliases and preserves direct authentication/source", LowQualityAlignmentTests.ConfigurationAndMountIsolation);
+            await Test("HQ timing ownership survives aliases and expires across releases/reconnects", LowQualityAlignmentTests.SharedReferenceOwnershipAndExpiry);
+            await Test("LQ pacing subtracts encoder time and preserves original AAC/media timestamps", LowQualityAlignmentTests.CommonClockAndEncoderProvenance);
+            await Test("LQ matching cancels promptly and fails closed on stale or oversized media", LowQualityAlignmentTests.FailClosedAndCancellation);
+            await Test("matched and direct LQ RTSP outputs preserve encoded video and original AAC bytes", LowQualityAlignmentTests.DirectAndMatchedWirePayloads);
+            await Test("actual bounded LQ subscriber backpressure closes instead of sending damaged media", LowQualityAlignmentTests.SubscriberBackpressureFailsClosed);
+            await Test("RTSP session policy isolates direct/matched tracks and described Opus codec choices", LowQualityAlignmentTests.SessionMediaPolicyIsolation);
             await Test("exact video routing preserves legacy and unsolicited message watches", SharedBaichuanStreamTests.MessageNumberRouting);
             await Test("successful preview stop releases only its binary command number", SharedBaichuanStreamTests.StopAcknowledgementReleasesBinaryMode);
             await Test("shared login demuxes both qualities and retries low without stopping main", SharedBaichuanStreamTests.OneLoginDemuxAndLowRetry);

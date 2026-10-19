@@ -45,6 +45,7 @@ public sealed partial class ProtectOnvifServer
     public Func<object>? LowQualityDecoderDiagnostics { get; set; }
     public Func<object>? NativeTalkDiagnostics { get; set; }
     public Func<object>? GopAudioDiagnostics { get; set; }
+    public Func<object>? LowQualityTimingDiagnostics { get; set; }
     private readonly long _startedTimestamp = System.Diagnostics.Stopwatch.GetTimestamp();
     private readonly Dictionary<string, DateTime> _nonces = new(StringComparer.Ordinal);
     private readonly Dictionary<string, int> _connections = new(StringComparer.Ordinal);
@@ -95,6 +96,7 @@ public sealed partial class ProtectOnvifServer
         lowQualityDecoder = LowQualityDecoderDiagnostics?.Invoke(),
         nativeTalk = NativeTalkDiagnostics?.Invoke(),
         gopAudio = GopAudioDiagnostics?.Invoke(),
+        lowQualityTiming = LowQualityTimingDiagnostics?.Invoke(),
         uptimeSeconds = System.Diagnostics.Stopwatch.GetElapsedTime(_startedTimestamp).TotalSeconds,
         streams = _streams.Select(stream =>
         {

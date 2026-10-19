@@ -20,6 +20,9 @@ public sealed record HubVideo(long Index, byte[] AnnexB, bool Keyframe, uint Rtp
     /// <summary>Original publisher arrival on a monotonic clock, including after GOP replay.</summary>
     public long? ArrivalTimestamp { get; init; }
     public long ArrivalTimestampFrequency { get; init; }
+    /// <summary>Estimated original input-picture arrival before an optional encoder. Not a capture timestamp.</summary>
+    public long? SourceArrivalTimestamp { get; init; }
+    public long SourceArrivalTimestampFrequency { get; init; }
     /// <summary>Unmodified camera header counter, for detecting discontinuities hidden by the legacy RTP fallback.</summary>
     public uint? CameraMicroseconds { get; init; }
 }
@@ -307,8 +310,13 @@ public sealed class StreamHub : IStreamHub, IMediaSink
         }
     }
 
-    public void PublishVideo(VideoFrame frame)
+    public void PublishVideo(VideoFrame frame) => PublishVideo(frame, null, 0);
+
+    /// <summary>Keep an encoder's input provenance separate from actual output freshness.</summary>
+    internal void PublishVideo(VideoFrame frame, long? sourceArrivalTimestamp, long sourceArrivalFrequency)
     {
+        if (sourceArrivalTimestamp != null && sourceArrivalFrequency <= 0)
+            throw new ArgumentOutOfRangeException(nameof(sourceArrivalFrequency));
         lock (_gate)
         {
             long arrivalTimestamp = _diagnosticClock.GetTimestamp();
@@ -398,7 +406,9 @@ public sealed class StreamHub : IStreamHub, IMediaSink
 
             Emit(new HubVideo(0, frame.Data, frame.Keyframe, _videoRtpTs, frameHasSps)
                  { SourceEpoch = SourceEpoch, ArrivalTimestamp = arrivalTimestamp,
-                   ArrivalTimestampFrequency = _diagnosticClock.TimestampFrequency, CameraMicroseconds = frame.Microseconds },
+                   ArrivalTimestampFrequency = _diagnosticClock.TimestampFrequency, CameraMicroseconds = frame.Microseconds,
+                   SourceArrivalTimestamp = sourceArrivalTimestamp,
+                   SourceArrivalTimestampFrequency = sourceArrivalTimestamp == null ? 0 : sourceArrivalFrequency },
                  frame.Keyframe, frame.Data.Length);
         }
     }
