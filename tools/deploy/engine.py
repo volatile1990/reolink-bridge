@@ -119,7 +119,9 @@ def runtime(entry):
     labels = result.setdefault("Labels", {})
     for key in ("com.docker.compose.image", "com.docker.compose.config-hash", "com.docker.compose.replace"):
         value = labels.pop(key, None)
-        need(value is None or isinstance(value, str) and re.fullmatch(r"(?:sha256:)?[0-9a-f]{64}", value), "generated_label_invalid")
+        own_replacement = key == "com.docker.compose.replace" and isinstance(value, str) and value == entry["name"]
+        need(value is None or own_replacement or isinstance(value, str)
+             and re.fullmatch(r"(?:sha256:)?[0-9a-f]{64}", value), "generated_label_invalid")
     return result
 
 
@@ -220,6 +222,7 @@ class DeployEngine:
         compose = self.backend.read_compose()
         production = self.backend.image(frozen["imageId"])["Config"]
         for entry in entries:
+            runtime(entry)  # Validate generated metadata before creating any baseline receipt.
             need(entry["imageRef"] != frozen["imageTag"] or entry["imageId"] == frozen["imageId"], "release_tag_reuses_running_image_reference")
             need(self.backend.image(entry["imageRef"])["Id"] == entry["imageId"], "original_image_tag_drift")
             old = self.backend.image(entry["imageId"])["Config"]

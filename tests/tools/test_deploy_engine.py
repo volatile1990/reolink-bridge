@@ -285,6 +285,45 @@ class DeployTests(unittest.TestCase):
         before[0]["inspect"]["Config"]["Env"] = None; after[0]["inspect"]["Config"]["Env"] = []
         engine.preserve(before, after, IPS[0], self.nas.read_compose(), OLD_TAG, OLD_ID, self.nas.image)
 
+    def test_generated_replace_own_container_name_is_valid_and_input_unchanged(self):
+        entry = self.nas.inventory()[0]
+        entry["inspect"]["Config"]["Labels"].update({"com.docker.compose.replace": entry["name"],
+            "com.docker.compose.image": "sha256:" + "c" * 64, "com.docker.compose.config-hash": "d" * 64})
+        original = copy.deepcopy(entry)
+        normalized = engine.runtime(entry)
+        self.assertFalse(any(key in normalized["Labels"] for key in
+            ("com.docker.compose.replace", "com.docker.compose.image", "com.docker.compose.config-hash")))
+        self.assertEqual(entry, original)
+
+    def test_generated_replace_own_names_allow_plan_apply_and_receipted_rollback(self):
+        for entry in self.nas.entries:
+            entry["inspect"]["Config"]["Labels"]["com.docker.compose.replace"] = entry["name"]
+        plan = self.planned(); applied = self.apply_next(plan["baseline"], IPS[0])
+        self.assertTrue(applied["ok"])
+        restored = self.deploy.rollback({"baseline": plan["baseline"], "release": RELEASE,
+            "receipt": applied["receipt"], "expected": engine.projected(self.nas.inventory())})
+        self.assertTrue(restored["rollbackRestored"])
+
+    def test_plan_refuses_foreign_or_arbitrary_replacement_before_receipt_creation(self):
+        for value in (self.nas.entries[1]["name"], "unrelated-text", True, 1):
+            with self.subTest(value_shape=type(value).__name__):
+                self.nas.entries[0]["inspect"]["Config"]["Labels"]["com.docker.compose.replace"] = value
+                with self.assertRaisesRegex(engine.GuardError, "generated_label_invalid"):
+                    self.planned()
+                self.assertEqual(self.nas.receipt_counter, 0); self.assertFalse(self.nas.recreated)
+
+    def test_generated_hash_labels_keep_their_strict_format(self):
+        for key in ("com.docker.compose.image", "com.docker.compose.config-hash", "com.docker.compose.replace"):
+            for prefix in ("", "sha256:"):
+                entry = self.nas.inventory()[0]; entry["inspect"]["Config"]["Labels"][key] = prefix + "a" * 64
+                engine.runtime(entry)
+        for key in ("com.docker.compose.image", "com.docker.compose.config-hash"):
+            for value in (self.nas.entries[0]["name"], "arbitrary", "a" * 63, "A" * 64, True):
+                with self.subTest(key=key, value_shape=type(value).__name__):
+                    entry = self.nas.inventory()[0]; entry["inspect"]["Config"]["Labels"][key] = value
+                    with self.assertRaisesRegex(engine.GuardError, "generated_label_invalid"):
+                        engine.runtime(entry)
+
     def test_release_valid(self):
         self.assertEqual(self.deploy.release(RELEASE)["version"], "1.4.0")
 

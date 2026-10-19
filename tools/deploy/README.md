@@ -84,6 +84,10 @@ target, permissions, options and multiplicity remain significant. Auto-generated
 container hostname and known Compose lifecycle labels are normalized; complete
 runtime/HostConfig checks remain strict. Main source failures are never repaired
 by changing camera settings, and no implicit software fallback is introduced.
+Generated lifecycle labels retain their checked hash format; only
+`com.docker.compose.replace` may additionally equal that exact container's own
+name. Other strings or foreign names are refused. `plan` validates these runtime
+metadata before creating its baseline receipt.
 
 Image environment entries are compared as unique key/value mappings; malformed
 entries and duplicate keys are refused. The only permitted value change is a
