@@ -1,15 +1,18 @@
 // Protect-only packet pacing against an observed HQ clock; AGPL-3.0.
 using Neolink.Streaming;
+using System.Runtime.CompilerServices;
+using System.Threading.Channels;
 
 namespace Neolink.Rtsp;
 
-/// <summary>Waits on the RTSP pump's existing bounded subscriber queue. Encoded bytes,
+/// <summary>Schedules a bounded set of encoded packet references against HQ timing. Encoded bytes,
 /// RTP timestamps and AAC samples stay unchanged. Input provenance subtracts encoder
 /// latency instead of blindly adding a fixed delay to the encoded output arrival.</summary>
 internal sealed class MatchedLowQualityPlayout(IStreamHub hub, HqPlayoutReference reference,
     TimeProvider? clock = null, Func<TimeSpan, CancellationToken, Task>? wait = null)
 {
     internal const double MaximumLateSeconds = 0.25;
+    internal const int MaxPendingPackets = 512, MaxPendingBytes = 6 * 1024 * 1024;
     private readonly TimeProvider _clock = clock ?? TimeProvider.System;
     private readonly Func<TimeSpan, CancellationToken, Task>? _wait = wait;
     private readonly long _lowEpoch = hub.SourceEpoch;
@@ -22,6 +25,112 @@ internal sealed class MatchedLowQualityPlayout(IStreamHub hub, HqPlayoutReferenc
     private long _videoPackets, _audioPackets, _failures;
     private double _totalWaitMs, _maximumLateMs, _lastEncoderAgeMs, _lastDelayMs,
         _lastDeliveredSourceAgeMs, _lastQueueAgeMs, _startupWaitMs;
+    private readonly Queue<PlannedPacket> _videoQueue = new(), _audioQueue = new();
+    private readonly PriorityQueue<PlannedPacket, (double Due, long Index)> _heads = new();
+    private PlannedPacket? _readyPacket;
+    private int _pendingPackets, _maximumPendingPackets, _unchangedTimerWakeups;
+    private long _pendingBytes, _maximumPendingBytes;
+    private bool _readerActive;
+
+    private sealed record PlannedPacket(HubPacket Packet, long SourceTimestamp, long Frequency,
+        double Due, HqPlayoutSnapshot Timing, double? EncoderAgeMs, double? InputQueueAgeMs);
+
+    /// <summary>Buffer immutable packet references, with one FIFO per track. Only
+    /// their heads compete by deadline, so a small valid HQ-delay change cannot
+    /// reorder predictive video or AAC. The extra queue is bounded at 512 packets
+    /// and 6 MiB including its waiting head; typical two-second LQ uses about 72
+    /// packets. The existing input channel retains its separate 2048-packet cap.</summary>
+    public async IAsyncEnumerable<HubPacket> ReadAsync(ChannelReader<HubPacket> reader, AudioTrackInfo? audio,
+        [EnumeratorCancellation] CancellationToken ct, bool videoEnabled = true)
+    {
+        if (_readerActive) throw new InvalidOperationException("Matched LQ reader already active");
+        _readerActive = true;
+        long? lastIndex = null;
+        bool started = !videoEnabled, inputCompleted = false;
+        try
+        {
+            while (true)
+            {
+                ct.ThrowIfCancellationRequested();
+                if (_readyPacket != null) throw Failure("Matched LQ previous packet was not marked sent");
+                while (reader.TryRead(out var packet))
+                {
+                    if (lastIndex is { } previous && packet.Index != previous + 1)
+                        throw Failure("Matched LQ subscriber lost packets; reconnect at a keyframe");
+                    lastIndex = packet.Index; // Includes Opus packets ignored by original-AAC sessions.
+                    if (packet is HubVideo video)
+                    {
+                        if (!videoEnabled) continue;
+                        if (!started && !video.Keyframe) continue;
+                        started = true;
+                    }
+                    else if (packet is HubAudioAac)
+                    { if (audio == null || !started) continue; }
+                    else if (packet is HubAudioPcm && audio != null)
+                        throw Failure("Matched LQ requires original AAC");
+                    else continue;
+                    Enqueue(await PlanAsync(packet, audio, ct).ConfigureAwait(false));
+                }
+                if (!_heads.TryPeek(out var next, out _))
+                {
+                    if (inputCompleted || !await reader.WaitToReadAsync(ct).ConfigureAwait(false)) yield break;
+                    continue;
+                }
+                VerifyPlan(next);
+                if (Remaining(next) > 0)
+                {
+                    if (inputCompleted) await WaitPlanAsync(next, ct).ConfigureAwait(false);
+                    else
+                    {
+                        inputCompleted = await WaitForInputOrDeadlineAsync(reader, next, ct).ConfigureAwait(false);
+                        continue; // New video can have an earlier source instant than queued AAC.
+                    }
+                }
+                VerifyDeadline(next);
+                Dequeue(next);
+                _readyPacket = next;
+                // Both readiness/timer tasks have completed before handing a packet to the sender.
+                yield return next.Packet;
+            }
+        }
+        finally
+        {
+            _videoQueue.Clear(); _audioQueue.Clear(); _heads.Clear();
+            _pendingBytes = _pendingPackets = 0; _readyPacket = null; _readerActive = false;
+        }
+    }
+
+    public void MarkSent(HubPacket packet)
+    {
+        var ready = _readyPacket;
+        if (ready == null || !ReferenceEquals(ready.Packet, packet))
+            throw Failure("Matched LQ sent packet does not match its ready head");
+        RecordSent(ready); _readyPacket = null;
+    }
+
+    private void Enqueue(PlannedPacket packet)
+    {
+        int bytes = PayloadBytes(packet.Packet);
+        if (_pendingPackets >= MaxPendingPackets || _pendingBytes + bytes > MaxPendingBytes)
+            throw Failure("Matched LQ pending packet budget exceeded");
+        var queue = packet.Packet is HubVideo ? _videoQueue : _audioQueue;
+        queue.Enqueue(packet);
+        if (queue.Count == 1) _heads.Enqueue(packet, (packet.Due, packet.Packet.Index));
+        _pendingPackets++; _pendingBytes += bytes;
+        _maximumPendingPackets = Math.Max(_maximumPendingPackets, _pendingPackets);
+        _maximumPendingBytes = Math.Max(_maximumPendingBytes, _pendingBytes);
+    }
+
+    private void Dequeue(PlannedPacket packet)
+    {
+        _heads.Dequeue();
+        var queue = packet.Packet is HubVideo ? _videoQueue : _audioQueue;
+        queue.Dequeue(); _pendingPackets--; _pendingBytes -= PayloadBytes(packet.Packet);
+        if (queue.TryPeek(out var next)) _heads.Enqueue(next, (next.Due, next.Packet.Index));
+    }
+
+    private static int PayloadBytes(HubPacket packet) => packet switch
+    { HubVideo video => video.AnnexB.Length, HubAudioAac audio => audio.Au.Length, _ => 0 };
 
     public void CheckFresh() => CheckedReference();
 
@@ -71,10 +180,19 @@ internal sealed class MatchedLowQualityPlayout(IStreamHub hub, HqPlayoutReferenc
 
     public async Task WaitAsync(HubPacket packet, AudioTrackInfo? descriptionAudio, CancellationToken ct)
     {
+        var plan = await PlanAsync(packet, descriptionAudio, ct).ConfigureAwait(false);
+        await WaitPlanAsync(plan, ct).ConfigureAwait(false);
+        RecordSent(plan);
+    }
+
+    private async Task<PlannedPacket> PlanAsync(HubPacket packet, AudioTrackInfo? descriptionAudio, CancellationToken ct)
+    {
         ct.ThrowIfCancellationRequested();
         var timing = await InitialReferenceAsync(ct).ConfigureAwait(false);
         long sourceTimestamp;
         long frequency;
+        double? encoderAge = null;
+        double? inputQueueAge = null;
         switch (packet)
         {
             case HubVideo video:
@@ -100,8 +218,8 @@ internal sealed class MatchedLowQualityPlayout(IStreamHub hub, HqPlayoutReferenc
                 if (video.ArrivalTimestamp is not { } published)
                     throw Failure("Matched LQ video lacks output arrival");
                 ValidateFrequency(video.ArrivalTimestampFrequency);
-                _lastEncoderAgeMs = (published - (double)sourceTimestamp) * 1000 / frequency;
-                _lastQueueAgeMs = (_clock.GetTimestamp() - (double)published) * 1000 / frequency;
+                encoderAge = (published - (double)sourceTimestamp) * 1000 / frequency;
+                inputQueueAge = (_clock.GetTimestamp() - (double)published) * 1000 / frequency;
                 break;
             case HubAudioAac audio:
                 if (audio.SourceEpoch != _lowEpoch || audio.ArrivalTimestamp == null)
@@ -142,38 +260,99 @@ internal sealed class MatchedLowQualityPlayout(IStreamHub hub, HqPlayoutReferenc
                 throw Failure("Matched LQ supports only video and original AAC");
         }
 
-        _lastDelayMs = timing.DelaySeconds * 1000;
         double due = sourceTimestamp + timing.DelaySeconds * frequency;
         double remaining = (due - _clock.GetTimestamp()) / frequency;
         if (remaining > HqPlayoutReference.MaximumDelaySeconds)
             throw Failure("Matched LQ wait exceeds its bound");
-        long began = _clock.GetTimestamp();
+        return new(packet, sourceTimestamp, frequency, due, timing, encoderAge, inputQueueAge);
+    }
+
+    private double Remaining(PlannedPacket packet) => (packet.Due - _clock.GetTimestamp()) / packet.Frequency;
+
+    private void VerifyPlan(PlannedPacket packet)
+    {
+        var current = CheckedReference();
+        if (current.SourceEpoch != packet.Timing.SourceEpoch || current.Generation != packet.Timing.Generation
+            || Math.Abs(current.DelaySeconds - packet.Timing.DelaySeconds) > MaximumLateSeconds)
+            throw Failure("Matched LQ HQ delay moved during its wait");
+    }
+
+    private async Task DelayAsync(double seconds, CancellationToken ct)
+    {
+        // Task.Delay truncates fractional milliseconds; never turn a positive
+        // remainder into a synchronous zero-ms wait or spin until a guard fires.
+        var delay = TimeSpan.FromMilliseconds(Math.Max(1, Math.Ceiling(seconds * 1000)));
+        if (_wait != null) await _wait(delay, ct).ConfigureAwait(false);
+        else await Task.Delay(delay, _clock, ct).ConfigureAwait(false);
+    }
+
+    private async Task WaitPlanAsync(PlannedPacket packet, CancellationToken ct)
+    {
         int waits = 0;
-        while (remaining > 0)
+        while (Remaining(packet) > 0)
         {
+            ct.ThrowIfCancellationRequested(); VerifyPlan(packet);
             if (++waits > 64) throw Failure("Matched LQ clock failed to advance");
-            // Task.Delay truncates fractional milliseconds. A positive sub-ms
-            // remainder would otherwise complete synchronously until the guard
-            // fires, even though the monotonic clock is working normally.
-            var delay = TimeSpan.FromMilliseconds(Math.Max(1, Math.Ceiling(remaining * 1000)));
-            if (_wait != null) await _wait(delay, ct).ConfigureAwait(false);
-            else await Task.Delay(delay, _clock, ct).ConfigureAwait(false);
-            ct.ThrowIfCancellationRequested();
-            var current = CheckedReference();
-            if (Math.Abs(current.DelaySeconds - timing.DelaySeconds) > MaximumLateSeconds)
-                throw Failure("Matched LQ HQ delay moved during its wait");
-            // Keep this packet's original deadline: a changing reference must not
-            // extend a queued packet indefinitely or silently replay an old source.
-            remaining = (due - _clock.GetTimestamp()) / frequency;
+            long began = _clock.GetTimestamp();
+            try { await DelayAsync(Remaining(packet), ct).ConfigureAwait(false); }
+            finally { _totalWaitMs += _clock.GetElapsedTime(began).TotalMilliseconds; }
         }
-        CheckedReference();
-        double late = (_clock.GetTimestamp() - due) / frequency;
+        ct.ThrowIfCancellationRequested(); VerifyPlan(packet);
+    }
+
+    private async Task<bool> WaitForInputOrDeadlineAsync(ChannelReader<HubPacket> reader, PlannedPacket packet, CancellationToken ct)
+    {
+        VerifyPlan(packet);
+        using var wake = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        Task<bool> input = reader.WaitToReadAsync(wake.Token).AsTask();
+        long began = _clock.GetTimestamp();
+        Task timer = DelayAsync(Remaining(packet), wake.Token);
+        bool completed = false, timerWon = false;
+        try
+        {
+            var winner = await Task.WhenAny(input, timer).ConfigureAwait(false);
+            if (winner == input) completed = !await input.ConfigureAwait(false);
+            else { await timer.ConfigureAwait(false); timerWon = true; }
+        }
+        finally
+        {
+            wake.Cancel();
+            // WhenAll observes both tasks even when one faults. Readiness never
+            // consumes a packet, including when it wins concurrently with the timer.
+            try { await Task.WhenAll(input, timer).ConfigureAwait(false); }
+            catch (OperationCanceledException) when (wake.IsCancellationRequested) { }
+            finally { _totalWaitMs += _clock.GetElapsedTime(began).TotalMilliseconds; }
+        }
+        ct.ThrowIfCancellationRequested(); VerifyPlan(packet);
+        if (timerWon && _clock.GetTimestamp() <= began)
+        {
+            if (++_unchangedTimerWakeups >= 64) throw Failure("Matched LQ clock failed to advance");
+        }
+        else _unchangedTimerWakeups = 0;
+        return completed;
+    }
+
+    private void VerifyDeadline(PlannedPacket packet)
+    {
+        VerifyPlan(packet);
+        double late = (_clock.GetTimestamp() - packet.Due) / packet.Frequency;
         _maximumLateMs = Math.Max(_maximumLateMs, late * 1000);
         if (late > MaximumLateSeconds)
             throw Failure("Matched LQ packet missed its HQ deadline");
-        _totalWaitMs += _clock.GetElapsedTime(began).TotalMilliseconds;
-        _lastDeliveredSourceAgeMs = (_clock.GetTimestamp() - (double)sourceTimestamp) * 1000 / frequency;
-        if (packet is HubVideo) _videoPackets++; else _audioPackets++;
+    }
+
+    private void RecordSent(PlannedPacket packet)
+    {
+        _lastDelayMs = packet.Timing.DelaySeconds * 1000;
+        _lastDeliveredSourceAgeMs = (_clock.GetTimestamp() - (double)packet.SourceTimestamp) * 1000 / packet.Frequency;
+        if (packet.EncoderAgeMs is { } encoderAge) _lastEncoderAgeMs = encoderAge;
+        // Input queue age excludes deliberate scheduling time, as on the former
+        // serial path; delivered source age above includes the actual delay.
+        if (packet.InputQueueAgeMs is { } inputQueueAge) _lastQueueAgeMs = inputQueueAge;
+        if (packet.Packet is HubVideo) _videoPackets++; else _audioPackets++;
+        // The production caller has already sent these bytes; retain the actual
+        // delivery metrics even if the send itself crossed the deadline.
+        VerifyDeadline(packet);
     }
 
     private void ValidateFrequency(long frequency)
@@ -200,6 +379,9 @@ internal sealed class MatchedLowQualityPlayout(IStreamHub hub, HqPlayoutReferenc
         maximumLateMs = _maximumLateMs, totalWaitMs = _totalWaitMs, maximumAllowedLateMs = MaximumLateSeconds * 1000,
         deliveredSourceAgeMs = _lastDeliveredSourceAgeMs, inputQueueAgeMs = _lastQueueAgeMs,
         initialReferenceWaitMs = _startupWaitMs,
+        pendingPackets = _pendingPackets, pendingBytes = _pendingBytes,
+        maximumPendingPackets = _maximumPendingPackets, maximumPendingBytes = _maximumPendingBytes,
+        pendingPacketLimit = MaxPendingPackets, pendingByteLimit = MaxPendingBytes,
         timeBasis = "source-arrival-estimate-and-original-aac-samples", captureSynchronizationVerified = false
     };
 }

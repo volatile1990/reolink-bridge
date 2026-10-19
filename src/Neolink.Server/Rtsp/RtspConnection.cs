@@ -953,13 +953,17 @@ internal sealed class RtspSession
             Log.Info($"{hub.Name}: RTSP GOP playout enabled, reserve={_mount.PlayoutDelayMs}ms ({(aacTimeline == null ? "video-only" : "original AAC; arrival-estimated synchronization")})");
         try
         {
+            if (matchedLow != null)
+            {
+                await PumpMatchedLowAsync(hub, reader, matchedLow, batch, ct).ConfigureAwait(false);
+                return;
+            }
             await foreach (var packet in reader.ReadAllAsync(ct).ConfigureAwait(false))
             {
                 bool gap = lastIndex >= 0 && packet.Index != lastIndex + 1;
                 lastIndex = packet.Index;
                 if (gap)
                 {
-                    if (matchedLow != null) throw new IOException("Matched low-quality subscriber lost packets; reconnect at a keyframe");
                     waitKeyframe = true;
                     playout?.Reset();
                     aacTimeline?.Reset(hub.SourceEpoch);
@@ -1039,11 +1043,6 @@ internal sealed class RtspSession
                             if (aacTimeline != null) _conn.Server.ObserveGopAac(Id, aacTimeline.Diagnostics);
                             continue;
                         }
-                        if (matchedLow != null)
-                        {
-                            await matchedLow.WaitAsync(v, _description.Audio, ct).ConfigureAwait(false);
-                            _conn.Server.ObserveMatchedLow(Id, matchedLow.Diagnostics());
-                        }
                         await SendVideoAsync(hub, v.AnnexB, v.Keyframe, v.HasSps, v.RtpTs, batch, ct).ConfigureAwait(false);
                         break;
                     }
@@ -1052,7 +1051,6 @@ internal sealed class RtspSession
                     // skipped; on an original session it's the exact opposite. Both
                     // kinds flow through the hub side by side.
                     case HubAudioOpus o when Audio != null && _opus:
-                        if (matchedLow != null) throw new IOException("Matched low-quality requires original AAC");
                         await SendAsync(Audio, Audio.Packetizer.PacketizeOpus(o.Packet, o.RtpTs), ct).ConfigureAwait(false);
                         break;
                     case HubAudioAac a when Audio != null && !_opus:
@@ -1065,16 +1063,9 @@ internal sealed class RtspSession
                                 throw new IOException("GOP AAC source format changed; reconnect for current SDP");
                             aacTimeline.Push(a); break;
                         }
-                        if (matchedLow != null)
-                        {
-                            if (Video != null && waitKeyframe) break;
-                            await matchedLow.WaitAsync(a, _description.Audio, ct).ConfigureAwait(false);
-                            _conn.Server.ObserveMatchedLow(Id, matchedLow.Diagnostics());
-                        }
                         await SendAsync(Audio, Audio.Packetizer.PacketizeAac(a.Au, a.RtpTs), ct).ConfigureAwait(false);
                         break;
                     case HubAudioPcm p when Audio != null && !_opus:
-                        if (matchedLow != null) throw new IOException("Matched low-quality requires original AAC");
                         if (!RtspConnection.SameAudio(_description.Audio, hub.Audio))
                             throw new IOException("RTSP audio source format changed; reconnect for current SDP");
                         if (aacTimeline != null) throw new IOException("GOP AAC source changed to PCM; reconnect for current SDP");
@@ -1104,6 +1095,32 @@ internal sealed class RtspSession
             if (_opus) hub.ReleaseOpus();
             watch.Dispose();
             Log.Info($"{hub.Name}: client stopped streaming (session {Id})");
+        }
+    }
+
+    private async Task PumpMatchedLowAsync(IStreamHub hub, System.Threading.Channels.ChannelReader<HubPacket> reader,
+        MatchedLowQualityPlayout playout, RtpBatch batch, CancellationToken ct)
+    {
+        if (_opus) throw new IOException("Matched low-quality requires original AAC");
+        await foreach (var packet in playout.ReadAsync(reader, Audio != null ? _description.Audio : null,
+            ct, videoEnabled: Video != null).ConfigureAwait(false))
+        {
+            switch (packet)
+            {
+                case HubVideo video when Video != null:
+                    await SendVideoAsync(hub, video.AnnexB, video.Keyframe, video.HasSps,
+                        video.RtpTs, batch, ct).ConfigureAwait(false);
+                    break;
+                case HubAudioAac audio when Audio != null:
+                    if (!RtspConnection.SameAudio(_description.Audio, hub.Audio))
+                        throw new IOException("RTSP audio source format changed; reconnect for current SDP");
+                    await SendAsync(Audio, Audio.Packetizer.PacketizeAac(audio.Au, audio.RtpTs), ct).ConfigureAwait(false);
+                    break;
+                default:
+                    throw new IOException("Matched low-quality yielded an unrequested track");
+            }
+            playout.MarkSent(packet);
+            _conn.Server.ObserveMatchedLow(Id, playout.Diagnostics());
         }
     }
 
