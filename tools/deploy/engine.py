@@ -66,9 +66,54 @@ def host_config(entry):
     return result
 
 
+FRAMEWORK_ENV = ("DOTNET_VERSION", "ASPNET_VERSION")
+
+
+def environment(values):
+    """Docker environment entries are a mapping; ambiguous duplicates fail closed."""
+    need(values is None or isinstance(values, list), "environment_invalid")
+    result = {}
+    for item in values or []:
+        need(isinstance(item, str) and "=" in item and "\0" not in item, "environment_invalid")
+        key, value = item.split("=", 1)
+        need(key and key not in result, "environment_key_invalid_or_duplicate")
+        result[key] = value
+    return result
+
+
+def image_environment(before, after, rollback=False):
+    old, new = environment(before.get("Env")), environment(after.get("Env"))
+    need(set(old) == set(new), "image_default_drift_Env")
+    changed = {key for key in old if old[key] != new[key]}
+    if changed:
+        need(changed == set(FRAMEWORK_ENV), "image_default_drift_Env")
+        pattern = r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)"
+        versions = []
+        for values in (old, new):
+            need(all(re.fullmatch(pattern, values[key]) for key in FRAMEWORK_ENV)
+                 and values[FRAMEWORK_ENV[0]] == values[FRAMEWORK_ENV[1]], "image_default_drift_Env")
+            versions.append(tuple(int(part) for part in values[FRAMEWORK_ENV[0]].split(".")))
+        need(versions[0][:2] == versions[1][:2]
+             and (rollback or versions[1][2] > versions[0][2]), "image_default_drift_Env")
+    return old, new
+
+
+def expected_environment(entry, before, after, rollback=False):
+    old, new = image_environment(before, after, rollback=rollback)
+    expected = environment(entry["inspect"]["Config"].get("Env"))
+    explicit = entry["resolved"]["services"][entry["service"]].get("environment") or {}
+    need(isinstance(explicit, dict), "compose_environment_mapping_required")
+    for key in FRAMEWORK_ENV:
+        if old.get(key) != new.get(key) and key not in explicit:
+            need(key in expected and expected[key] == old[key], "framework_environment_not_inherited")
+            expected[key] = new[key]
+    return expected
+
+
 def runtime(entry):
     result = copy.deepcopy(entry["inspect"]["Config"])
     result.pop("Image", None)
+    result["Env"] = environment(result.get("Env"))
     if result.get("Hostname") == entry["id"][:12]:
         result.pop("Hostname")
     labels = result.setdefault("Labels", {})
@@ -106,12 +151,17 @@ def preserve(before, after, ip, compose_bytes, image_ref, image_id, image_lookup
             need(runtime(previous) == runtime(current), "unrelated_runtime_drift")
         else:
             old_runtime, new_runtime = runtime(previous), runtime(current)
+            old_image = image_lookup(previous["imageId"])["Config"]
+            new_image = image_lookup(image_id)["Config"]
+            # The caller already checked immutable target IDs and, for rollback,
+            # the original receipt. Only inherited framework patch metadata moves.
+            old_runtime["Env"] = expected_environment(previous, old_image, new_image, rollback=True)
             labels = old_runtime["Labels"]
             explicit = previous["resolved"]["services"][previous["service"]].get("labels", {})
-            for key, value in (image_lookup(previous["imageId"])["Config"].get("Labels") or {}).items():
+            for key, value in (old_image.get("Labels") or {}).items():
                 if key not in explicit and labels.get(key) == value:
                     labels.pop(key)
-            for key, value in (image_lookup(image_id)["Config"].get("Labels") or {}).items():
+            for key, value in (new_image.get("Labels") or {}).items():
                 if key not in explicit:
                     labels[key] = value
             need(old_runtime == new_runtime, "runtime_defaults_drift")
@@ -173,7 +223,8 @@ class DeployEngine:
             need(entry["imageRef"] != frozen["imageTag"] or entry["imageId"] == frozen["imageId"], "release_tag_reuses_running_image_reference")
             need(self.backend.image(entry["imageRef"])["Id"] == entry["imageId"], "original_image_tag_drift")
             old = self.backend.image(entry["imageId"])["Config"]
-            for key in ("Env", "User", "Entrypoint", "Cmd", "WorkingDir", "Healthcheck", "ExposedPorts", "Volumes", "StopSignal"):
+            expected_environment(entry, old, production)
+            for key in ("User", "Entrypoint", "Cmd", "WorkingDir", "Healthcheck", "ExposedPorts", "Volumes", "StopSignal"):
                 need(old.get(key) == production.get(key), "image_default_drift_" + key)
             self.backend.sample(entry)
         baseline = self.backend.create_receipt("plan")

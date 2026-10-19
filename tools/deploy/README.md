@@ -76,6 +76,15 @@ container hostname and known Compose lifecycle labels are normalized; complete
 runtime/HostConfig checks remain strict. Main source failures are never repaired
 by changing camera settings, and no implicit software fallback is introduced.
 
+Image environment entries are compared as unique key/value mappings; malformed
+entries and duplicate keys are refused. The only permitted value change is a
+matching `DOTNET_VERSION` / `ASPNET_VERSION` patch upgrade within the same major
+and minor version. All other environment keys/values and image defaults remain
+exact. Runtime expectations update only values proven inherited from the old
+image; explicit Compose environment overrides stay unchanged even when they
+equal that old default. A verified receipt rollback may restore the original
+framework patch pair; planning a downgrade is refused.
+
 `build` accepts `sourceManifest` (`version`, `sourceRevision`, `sourceSha256`,
 `sourceFiles`, `sourceDirty: false`, `canonicalLineEndings: true`),
 `archiveSha256` and `archiveBase64`. Optional `imageTag` defaults to

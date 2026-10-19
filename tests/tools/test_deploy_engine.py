@@ -123,6 +123,15 @@ class MemoryNas:
             self.stop_rollback_ip = None
             raise engine.GuardError("synthetic_recreate_interruption")
         new_id = self.tags[new_tag]
+        old_env = dict(value.split("=", 1) for value in self.image(entry["imageId"])["Config"].get("Env") or [])
+        new_env = dict(value.split("=", 1) for value in self.image(new_id)["Config"].get("Env") or [])
+        actual = dict(value.split("=", 1) for value in entry["inspect"]["Config"].get("Env") or [])
+        explicit = json.loads(self.compose_bytes)["services"][entry["service"]].get("environment") or {}
+        for key, value in old_env.items():
+            if key not in explicit and key in actual and actual[key] == value:
+                if key in new_env: actual[key] = new_env[key]
+                else: actual.pop(key)
+        entry["inspect"]["Config"]["Env"] = [key + "=" + value for key, value in actual.items()]
         self.container_counter += 1
         ident = hashlib.sha256((entry["ip"] + str(self.container_counter)).encode()).hexdigest()
         entry.update(id=ident, imageId=new_id, imageRef=new_tag)
@@ -172,6 +181,109 @@ class DeployTests(unittest.TestCase):
         for ip in IPS:
             self.assertTrue(self.apply_next(plan["baseline"], ip)["ok"])
         return plan["baseline"]
+
+    def framework_patch(self, old="10.0.12", new="10.0.13"):
+        for image_id, version in ((OLD_ID, old), (NEW_ID, new)):
+            self.nas.images[image_id]["Config"]["Env"].extend(key + "=" + version for key in engine.FRAMEWORK_ENV)
+        for entry in self.nas.entries:
+            entry["inspect"]["Config"]["Env"].extend(key + "=" + old for key in engine.FRAMEWORK_ENV)
+
+    def test_framework_patch_plan_is_readonly_and_environment_order_is_semantic(self):
+        self.framework_patch(); self.nas.images[NEW_ID]["Config"]["Env"].reverse()
+        before, configs = self.nas.inventory(), dict(self.nas.configs)
+        plan = self.planned()
+        self.assertEqual(before, self.nas.inventory()); self.assertEqual(configs, self.nas.configs)
+        self.assertFalse(self.nas.recreated); self.assertNotIn(SECRET, json.dumps(plan))
+
+    def test_framework_patch_apply_and_receipted_rollback_restore_versions(self):
+        self.framework_patch(); before = self.nas.inventory(); plan = self.planned()
+        applied = self.apply_next(plan["baseline"], IPS[0]); self.assertTrue(applied["ok"])
+        current = self.nas.inventory()
+        for key in engine.FRAMEWORK_ENV:
+            self.assertEqual(engine.environment(current[0]["inspect"]["Config"]["Env"])[key], "10.0.13")
+        self.assertEqual(current[1:], [dict(entry, composeSha256=current[1]["composeSha256"], resolved=current[1]["resolved"]) for entry in before[1:]])
+        restored = self.deploy.rollback({"baseline": plan["baseline"], "release": RELEASE,
+            "receipt": applied["receipt"], "expected": engine.projected(current)})
+        self.assertTrue(restored["rollbackRestored"])
+        for key in engine.FRAMEWORK_ENV:
+            self.assertEqual(engine.environment(self.nas.inventory()[0]["inspect"]["Config"]["Env"])[key], "10.0.12")
+        self.assertNotIn(SECRET, json.dumps([applied, restored]))
+
+    def test_framework_patch_failed_apply_restores_and_prefix_rollback_is_supported(self):
+        self.framework_patch(); plan = self.planned(); self.nas.fail_new = IPS[0]
+        failed = self.apply_next(plan["baseline"], IPS[0])
+        self.assertFalse(failed["ok"]); self.assertTrue(failed["rollbackRestored"])
+        self.nas.fail_new = None
+        for ip in IPS[:2]: self.assertTrue(self.apply_next(plan["baseline"], ip)["ok"])
+        result = self.deploy.rollback_all({"baseline": plan["baseline"], "release": RELEASE,
+            "expected": engine.projected(self.nas.inventory())})
+        self.assertTrue(result["allPreviousImagesRestored"])
+        for entry in self.nas.inventory():
+            for key in engine.FRAMEWORK_ENV:
+                self.assertEqual(engine.environment(entry["inspect"]["Config"]["Env"])[key], "10.0.12")
+
+    def test_framework_patch_explicit_override_equal_to_old_default_stays_exact(self):
+        for override in engine.FRAMEWORK_ENV:
+            with self.subTest(override=override):
+                self.setUp(); self.framework_patch()
+                compose = json.loads(self.nas.compose_bytes)
+                for service in compose["services"].values(): service["environment"] = {override: "10.0.12"}
+                self.nas.compose_bytes = engine.encoded(compose)
+                plan = self.planned(); self.assertTrue(self.apply_next(plan["baseline"], IPS[0])["ok"])
+                before, after = self.nas.inventory(), self.nas.inventory()
+                values = engine.environment(after[0]["inspect"]["Config"]["Env"])
+                self.assertEqual(values[override], "10.0.12")
+                self.assertEqual(values[next(key for key in engine.FRAMEWORK_ENV if key != override)], "10.0.13")
+                after[0]["inspect"]["Config"]["Env"] = [key + "=" + ("10.0.13" if key == override else value) for key, value in values.items()]
+                with self.assertRaisesRegex(engine.GuardError, "runtime_defaults_drift"):
+                    engine.preserve(before, after, IPS[0], self.nas.read_compose(), NEW_TAG, NEW_ID, self.nas.image)
+
+    def test_framework_patch_plan_rejects_every_other_environment_or_version_change(self):
+        def replace(values, key, value):
+            return [key + "=" + value if item.startswith(key + "=") else item for item in values]
+        cases = {
+            "unknown_key": lambda values: values + ["UNEXPECTED=1"],
+            "unknown_value": lambda values: replace(values, "DOTNET_RUNNING_IN_CONTAINER", "false"),
+            "missing_key": lambda values: values[1:],
+            "unpaired_version": lambda values: replace(values, "DOTNET_VERSION", "10.0.12"),
+            "major": lambda values: [replace([item], item.split("=", 1)[0], "11.0.13")[0] if item.split("=", 1)[0] in engine.FRAMEWORK_ENV else item for item in values],
+            "minor": lambda values: [replace([item], item.split("=", 1)[0], "10.1.13")[0] if item.split("=", 1)[0] in engine.FRAMEWORK_ENV else item for item in values],
+            "downgrade": lambda values: [replace([item], item.split("=", 1)[0], "10.0.11")[0] if item.split("=", 1)[0] in engine.FRAMEWORK_ENV else item for item in values],
+            "prerelease": lambda values: replace(values, "ASPNET_VERSION", "10.0.13-preview.1"),
+            "malformed": lambda values: replace(values, "DOTNET_VERSION", "010.0.13"),
+            "duplicate": lambda values: values + ["DOTNET_VERSION=10.0.13"],
+            "duplicate_other": lambda values: values + ["DOTNET_RUNNING_IN_CONTAINER=true"],
+            "no_equals": lambda values: values + ["BROKEN"],
+            "empty_key": lambda values: values + ["=value"],
+            "nul": lambda values: values + ["BROKEN=\0"],
+            "non_string": lambda values: values + [None],
+            "not_array": lambda values: {"DOTNET_VERSION": "10.0.13"},
+        }
+        for name, mutate in cases.items():
+            with self.subTest(case=name):
+                self.setUp(); self.framework_patch(); configs = dict(self.nas.configs)
+                self.nas.images[NEW_ID]["Config"]["Env"] = mutate(self.nas.images[NEW_ID]["Config"]["Env"])
+                with self.assertRaises(engine.GuardError): self.planned()
+                self.assertFalse(self.nas.recreated); self.assertEqual(self.nas.receipt_counter, 0)
+                self.assertEqual(configs, self.nas.configs)
+
+    def test_framework_patch_refuses_unproven_inheritance_and_duplicate_runtime(self):
+        self.framework_patch()
+        for env in (["DOTNET_VERSION=unknown", "ASPNET_VERSION=10.0.12"],
+                    ["DOTNET_VERSION=10.0.12", "DOTNET_VERSION=10.0.12", "ASPNET_VERSION=10.0.12"]):
+            with self.subTest(environment_shape=len(env)):
+                self.nas.entries[0]["inspect"]["Config"]["Env"] = env
+                with self.assertRaises(engine.GuardError): self.planned()
+                self.assertFalse(self.nas.recreated); self.assertEqual(self.nas.receipt_counter, 0)
+
+    def test_empty_environment_and_permutations_have_unambiguous_mapping_semantics(self):
+        self.assertEqual(engine.environment(None), {}); self.assertEqual(engine.environment([]), {})
+        self.assertEqual(engine.image_environment({"Env": None}, {"Env": []}), ({}, {}))
+        self.assertEqual(engine.environment(["A=a=b", "B="]), {"A": "a=b", "B": ""})
+        self.nas.images[NEW_ID]["Config"]["Env"].reverse(); self.planned()
+        before, after = self.nas.inventory(), self.nas.inventory()
+        before[0]["inspect"]["Config"]["Env"] = None; after[0]["inspect"]["Config"]["Env"] = []
+        engine.preserve(before, after, IPS[0], self.nas.read_compose(), OLD_TAG, OLD_ID, self.nas.image)
 
     def test_release_valid(self):
         self.assertEqual(self.deploy.release(RELEASE)["version"], "1.4.0")
