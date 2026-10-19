@@ -426,6 +426,265 @@ internal static class LowQualityAlignmentTests
         ownerWait.Release();
         await RejectAsync(() => ownerChanged, "a queued LQ picture crossed an HQ timing generation change");
         await ScheduledReaderBoundsAndDiscontinuities();
+        await InitialCachedGopResynchronizesBeforeFirstSend();
+        await StartupBudgetIncludesReferenceAndChannelWait();
+        await StartupResynchronizationPreservesFatalBoundaries();
+    }
+
+    private static async Task InitialCachedGopResynchronizesBeforeFirstSend()
+    {
+        var clock = new ManualTimeProvider(); var main = Hub("startup-main", clock); var low = Hub("startup-low", clock);
+        low.PublishAac(new AacFrame([0xff, 0xf1, 0x60, 0x40, 0x01, 0x9f, 0xfc, 1, 2, 3, 4, 5]));
+        clock.AdvanceTimestampTicks(1_000_000); var reference = new HqPlayoutReference(main, clock);
+        var input = Channel.CreateUnbounded<HubPacket>();
+        var oldKey = Video(0, 0, 200_000); var oldAudio = Aac(1, 64_000);
+        input.Writer.TryWrite(oldKey); input.Writer.TryWrite(oldAudio);
+        input.Writer.TryWrite(Video(2, 50_000, 250_000, key: false)); input.Writer.TryWrite(Aac(3, 128_000));
+        var freshKey = Video(4, 2_450_000, 2_558_000);
+        var freshAudio = Aac(5, 2_514_000) with { RtpTs = uint.MaxValue - 511 };
+        int calls = 0;
+        Task Wait(TimeSpan delay, CancellationToken ct)
+        {
+            ct.ThrowIfCancellationRequested();
+            if (++calls == 1)
+            {
+                // Reproduce a cached initial GOP becoming obsolete while the
+                // first HQ reference takes1.558s to become available.
+                clock.AdvanceTimestampTicks(1_558_000);
+                main.PublishVideo(Key()); low.PublishVideo(Key());
+                Check(Observe(reference, "hq", main.SourceEpoch, 0, 1_000_000, 2_000_000, 1_000_000), "late initial HQ reference unavailable");
+                input.Writer.TryWrite(freshKey); input.Writer.TryWrite(freshAudio); input.Writer.Complete();
+            }
+            else
+            {
+                clock.Advance(delay);
+            }
+            return Task.CompletedTask;
+        }
+        var playout = new MatchedLowQualityPlayout(low, reference, clock, Wait);
+        var sender = new LowQualityRtpSenderClock(low, clock);
+        var delivered = new List<HubPacket>();
+        await foreach (var packet in playout.ReadAsync(input.Reader, low.Audio, CancellationToken.None))
+        {
+            Check(!ReferenceEquals(packet, oldKey) && !ReferenceEquals(packet, oldAudio)
+                && packet.Index >= 4, "startup resynchronization emitted an obsolete cached GOP or its AAC");
+            delivered.Add(packet); var confirmed = playout.MarkSent(packet);
+            Check(sender.ObserveMatchedSent(packet, confirmed), "fresh post-resync matched anchor rejected");
+            if (packet is HubVideo)
+                Check(!sender.TryGetReport(true, true, out _), "discarded AAC incorrectly survived as a confirmed report anchor");
+        }
+        Check(delivered.Count == 2 && ReferenceEquals(delivered[0], freshKey) && ReferenceEquals(delivered[1], freshAudio),
+            "initial obsolete-GOP recovery lost the fresh keyframe/AAC or changed packet references");
+        Check(sender.TryGetReport(true, true, out var report), "fresh keyframe and AAC failed to establish paired sender clock after initial resync");
+        double elapsed = (report.UtcTimestamp - DateTimeOffset.UnixEpoch).TotalSeconds;
+        Near(elapsed - unchecked(report.VideoRtpTimestamp!.Value - freshKey.RtpTs) / 90000d, 3.45,
+            "post-resync video report retained obsolete startup presentation");
+        Check(Math.Abs(elapsed - unchecked(report.AudioRtpTimestamp!.Value - freshAudio.RtpTs) / 16000d - 3.514) < .00007,
+            "post-resync AAC report retained discarded sample phase");
+        var diagnostics = System.Text.Json.JsonSerializer.SerializeToNode(playout.Diagnostics())!;
+        Check(diagnostics["videoPackets"]!.GetValue<long>() == 1 && diagnostics["audioPackets"]!.GetValue<long>() == 1
+            && diagnostics["pendingPackets"]!.GetValue<int>() == 0 && diagnostics["pendingBytes"]!.GetValue<long>() == 0
+            && diagnostics["pendingPacketLimit"]!.GetValue<int>() == 512 && diagnostics["pendingByteLimit"]!.GetValue<int>() == 6 * 1024 * 1024,
+            "startup discard counted unsent media or changed/retained pending queue bounds");
+        Check(diagnostics["maximumPendingPackets"]!.GetValue<int>() >= 1 && diagnostics["startupDiscardedGops"]!.GetValue<long>() == 1
+            && diagnostics["startupDiscardedPackets"]!.GetValue<long>() >= 1
+            && diagnostics["maximumStartupDiscardLateMs"]!.GetValue<double>() > 250,
+            "startup discard reset high-water history or was not counted separately from failures");
+    }
+
+    private static async Task StartupBudgetIncludesReferenceAndChannelWait()
+    {
+        foreach (bool delayedReference in new[] { false, true })
+        {
+            var clock = new StartupTimeProvider(); var main = StartupHub("startup-budget-main", clock); var low = StartupHub("startup-budget-low", clock);
+            clock.AdvanceTimestampTicks(1_000_000); var reference = new HqPlayoutReference(main, clock);
+            long started = clock.GetTimestamp(); var input = Channel.CreateUnbounded<HubPacket>();
+            if (delayedReference) input.Writer.TryWrite(Video(0, 0, 200_000));
+            else
+            {
+                Check(Observe(reference, "hq", main.SourceEpoch, 0, 1_000_000, 2_000_000, 1_000_000), "budget HQ reference unavailable");
+                input.Writer.TryWrite(Video(0, 0, 200_000, key: false)); // No usable initial keyframe.
+            }
+            Task Wait(TimeSpan delay, CancellationToken ct)
+            {
+                ct.ThrowIfCancellationRequested(); clock.Advance(delay); main.PublishVideo(Key()); low.PublishVideo(Key());
+                if (delayedReference && clock.GetElapsedTime(started).TotalSeconds >= 3)
+                    Check(Observe(reference, "hq", main.SourceEpoch, clock.GetTimestamp() - 2_000_000,
+                        1_000_000, clock.GetTimestamp(), 1_000_000), "delayed budget HQ reference unavailable");
+                return Task.CompletedTask;
+            }
+            var playout = new MatchedLowQualityPlayout(low, reference, clock, Wait);
+            using var stop = new CancellationTokenSource();
+            async Task Drain()
+            { await foreach (var packet in playout.ReadAsync(input.Reader, null, stop.Token)) throw new Exception("missing-key startup emitted a packet"); }
+            Task pending = Drain();
+            try
+            {
+                long deadline = await clock.NextTimerDeadline();
+                Check(deadline == started + 8_000_000, "channel wait restarted the overall eight-second deadline after initial HQ acquisition");
+                while (clock.GetTimestamp() < deadline)
+                {
+                    clock.AdvanceTimestampTicks(Math.Min(1_000_000, deadline - clock.GetTimestamp()));
+                    main.PublishVideo(Key()); low.PublishVideo(Key());
+                }
+                await RejectAsync(() => pending.WaitAsync(TimeSpan.FromSeconds(3)), "startup channel/key wait escaped the total eight-second budget");
+            }
+            finally { stop.Cancel(); try { await pending.WaitAsync(TimeSpan.FromSeconds(1)); } catch (OperationCanceledException) { } catch (InvalidDataException) { } }
+            Check(clock.GetElapsedTime(started).TotalSeconds is >= 7.99 and <= 8.05,
+                "startup reset its eight-second budget after the initial HQ wait or while awaiting a new keyframe");
+        }
+        foreach (bool completeInput in new[] { false, true })
+        {
+            var clock = new ManualTimeProvider(); var main = Hub("startup-long-main", clock); var low = Hub("startup-long-low", clock);
+            var reference = new HqPlayoutReference(main, clock);
+            Check(Observe(reference, "hq", main.SourceEpoch, 0, 1_000_000, 9_000_000, 1_000_000), "long startup reference unavailable");
+            var input = Channel.CreateUnbounded<HubPacket>(); input.Writer.TryWrite(Video(0, 0, 0));
+            if (completeInput) input.Writer.Complete();
+            int waits = 0;
+            Task Wait(TimeSpan delay, CancellationToken ct)
+            {
+                ct.ThrowIfCancellationRequested(); waits++;
+                // Completed input first wins the readiness/timer race. Its
+                // cancelled timer must not advance the synthetic clock.
+                if (completeInput && waits == 1) return Task.Delay(Timeout.InfiniteTimeSpan, ct);
+                clock.Advance(delay); main.PublishVideo(Key()); low.PublishVideo(Key()); return Task.CompletedTask;
+            }
+            var playout = new MatchedLowQualityPlayout(low, reference, clock, Wait);
+            using var stop = new CancellationTokenSource();
+            async Task Drain()
+            { await foreach (var packet in playout.ReadAsync(input.Reader, null, stop.Token)) throw new Exception("nine-second presentation escaped startup timeout"); }
+            Task pending = Drain();
+            try { await RejectAsync(() => pending.WaitAsync(TimeSpan.FromSeconds(3)), "initial presentation wait escaped total startup budget"); }
+            finally { stop.Cancel(); try { await pending.WaitAsync(TimeSpan.FromSeconds(1)); } catch (OperationCanceledException) { } catch (InvalidDataException) { } }
+            Check(clock.GetTimestamp() == 8_000_000 && waits == (completeInput ? 2 : 1),
+                "initial planned-packet wait used its full nine-second HQ delay instead of the eight-second total budget");
+        }
+    }
+
+    private static StreamHub StartupHub(string name, TimeProvider clock)
+    { var hub = new StreamHub(name, clock); hub.PublishInfo(new MediaInfo(672, 384, 20)); hub.PublishVideo(Key()); return hub; }
+
+    // Deterministic TimeProvider timer support for the actual empty-channel
+    // WaitAsync(timeout, clock, ct) path; no wall-clock sleeps or product seams.
+    private sealed class StartupTimeProvider : TimeProvider
+    {
+        private readonly object _gate = new();
+        private readonly List<ClockTimer> _active = new();
+        private readonly Channel<ClockTimer> _created = Channel.CreateUnbounded<ClockTimer>();
+        private long _timestamp;
+        public override long TimestampFrequency => 1_000_000;
+        public override long GetTimestamp() => Interlocked.Read(ref _timestamp);
+        public int ActiveTimerCount { get { lock (_gate) return _active.Count; } }
+        public override DateTimeOffset GetUtcNow() => DateTimeOffset.UnixEpoch + TimeSpan.FromTicks(GetTimestamp() * 10);
+        public void Advance(TimeSpan delay) => AdvanceTimestampTicks((long)Math.Ceiling(delay.TotalSeconds * TimestampFrequency));
+        public void AdvanceTimestampTicks(long ticks)
+        {
+            Check(ticks >= 0, "startup test clock moved backwards"); List<ClockTimer> due;
+            lock (_gate)
+            {
+                Interlocked.Add(ref _timestamp, ticks);
+                due = _active.Where(t => !t.Disposed && t.Due <= _timestamp).ToList();
+                foreach (var timer in due) _active.Remove(timer);
+            }
+            foreach (var timer in due) timer.Fire();
+        }
+        public override ITimer CreateTimer(TimerCallback callback, object? state, TimeSpan dueTime, TimeSpan period)
+        { var timer = new ClockTimer(this, callback, state); timer.Change(dueTime, period); return timer; }
+        public async Task<long> NextTimerDeadline()
+        {
+            while (true)
+            { var timer = await _created.Reader.ReadAsync().AsTask().WaitAsync(TimeSpan.FromSeconds(3)); if (!timer.Disposed) return timer.Due; }
+        }
+        public async Task AwaitTimerDisposal()
+        {
+            Task[] disposed;
+            lock (_gate) disposed = _active.Select(timer => timer.Disposal.Task).ToArray();
+            // Task.WaitAsync may run its completed consumer continuation before
+            // its own Cleanup disposes the TimeProvider timer. Observe that
+            // disposal explicitly instead of racing framework cleanup order.
+            await Task.WhenAll(disposed).WaitAsync(TimeSpan.FromSeconds(2));
+        }
+        private sealed class ClockTimer(StartupTimeProvider owner, TimerCallback callback, object? state) : ITimer
+        {
+            public bool Disposed { get; private set; }
+            public long Due { get; private set; }
+            public TaskCompletionSource Disposal { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+            public bool Change(TimeSpan dueTime, TimeSpan period)
+            {
+                Check(period == Timeout.InfiniteTimeSpan, "startup timeout unexpectedly requested a periodic timer");
+                lock (owner._gate)
+                {
+                    if (Disposed) return false; owner._active.Remove(this);
+                    Due = dueTime == Timeout.InfiniteTimeSpan ? long.MaxValue
+                        : owner.GetTimestamp() + (long)Math.Ceiling(dueTime.TotalSeconds * owner.TimestampFrequency);
+                    owner._active.Add(this); owner._created.Writer.TryWrite(this); return true;
+                }
+            }
+            public void Fire() { if (!Disposed) callback(state); }
+            public void Dispose() { lock (owner._gate) { Disposed = true; owner._active.Remove(this); Disposal.TrySetResult(); } }
+            public ValueTask DisposeAsync() { Dispose(); return ValueTask.CompletedTask; }
+        }
+    }
+
+    private static async Task StartupResynchronizationPreservesFatalBoundaries()
+    {
+        // A resync exception is startup-only: once the first packet was actually
+        // sent, the same late cached media must still close the session.
+        var clock = new ManualTimeProvider(); var main = Hub("started-late-main", clock); var low = Hub("started-late-low", clock);
+        clock.AdvanceTimestampTicks(2_000_000); var reference = new HqPlayoutReference(main, clock);
+        Check(Observe(reference, "hq", main.SourceEpoch, 0, 1_000_000, 2_000_000, 1_000_000), "started-late HQ reference unavailable");
+        var input = Channel.CreateUnbounded<HubPacket>(); input.Writer.TryWrite(Video(0, 1_000_000, 1_200_000));
+        Task Wait(TimeSpan delay, CancellationToken ct) { ct.ThrowIfCancellationRequested(); clock.Advance(delay); return Task.CompletedTask; }
+        var playout = new MatchedLowQualityPlayout(low, reference, clock, Wait);
+        using var stop = new CancellationTokenSource();
+        await using (var output = playout.ReadAsync(input.Reader, null, stop.Token).GetAsyncEnumerator())
+        {
+            Check(await output.MoveNextAsync(), "started-late initial keyframe missing"); playout.MarkSent(output.Current);
+            clock.AdvanceTimestampTicks(350_000); input.Writer.TryWrite(Video(1, 1_050_000, 1_250_000, key: false));
+            await RejectAsync(async () => { await output.MoveNextAsync(); }, "post-first-send lateness became a silent keyframe resync");
+        }
+        foreach (string failure in new[] { "index-gap", "low-epoch", "hq-generation", "cancel" })
+        {
+            var startupClock = new StartupTimeProvider(); var hq = StartupHub("resync-bound-main", startupClock);
+            var lq = StartupHub("resync-bound-low", startupClock); startupClock.AdvanceTimestampTicks(2_600_000);
+            var shared = new HqPlayoutReference(hq, startupClock);
+            Check(Observe(shared, "hq", hq.SourceEpoch, 0, 1_000_000, 2_000_000, 1_000_000), "resync-bound HQ reference unavailable");
+            var channel = Channel.CreateUnbounded<HubPacket>(); channel.Writer.TryWrite(Video(0, 0, 200_000));
+            var bound = new MatchedLowQualityPlayout(lq, shared, startupClock);
+            using var cancel = new CancellationTokenSource();
+            await using var reader = bound.ReadAsync(channel.Reader, null, cancel.Token).GetAsyncEnumerator();
+            Task<bool> next = reader.MoveNextAsync().AsTask();
+            try
+            {
+                await startupClock.NextTimerDeadline();
+                var before = System.Text.Json.JsonSerializer.SerializeToNode(bound.Diagnostics())!;
+                Check(before["startupDiscardedGops"]!.GetValue<long>() == 1, "fatal-boundary fixture did not actually enter startup resync");
+                if (failure == "cancel")
+                {
+                    cancel.Cancel(); bool observed = false;
+                    try { await next.WaitAsync(TimeSpan.FromSeconds(2)); } catch (OperationCanceledException) { observed = true; }
+                    Check(observed, "startup resync did not promptly cancel empty-channel wait");
+                }
+                else
+                {
+                    if (failure == "low-epoch") { lq.SourceStopped(); lq.PublishVideo(Key()); }
+                    if (failure == "hq-generation")
+                    {
+                        shared.Release("hq");
+                        Check(Observe(shared, "replacement", hq.SourceEpoch, 600_000, 1_000_000, 2_600_000, 1_000_000), "resync-bound replacement unavailable");
+                    }
+                    channel.Writer.TryWrite(Video(failure == "index-gap" ? 2 : 1, 2_600_000, 2_600_000, epoch: lq.SourceEpoch));
+                    await RejectAsync(async () => { await next.WaitAsync(TimeSpan.FromSeconds(2)); }, "startup resync hid fatal " + failure);
+                }
+                await startupClock.AwaitTimerDisposal();
+                Check(startupClock.ActiveTimerCount == 0, "completed/cancelled startup wait retained an active timeout timer");
+            }
+            finally
+            {
+                cancel.Cancel();
+                try { await next.WaitAsync(TimeSpan.FromSeconds(1)); } catch (OperationCanceledException) { } catch (InvalidDataException) { }
+            }
+        }
     }
 
     private static async Task ScheduledReaderBoundsAndDiscontinuities()
