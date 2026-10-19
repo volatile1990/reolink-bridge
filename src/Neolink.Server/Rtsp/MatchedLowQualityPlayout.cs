@@ -100,12 +100,13 @@ internal sealed class MatchedLowQualityPlayout(IStreamHub hub, HqPlayoutReferenc
         }
     }
 
-    public void MarkSent(HubPacket packet)
+    public LowQualityPlayoutAnchor MarkSent(HubPacket packet)
     {
         var ready = _readyPacket;
         if (ready == null || !ReferenceEquals(ready.Packet, packet))
             throw Failure("Matched LQ sent packet does not match its ready head");
         RecordSent(ready); _readyPacket = null;
+        return new(_lowEpoch, ready.Due, ready.Frequency);
     }
 
     private void Enqueue(PlannedPacket packet)

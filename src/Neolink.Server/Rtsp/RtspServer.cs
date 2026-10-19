@@ -56,6 +56,10 @@ public sealed class RtspMount
     /// <summary>Complete-GOP video-only output normalization; disabled for existing mounts.</summary>
     public bool GopPlayout { get; init; }
     public bool GopAudio { get; init; }
+    /// <summary>Source/presentation sender reports for explicit LQ original-AAC mounts only.</summary>
+    public bool LowQualitySenderReports { get; init; }
+    /// <summary>Encoded LQ cannot substitute output publication time for missing input provenance.</summary>
+    internal bool LowQualityRequiresSourceArrival { get; init; }
     internal bool GopAacAvailable => GopAudio && Hub is StreamHub actual && Hub.LiveVideo
         && Hub.GetVideoDiagnostics().LastVideoAgeMs is >= 0 and <= 5000
         && actual.AudioMetadataSourceEpoch == Hub.SourceEpoch && actual.LastAudioAgeMs is >= 0 and <= 5000
@@ -68,6 +72,8 @@ public sealed class RtspMount
     internal HqPlayoutReference? MatchHqTiming { get; init; }
     internal bool SameMediaPolicy(RtspMount other) => ReferenceEquals(Hub, other.Hub)
         && GopPlayout == other.GopPlayout && GopAudio == other.GopAudio
+        && LowQualitySenderReports == other.LowQualitySenderReports
+        && LowQualityRequiresSourceArrival == other.LowQualityRequiresSourceArrival
         && PlayoutDelayMs == other.PlayoutDelayMs && Opus == other.Opus
         && ReferenceEquals(PublishHqTiming, other.PublishHqTiming)
         && ReferenceEquals(MatchHqTiming, other.MatchHqTiming);
@@ -110,13 +116,22 @@ public sealed class RtspServer
         if (completed) { _matchedLowSessions.TryRemove(session, out _); _lastMatchedLowSession = value; }
         else _matchedLowSessions[session] = value;
     }
+    private readonly ConcurrentDictionary<string, object> _lowSenderReports = new();
+    private object? _lastLowSenderReport;
+    internal void ObserveLowSenderReports(string session, object value, bool completed = false)
+    {
+        if (completed) { _lowSenderReports.TryRemove(session, out _); _lastLowSenderReport = value; }
+        else _lowSenderReports[session] = value;
+    }
     public object LowQualityTimingDiagnostics() => new
     {
         timeBasis = "source-arrival-estimate-and-observed-hq-presentation", captureSynchronizationVerified = false,
         references = _mounts.Values.Select(m => m.PublishHqTiming).OfType<HqPlayoutReference>()
             .Distinct().Select(reference => reference.Diagnostics()).ToArray(),
         activeSessions = _matchedLowSessions.Count, sessions = _matchedLowSessions.Values.ToArray(),
-        lastCompleted = _lastMatchedLowSession
+        lastCompleted = _lastMatchedLowSession,
+        senderReports = new { activeSessions = _lowSenderReports.Count,
+            sessions = _lowSenderReports.Values.ToArray(), lastCompleted = _lastLowSenderReport }
     };
 
     public RtspServer(IReadOnlyDictionary<string, string> users)

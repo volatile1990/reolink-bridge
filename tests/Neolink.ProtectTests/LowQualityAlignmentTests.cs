@@ -85,6 +85,16 @@ internal static class LowQualityAlignmentTests
         ProtectBridgeHost.AddRtspMounts(server, "synthetic", main, permitted, true, 0, lowHub: low, gopAudio: true, lowQualityMatchHqDelay: true);
         var canonical = server.FindMount("/synthetic/mainStream")!; var alias = server.FindMount("/synthetic")!;
         var matched = server.FindMount("/synthetic/subStream")!; var direct = server.FindMount("/synthetic/subStream/direct")!;
+        Check(matched.LowQualitySenderReports && direct.LowQualitySenderReports
+            && !canonical.LowQualitySenderReports && !alias.LowQualitySenderReports,
+            "sender-report clock binding escaped the explicit low-quality mounts");
+        Check(!matched.LowQualityRequiresSourceArrival && !direct.LowQualityRequiresSourceArrival,
+            "native low-quality mounts unexpectedly require encoder provenance");
+        var encoded = new RtspServer(new Dictionary<string, string> { ["u"] = "p" });
+        ProtectBridgeHost.AddRtspMounts(encoded, "encoded", main, permitted, false, 0, lowHub: low, lowQualityEncoded: true);
+        Check(encoded.FindMount("/encoded/subStream")!.LowQualityRequiresSourceArrival
+            && encoded.FindMount("/encoded/subStream/direct")!.LowQualityRequiresSourceArrival,
+            "encoded low-quality aliases can silently substitute output arrival for source provenance");
         Check(ReferenceEquals(canonical.Hub, main) && ReferenceEquals(alias.Hub, main)
             && ReferenceEquals(canonical.PublishHqTiming, alias.PublishHqTiming) && canonical.PublishHqTiming != null,
             "HQ aliases do not share one timing reference");

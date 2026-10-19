@@ -13,6 +13,16 @@ using Neolink.Media;
 using Neolink.Onvif;
 using Neolink.Streaming;
 
+if (args.SequenceEqual(new[] { "--lq-rtcp-only" }))
+{
+    try
+    {
+        await LowQualityRtcpTests.RunAll();
+        Console.WriteLine("LQ sender-clock/RTCP contracts passed; synthetic media, controlled clocks and loopback peers only."); return 0;
+    }
+    catch (Exception error) { Console.Error.WriteLine("FAIL LQ sender clock/RTCP: " + error); return 1; }
+}
+
 if (args.SequenceEqual(new[] { "--lq-alignment-only" }))
 {
     try
@@ -296,6 +306,7 @@ internal static class ContractTests
             await Test("matched and direct LQ RTSP outputs preserve encoded video and original AAC bytes", LowQualityAlignmentTests.DirectAndMatchedWirePayloads);
             await Test("actual bounded LQ subscriber backpressure closes instead of sending damaged media", LowQualityAlignmentTests.SubscriberBackpressureFailsClosed);
             await Test("RTSP session policy isolates direct/matched tracks and described Opus codec choices", LowQualityAlignmentTests.SessionMediaPolicyIsolation);
+            await Test("explicit LQ sender reports bind original RTP to confirmed source/presentation clocks", LowQualityRtcpTests.RunAll);
             await Test("exact video routing preserves legacy and unsolicited message watches", SharedBaichuanStreamTests.MessageNumberRouting);
             await Test("successful preview stop releases only its binary command number", SharedBaichuanStreamTests.StopAcknowledgementReleasesBinaryMode);
             await Test("shared login demuxes both qualities and retries low without stopping main", SharedBaichuanStreamTests.OneLoginDemuxAndLowRetry);

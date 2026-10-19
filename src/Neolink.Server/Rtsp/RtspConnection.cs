@@ -935,6 +935,8 @@ internal sealed class RtspSession
         var aacTimeline = playout != null && Audio != null && aacRate > 0 ? new GopAacTimeline(aacRate, hub.SourceEpoch) : null;
         var matchedLow = _mount.MatchHqTiming is { } timing
             ? new MatchedLowQualityPlayout(hub, timing, _conn.Server.PlayoutTimeProvider, _conn.Server.PlayoutWaiter) : null;
+        var lowSenderClock = _mount.LowQualitySenderReports && !_mount.GopPlayout && !_opus
+            ? new LowQualityRtpSenderClock(hub, _conn.Server.PlayoutTimeProvider, _mount.LowQualityRequiresSourceArrival) : null;
         long? lastRtcpAt = null;
         string cname = "reolink-gop-" + Id.ToLowerInvariant();
         long sourceEpoch = hub.SourceEpoch;
@@ -947,6 +949,7 @@ internal sealed class RtspSession
         // Opus sessions vote for the transcoder: ffmpeg runs only while at least
         // one Opus session is playing, and stops with the last one.
         if (_opus) hub.AcquireOpus();
+        if (lowSenderClock != null) _conn.Server.ObserveLowSenderReports(Id, lowSenderClock.Diagnostics());
         Log.Info($"{hub.Name}: client started streaming (session {Id}" +
                  $"{(_opus ? ", Opus audio" : "")})");
         if (playout != null)
@@ -955,7 +958,7 @@ internal sealed class RtspSession
         {
             if (matchedLow != null)
             {
-                await PumpMatchedLowAsync(hub, reader, matchedLow, batch, ct).ConfigureAwait(false);
+                await PumpMatchedLowAsync(hub, reader, matchedLow, lowSenderClock, batch, ct).ConfigureAwait(false);
                 return;
             }
             await foreach (var packet in reader.ReadAllAsync(ct).ConfigureAwait(false))
@@ -1044,6 +1047,11 @@ internal sealed class RtspSession
                             continue;
                         }
                         await SendVideoAsync(hub, v.AnnexB, v.Keyframe, v.HasSps, v.RtpTs, batch, ct).ConfigureAwait(false);
+                        if (lowSenderClock != null)
+                        {
+                            lowSenderClock.ObserveRawVideoSent(v);
+                            await SendLowQualityReportsAsync(lowSenderClock, ct).ConfigureAwait(false);
+                        }
                         break;
                     }
                     // The URL decided this session's audio: on an Opus session the
@@ -1064,6 +1072,11 @@ internal sealed class RtspSession
                             aacTimeline.Push(a); break;
                         }
                         await SendAsync(Audio, Audio.Packetizer.PacketizeAac(a.Au, a.RtpTs), ct).ConfigureAwait(false);
+                        if (lowSenderClock != null)
+                        {
+                            lowSenderClock.ObserveRawAacSent(a, _description.Audio);
+                            await SendLowQualityReportsAsync(lowSenderClock, ct).ConfigureAwait(false);
+                        }
                         break;
                     case HubAudioPcm p when Audio != null && !_opus:
                         if (!RtspConnection.SameAudio(_description.Audio, hub.Audio))
@@ -1085,6 +1098,7 @@ internal sealed class RtspSession
         {
             _mount.PublishHqTiming?.Release(Id);
             if (matchedLow != null) _conn.Server.ObserveMatchedLow(Id, matchedLow.Diagnostics(), completed: true);
+            if (lowSenderClock != null) _conn.Server.ObserveLowSenderReports(Id, lowSenderClock.Diagnostics(), completed: true);
             if (aacTimeline != null)
             {
                 var diagnostic = aacTimeline.Diagnostics;
@@ -1099,7 +1113,7 @@ internal sealed class RtspSession
     }
 
     private async Task PumpMatchedLowAsync(IStreamHub hub, System.Threading.Channels.ChannelReader<HubPacket> reader,
-        MatchedLowQualityPlayout playout, RtpBatch batch, CancellationToken ct)
+        MatchedLowQualityPlayout playout, LowQualityRtpSenderClock? senderClock, RtpBatch batch, CancellationToken ct)
     {
         if (_opus) throw new IOException("Matched low-quality requires original AAC");
         await foreach (var packet in playout.ReadAsync(reader, Audio != null ? _description.Audio : null,
@@ -1119,9 +1133,26 @@ internal sealed class RtspSession
                 default:
                     throw new IOException("Matched low-quality yielded an unrequested track");
             }
-            playout.MarkSent(packet);
+            var sent = playout.MarkSent(packet);
+            if (senderClock != null)
+            {
+                senderClock.ObserveMatchedSent(packet, sent);
+                await SendLowQualityReportsAsync(senderClock, ct).ConfigureAwait(false);
+            }
             _conn.Server.ObserveMatchedLow(Id, playout.Diagnostics());
         }
+    }
+
+    private async Task SendLowQualityReportsAsync(LowQualityRtpSenderClock clock, CancellationToken ct)
+    {
+        if (!clock.ReportDue || !clock.TryGetReport(Video != null, Audio != null, out var report)) return;
+        string cname = "reolink-lq-" + Id.ToLowerInvariant();
+        if (Video != null && report.VideoRtpTimestamp is { } video)
+            await SendRtcpAsync(Video, RtcpSenderReport.Build(Video.Packetizer, video, report.UtcTimestamp, cname), ct).ConfigureAwait(false);
+        if (Audio != null && report.AudioRtpTimestamp is { } audio)
+            await SendRtcpAsync(Audio, RtcpSenderReport.Build(Audio.Packetizer, audio, report.UtcTimestamp, cname), ct).ConfigureAwait(false);
+        clock.MarkReportSent();
+        _conn.Server.ObserveLowSenderReports(Id, clock.Diagnostics());
     }
 
     private async Task SendVideoAsync(IStreamHub hub, byte[] annexB, bool keyframe, bool hasSps,
