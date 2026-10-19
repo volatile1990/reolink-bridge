@@ -173,6 +173,40 @@ internal static class LowQualityAlignmentTests
         Check(Observe(zeroReference, "zero", main.SourceEpoch, clock.GetTimestamp(), 1_000_000, clock.GetTimestamp(), 1_000_000), "zero-delay HQ fixture unavailable");
         var zero = new MatchedLowQualityPlayout(low, zeroReference, clock, (_, _) => throw new Exception("zero-delay path introduced a wait"));
         await zero.WaitAsync(Video(0, clock.GetTimestamp(), clock.GetTimestamp()), low.Audio, CancellationToken.None);
+        await TimerResolutionAndClockFailure();
+    }
+
+    private static async Task TimerResolutionAndClockFailure()
+    {
+        var clock = new ManualTimeProvider(); var main = Hub("timer-main", clock); var low = Hub("timer-low", clock);
+        clock.AdvanceTimestampTicks(2_000_000);
+        var reference = new HqPlayoutReference(main, clock);
+        Check(Observe(reference, "hq", main.SourceEpoch, 0, 1_000_000, 2_000_000, 1_000_000), "timer HQ fixture unavailable");
+        var waits = new List<TimeSpan>();
+        Task FloorTimer(TimeSpan delay, CancellationToken token)
+        {
+            token.ThrowIfCancellationRequested(); waits.Add(delay);
+            // Model the real Task.Delay timeout conversion: discard fractional
+            // milliseconds, with a zero-ms timeout completing synchronously.
+            clock.AdvanceTimestampTicks((long)Math.Floor(delay.TotalMilliseconds) * 1000);
+            return Task.CompletedTask;
+        }
+        var timed = new MatchedLowQualityPlayout(low, reference, clock, FloorTimer);
+        // The former loop waited 1000.375 ms, then repeatedly requested 0.375 ms.
+        // This floor-timer could never advance that remainder and tripped at 64.
+        const long source = 1_000_375, due = source + 2_000_000;
+        await timed.WaitAsync(Video(0, source, 1_200_375), low.Audio, CancellationToken.None);
+        Check(waits.Count == 1 && waits[0] == TimeSpan.FromMilliseconds(1001), "positive wait was not rounded up to the timer's millisecond resolution");
+        Check(clock.GetTimestamp() >= due && clock.GetTimestamp() - due < 1000,
+            "timer rounding returned early or added more than one millisecond beyond the presentation deadline");
+
+        int stalledWaits = 0;
+        var stalled = new MatchedLowQualityPlayout(low, reference, clock, (_, token) =>
+        { token.ThrowIfCancellationRequested(); stalledWaits++; return Task.CompletedTask; });
+        bool bounded = false;
+        try { await stalled.WaitAsync(Video(0, clock.GetTimestamp() - 1_000_000, clock.GetTimestamp()), low.Audio, CancellationToken.None); }
+        catch (InvalidDataException error) { bounded = error.Message.Contains("clock failed to advance", StringComparison.Ordinal); }
+        Check(bounded && stalledWaits == 64, "a genuinely nonadvancing clock escaped the existing bounded-wait guard");
     }
 
     public static async Task FailClosedAndCancellation()

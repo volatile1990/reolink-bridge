@@ -152,7 +152,10 @@ internal sealed class MatchedLowQualityPlayout(IStreamHub hub, HqPlayoutReferenc
         while (remaining > 0)
         {
             if (++waits > 64) throw Failure("Matched LQ clock failed to advance");
-            var delay = TimeSpan.FromSeconds(remaining);
+            // Task.Delay truncates fractional milliseconds. A positive sub-ms
+            // remainder would otherwise complete synchronously until the guard
+            // fires, even though the monotonic clock is working normally.
+            var delay = TimeSpan.FromMilliseconds(Math.Max(1, Math.Ceiling(remaining * 1000)));
             if (_wait != null) await _wait(delay, ct).ConfigureAwait(false);
             else await Task.Delay(delay, _clock, ct).ConfigureAwait(false);
             ct.ThrowIfCancellationRequested();
