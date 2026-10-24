@@ -522,6 +522,9 @@ public sealed class BcCamera : IBcCamera
         return new MotionPush(status, aiTypes);
     }
 
+    public Task WatchPrivacyAsync(Action<StatusPush> onEvent, CancellationToken ct)
+        => WatchStatusIdAsync(BcConstants.MsgIdSleepStatus, "sleepStatus", ParseSleepStatus, onEvent, ct);
+
     public async Task WatchStatusAsync(Action<StatusPush> onEvent, CancellationToken ct)
     {
         // Cameras broadcast these without any opt-in request. The connection allows

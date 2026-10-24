@@ -59,6 +59,10 @@ public interface IBcCamera : IAsyncDisposable
     /// </summary>
     Task WatchStatusAsync(Action<StatusPush> onEvent, CancellationToken ct);
 
+    /// <summary>Passive privacy-only status listener. It sends no camera query.
+    /// The default leaves custom sessions without privacy support unchanged.</summary>
+    Task WatchPrivacyAsync(Action<StatusPush> onEvent, CancellationToken ct) => Task.CompletedTask;
+
     /// <summary>Requests a JPEG snapshot from the camera (msg 109), or null if unsupported.</summary>
     Task<byte[]?> SnapAsync(CancellationToken ct);
 

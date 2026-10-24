@@ -248,11 +248,14 @@ public sealed class CameraService : ILiveCameraSource
 
     public string Name => _config.Name;
     public StreamKind Kind => _kind;
-    /// <summary>Headless bridge: only login and video; skip optional battery/port queries and status watches.
+    /// <summary>Headless bridge: login/video plus passive privacy pushes; skip optional battery/port queries and other status watches.
     /// Does not change the camera or its enabled services.</summary>
     public bool RelayOnly { get; init; }
     /// <summary>Optional substream on the same logged-in session. Restricted to the always-running main relay.</summary>
     public IMediaSink? SecondaryVideoSink { get; init; }
+
+    /// <summary>Preview progress policy; independent of Baichuan transport traffic.</summary>
+    internal TimeSpan VideoProgressTimeout { get; init; } = VideoProgressDeadline.DefaultTimeout;
     public IBcCamera? LiveCamera => _live;
 
     /// <summary>
@@ -1105,6 +1108,7 @@ public sealed class CameraService : ILiveCameraSource
             _ = Task.Run(() => AuditServicePortsAsync(camera, linked.Token), CancellationToken.None);
         Task? videoTask = null;
         Task? secondaryTask = null;
+        VideoProgressDeadline? videoProgress = null;
         // The status watch always runs: battery pushes keep the sidebar reading
         // fresh even without MQTT; other pushes go to the external sink if any.
         var externalStatusSink = StatusSink;
@@ -1148,8 +1152,11 @@ public sealed class CameraService : ILiveCameraSource
             }
             externalStatusSink?.Invoke(push);
         };
-        Task statusTask = RelayOnly ? Task.CompletedTask
-            : Task.Run(() => WatchStatusGuardedAsync(camera, statusSink, linked.Token), CancellationToken.None);
+        // Headless relays need the unsolicited privacy state too: deliberate
+        // darkness must not look like a failed video preview. This listener sends
+        // no status request and does not enable the other optional status paths.
+        Task statusTask = Task.Run(() => WatchStatusGuardedAsync(camera, statusSink, linked.Token,
+            privacyOnly: RelayOnly), CancellationToken.None);
         // UDP battery firmware wants to see a LIVING CLIENT, not just transport
         // acks: the official client asks something at the BC layer every 5 s, and
         // an idle session gets recycled after ~1-2 min even with every msg-234
@@ -1181,13 +1188,19 @@ public sealed class CameraService : ILiveCameraSource
 
             var binary = new ByteBoundedChannel<byte[]>(16 * 1024 * 1024, 1024, block => block.Length);
             _mainQueueDiagnostics = binary.Diagnostics;
+            // Metadata and audio can keep Msg3 alive indefinitely while its video
+            // preview is stuck. Watch parsed video progress on a separate timer,
+            // including when a partial frame has blocked the parser itself.
+            await using var progress = new VideoProgressDeadline(linked, () => _privacyOn == 1, VideoProgressTimeout);
+            videoProgress = progress;
             // Privacy mode (E1 Pro etc.) makes the camera go dark: no video is expected,
             // and losing the connection over it would make the camera — and the privacy
             // switch itself — Unavailable in Home Assistant. Hold the connection instead.
             videoTask = Task.Run(() => camera.StartVideoAsync(_kind, binary.Writer,
                 StallTolerable, linked.Token), CancellationToken.None);
             if (SecondaryVideoSink is { } secondarySink)
-                secondaryTask = Task.Run(() => RunSecondaryVideoAsync(camera, secondarySink, linked.Token), CancellationToken.None);
+                secondaryTask = Task.Run(() => RunSecondaryVideoAsync(camera, secondarySink, linked.Token,
+                    stallTolerable: () => _privacyOn == 1, videoProgressTimeout: VideoProgressTimeout), CancellationToken.None);
             var reader = new MediaFrameReader(binary.Reader);
             long frames = 0;
 
@@ -1205,18 +1218,11 @@ public sealed class CameraService : ILiveCameraSource
                     throw new IOException("video stream ended");
                 }
 
-                if (_privacyLoop)
-                {
-                    _privacyLoop = false;
-                    Log.Info($"{Tag}: privacy mode off — video resumed");
-                }
+                progress.Observe(frame);
+
                 if (++frames == 1)
                 {
                     Log.Info($"{Tag}: receiving media");
-                    // Media flowing = definitely not private. Heals a stale flag
-                    // when the wake happened while we were reconnecting (the
-                    // "off" push can be missed across a connection swap).
-                    if (_privacyOn == 1) _privacyOn = 0;
                     if (_wakeDiag is { Reported: false, FirstFrameMs: null } wdFrame)
                         wdFrame.FirstFrameMs = (DateTime.UtcNow - wdFrame.ConnectedAt).TotalMilliseconds;
                 }
@@ -1228,6 +1234,14 @@ public sealed class CameraService : ILiveCameraSource
                         _hub.PublishInfo(info);
                         break;
                     case VideoFrame video:
+                        // Only a real image proves privacy ended. Metadata/audio
+                        // can continue while a camera is deliberately dark.
+                        if (_privacyLoop)
+                        {
+                            _privacyLoop = false;
+                            Log.Info($"{Tag}: privacy mode off — video resumed");
+                        }
+                        if (_privacyOn == 1) _privacyOn = 0;
                         _hub.PublishVideo(video);
                         // Wake clip: starts on the first KEYFRAME, after it is in the
                         // hub — starting on the session's first frame raced the hub's
@@ -1321,6 +1335,10 @@ public sealed class CameraService : ILiveCameraSource
             }
             return false;
         }
+        catch (OperationCanceledException) when (videoProgress?.Expired == true && !ct.IsCancellationRequested && !_suspended)
+        {
+            throw new IOException("Video stream stalled (no new video frames within the preview deadline)");
+        }
         finally
         {
             _live = null;
@@ -1350,13 +1368,15 @@ public sealed class CameraService : ILiveCameraSource
 
     /// <summary>A low preview failure releases/retries only that preview, preserving the main stream and login.</summary>
     internal static async Task RunSecondaryVideoAsync(IBcCamera camera, IMediaSink sink, CancellationToken ct,
-        TimeSpan? startupDelay = null, TimeSpan? retryDelay = null)
+        TimeSpan? startupDelay = null, TimeSpan? retryDelay = null, Func<bool>? stallTolerable = null,
+        TimeSpan? videoProgressTimeout = null)
     {
         try { await Task.Delay(startupDelay ?? TimeSpan.FromSeconds(2), ct).ConfigureAwait(false); }
         catch (OperationCanceledException) when (ct.IsCancellationRequested) { return; }
         while (!ct.IsCancellationRequested)
         {
             using var attempt = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            await using var progress = new VideoProgressDeadline(attempt, stallTolerable, videoProgressTimeout);
             var binary = new ByteBoundedChannel<byte[]>(8 * 1024 * 1024, 1024, block => block.Length);
             var pump = Task.Run(() => camera.StartVideoAsync(StreamKind.Sub, binary.Writer, null, attempt.Token), CancellationToken.None);
             try
@@ -1371,6 +1391,7 @@ public sealed class CameraService : ILiveCameraSource
                         await pump.ConfigureAwait(false);
                         throw new IOException("Substream ended");
                     }
+                    progress.Observe(frame);
                     switch (frame)
                     {
                         case MediaInfo info: sink.PublishInfo(info); break;
@@ -1381,6 +1402,10 @@ public sealed class CameraService : ILiveCameraSource
                 }
             }
             catch (OperationCanceledException) when (ct.IsCancellationRequested) { return; }
+            catch (OperationCanceledException) when (progress.Expired)
+            {
+                Log.Warn("Optional substream stopped producing video; retrying its preview on the existing session");
+            }
             catch (Exception error)
             {
                 Log.Warn($"Optional substream failed ({error.GetType().Name}); retrying on the existing session");
@@ -1724,11 +1749,13 @@ public sealed class CameraService : ILiveCameraSource
     /// Status-push listener riding the same connection as the video stream. These
     /// are purely informational, so any failure stays local to this task.
     /// </summary>
-    private async Task WatchStatusGuardedAsync(IBcCamera camera, Action<StatusPush> sink, CancellationToken ct)
+    private async Task WatchStatusGuardedAsync(IBcCamera camera, Action<StatusPush> sink, CancellationToken ct,
+        bool privacyOnly = false)
     {
         try
         {
-            await camera.WatchStatusAsync(sink, ct).ConfigureAwait(false);
+            if (privacyOnly) await camera.WatchPrivacyAsync(sink, ct).ConfigureAwait(false);
+            else await camera.WatchStatusAsync(sink, ct).ConfigureAwait(false);
         }
         catch (OperationCanceledException) { }
         catch (Exception ex) when (ex is IOException or ObjectDisposedException)

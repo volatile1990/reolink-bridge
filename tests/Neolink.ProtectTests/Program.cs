@@ -13,6 +13,31 @@ using Neolink.Media;
 using Neolink.Onvif;
 using Neolink.Streaming;
 
+if (args.SequenceEqual(new[] { "--video-progress-production-deadline" }))
+{
+    try
+    {
+        await VideoProgressDeadlineTests.ProductionDeadlineWireRecovery();
+        Console.WriteLine("2 real 15-second video-deadline wire recoveries passed; synthetic peers only."); return 0;
+    }
+    catch (Exception error) { Console.Error.WriteLine("FAIL production video deadline: " + error); return 1; }
+}
+
+if (args.SequenceEqual(new[] { "--video-progress-only" }))
+{
+    try
+    {
+        await VideoProgressDeadlineTests.OnlyVideoRenewsDeadline();
+        await VideoProgressDeadlineTests.PrivacyAndPartialReadCancellation();
+        await VideoProgressDeadlineTests.MainMetadataStallReconnects();
+        await VideoProgressDeadlineTests.LowMetadataStallOnlyRetriesPreview();
+        await VideoProgressDeadlineTests.PrivacySourceKeepsMetadataSession();
+        await VideoProgressDeadlineTests.IdleDemandAndSuspensionDoNotArmPreview();
+        Console.WriteLine("6 parsed-video freshness contracts passed; synthetic peers/media only."); return 0;
+    }
+    catch (Exception error) { Console.Error.WriteLine("FAIL parsed-video freshness: " + error); return 1; }
+}
+
 if (args.SequenceEqual(new[] { "--lq-rtcp-only" }))
 {
     try
@@ -310,6 +335,12 @@ internal static class ContractTests
             await Test("exact video routing preserves legacy and unsolicited message watches", SharedBaichuanStreamTests.MessageNumberRouting);
             await Test("successful preview stop releases only its binary command number", SharedBaichuanStreamTests.StopAcknowledgementReleasesBinaryMode);
             await Test("shared login demuxes both qualities and retries low without stopping main", SharedBaichuanStreamTests.OneLoginDemuxAndLowRetry);
+            await Test("only real video renews a preview progress deadline", VideoProgressDeadlineTests.OnlyVideoRenewsDeadline);
+            await Test("privacy and incomplete media reads obey independent video deadlines", VideoProgressDeadlineTests.PrivacyAndPartialReadCancellation);
+            await Test("metadata-only main stall reconnects and restores both previews", VideoProgressDeadlineTests.MainMetadataStallReconnects);
+            await Test("metadata-only low stall retries only its own preview", VideoProgressDeadlineTests.LowMetadataStallOnlyRetriesPreview);
+            await Test("privacy metadata preserves the control session and resumes images", VideoProgressDeadlineTests.PrivacySourceKeepsMetadataSession);
+            await Test("idle demand, sleeping and suspended sources do not arm unwanted previews", VideoProgressDeadlineTests.IdleDemandAndSuspensionDoNotArmPreview);
             await Test("shipped pilot config loads strictly without enabling recording or camera controls", () =>
             {
                 var pilot = NeolinkConfig.Load(example, strict: true);
