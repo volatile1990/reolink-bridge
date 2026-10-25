@@ -25,6 +25,9 @@
   <ItemGroup>
     <ProjectReference Include="..\Neolink.WebClient\Neolink.WebClient.csproj" />
     <InternalsVisibleTo Include="Neolink.ProtectTests" />
+    <!-- Bridges mostly await media I/O. Avoid the Unix worker semaphore's
+         repeated spin/yield phase; no media cadence or thread limit changes. -->
+    <RuntimeHostConfigurationOption Include="System.Threading.ThreadPool.UnfairSemaphoreSpinLimit" Value="0" />
   </ItemGroup>
 
   <!-- Ship the user's config (and the template) next to the built executable -->
