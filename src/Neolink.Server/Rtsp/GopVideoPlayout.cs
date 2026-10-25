@@ -52,7 +52,11 @@ internal sealed class GopVideoPlayout
         if (reserveMs is < 0 or > 5000) throw new ArgumentOutOfRangeException(nameof(reserveMs));
         _codec = codec; _reserve = TimeSpan.FromMilliseconds(reserveMs);
         _clock = clock ?? TimeProvider.System;
-        _wait = wait ?? ((delay, ct) => Task.Delay(delay, _clock, ct));
+        // Task.Delay truncates TimeSpan to whole milliseconds. A positive
+        // remainder below 1 ms otherwise completes synchronously and makes
+        // WaitAsync spin until presentation time, even with an idle CPU.
+        _wait = wait ?? ((delay, ct) => Task.Delay(
+            TimeSpan.FromMilliseconds(Math.Max(1, Math.Ceiling(delay.TotalMilliseconds))), _clock, ct));
     }
 
     /// <summary>Discard pending input and scheduling state; keep the outbound RTP clock continuous.</summary>
