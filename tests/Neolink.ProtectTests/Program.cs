@@ -13,6 +13,21 @@ using Neolink.Media;
 using Neolink.Onvif;
 using Neolink.Streaming;
 
+if (args.SequenceEqual(new[] { "--journal-optimization-only" }))
+{
+    try
+    {
+        await JournalOptimizationTests.CanonicalRestartAndMutationParity();
+        await JournalOptimizationTests.PhysicalRetentionByteAccountingAndCacheCap();
+        await JournalOptimizationTests.DurableFailureAndRecoveryParity();
+        await JournalOptimizationTests.NativeFileFlagsAndOwnedCache();
+        await StreamReliabilityTests.DurableReplayAndRecovery();
+        await StreamReliabilityTests.DurableReplayRenameOrderingAndSyncFailure();
+        Console.WriteLine("6 journal optimization/durability contracts passed; private synthetic files only."); return 0;
+    }
+    catch (Exception error) { Console.Error.WriteLine("FAIL journal optimization: " + error); return 1; }
+}
+
 if (args.SequenceEqual(new[] { "--cpu-optimization-only" }))
 {
     try
@@ -318,6 +333,10 @@ internal static class ContractTests
             await Test("low frame rates and camera certificate pins", StreamReliabilityTests.LowFrameRatesAndCertificatePinning);
             await Test("persistent camera replay survives restart and partial append", StreamReliabilityTests.DurableReplayAndRecovery);
             await Test("persistent replay sync follows rename and fails closed", StreamReliabilityTests.DurableReplayRenameOrderingAndSyncFailure);
+            await Test("cached journal preserves canonical bytes restart identity and mutable arrays", JournalOptimizationTests.CanonicalRestartAndMutationParity);
+            await Test("cached journal preserves physical retention original bytes and independent memory cap", JournalOptimizationTests.PhysicalRetentionByteAccountingAndCacheCap);
+            await Test("cached journal preserves durable rename failure and lease recovery", JournalOptimizationTests.DurableFailureAndRecoveryParity);
+            await Test("temporary journal buffering preserves native append sync and owned cache reuse", JournalOptimizationTests.NativeFileFlagsAndOwnedCache);
             await Test("single and dual quality preserve one device identity and strict headless configuration", () => DualStreamContractTests.Configurations(example));
             await Test("dual-quality configuration rejects mismatched codecs and unsafe conversions", () => DualStreamContractTests.InvalidConfigurations(example));
             await Test("main and low streams have independent media with one event owner", () => DualStreamContractTests.IndependentStreams(example));

@@ -15,8 +15,22 @@ internal sealed class ProtectReplayJournal : IDisposable
     private FileStream? _stream;
     private readonly FileStream _lease;
     private Header _header;
-    private readonly Queue<(ProtectAlarmPush Push, int Bytes)> _entries = new();
+    private readonly Queue<Entry> _entries = new();
     private long _bytes;
+    private long _serializedBytes, _cacheCharge;
+    // Account for metadata as well as serialized payload against the cache cap.
+    private const int CacheEntryOverhead = 128;
+    private readonly record struct Serialization(byte[] Data, string[]? Classes, string[]? RawAiTypes);
+    private sealed class Entry(ProtectAlarmPush push, int bytes)
+    {
+        public readonly ProtectAlarmPush Push = push;
+        public readonly int Bytes = bytes;
+        public byte[]? Utf8;
+        public string[]? Classes, RawAiTypes;
+        public long CacheCharge;
+    }
+    internal long SerializedCacheBytes => _serializedBytes;
+    internal long SerializationCacheCharge => _cacheCharge;
     private bool _disposed;
     public string InstanceId => _header.InstanceId;
     public long Sequence => _header.Sequence;
@@ -95,7 +109,10 @@ internal sealed class ProtectReplayJournal : IDisposable
                 || push.RawAiTypes.Any(c => c == null || c.Length > 64 || c.Any(char.IsControl))
                 || push.SourceStatus == null || push.SourceStatus.Length > 64 || push.SourceStatus.Any(char.IsControl))
                 throw new InvalidDataException("Persistent replay entry violates the camera-push contract");
-            _entries.Enqueue((push, length + 1)); _bytes += length + 1;
+            // Original file lengths still govern Trim, even for noncanonical
+            // historical JSON whose canonical serialization has another size.
+            _entries.Enqueue(CreateEntry(push, length + 1, Capture(push)));
+            _bytes += length + 1;
             previous = push.Sequence;
             _header = _header with { Sequence = Math.Max(_header.Sequence, push.Sequence), Epoch = Math.Max(_header.Epoch, push.ConnectionEpoch) };
             lineStart = newline + 1;
@@ -103,10 +120,13 @@ internal sealed class ProtectReplayJournal : IDisposable
         // An incomplete last append is discarded; every complete previous record remains available.
     }
 
-    private FileStream Open(string path, FileMode mode)
+    private FileStream Open(string path, FileMode mode, bool compaction = false)
     {
         var options = new FileStreamOptions { Mode = mode, Access = FileAccess.Write, Share = FileShare.Read,
-            Options = FileOptions.WriteThrough };
+            // A temporary replacement is not published before Flush(true).
+            // Appends retain their original write-through and flush contract.
+            Options = compaction ? FileOptions.None : FileOptions.WriteThrough,
+            BufferSize = compaction ? 64 * 1024 : 4096 };
         if (!OperatingSystem.IsWindows()) options.UnixCreateMode = UnixFileMode.UserRead | UnixFileMode.UserWrite;
         return new FileStream(path, options);
     }
@@ -116,10 +136,10 @@ internal sealed class ProtectReplayJournal : IDisposable
         string temporary = _path + ".new";
         RejectLinks(_path); RejectLinks(temporary);
         if (File.Exists(temporary)) CheckPrivate(temporary);
-        using (var output = Open(temporary, FileMode.Create))
+        using (var output = Open(temporary, FileMode.Create, compaction: true))
         {
             WriteLine(output, JsonSerializer.SerializeToUtf8Bytes(_header));
-            foreach (var entry in _entries) WriteLine(output, JsonSerializer.SerializeToUtf8Bytes(entry.Push));
+            foreach (var entry in _entries) WriteLine(output, Serialized(entry));
             output.Flush(flushToDisk: true);
         }
         _stream?.Dispose(); _stream = null;
@@ -158,11 +178,70 @@ internal sealed class ProtectReplayJournal : IDisposable
 
     private static void WriteLine(Stream stream, byte[] data) { stream.Write(data); stream.WriteByte((byte)'\n'); }
 
+    private static Serialization Capture(ProtectAlarmPush push)
+    {
+        // Serialize exactly the array values retained for cache validation.
+        // A concurrent array mutation cannot associate old bytes with a newer
+        // snapshot and turn a transient race into a permanently stale cache.
+        string[]? classes = push.Classes?.ToArray(), rawAiTypes = push.RawAiTypes?.ToArray();
+        byte[] data = JsonSerializer.SerializeToUtf8Bytes(push with { Classes = classes!, RawAiTypes = rawAiTypes! });
+        return new(data, classes, rawAiTypes);
+    }
+
+    private Entry CreateEntry(ProtectAlarmPush push, int countedBytes, Serialization serialized)
+    {
+        var entry = new Entry(push, countedBytes);
+        Cache(entry, serialized);
+        return entry;
+    }
+
+    private void Cache(Entry entry, Serialization serialized)
+    {
+        long charge = serialized.Data.LongLength + CacheEntryOverhead
+            + 8L * ((serialized.Classes?.Length ?? 0) + (serialized.RawAiTypes?.Length ?? 0))
+            + TextCharge(serialized.Classes) + TextCharge(serialized.RawAiTypes);
+        if (charge > _maxBytes - _cacheCharge) return;
+        entry.Utf8 = serialized.Data;
+        // Scalar record properties are immutable, but internal callers can
+        // change array values. Preserve that existing compaction behavior.
+        entry.Classes = serialized.Classes;
+        entry.RawAiTypes = serialized.RawAiTypes;
+        entry.CacheCharge = charge;
+        _serializedBytes += serialized.Data.LongLength;
+        _cacheCharge += charge;
+    }
+
+    // Strings are normally shared with Push. Charge their full size anyway:
+    // a caller can replace an array slot while the cache retains the old value.
+    private static long TextCharge(string[]? values) => values?.Sum(
+        static value => value == null ? 0L : 32L + 2L * value.Length) ?? 0;
+
+    private void Uncache(Entry entry)
+    {
+        if (entry.Utf8 == null) return;
+        _serializedBytes -= entry.Utf8.LongLength;
+        _cacheCharge -= entry.CacheCharge;
+        entry.Utf8 = null; entry.Classes = entry.RawAiTypes = null; entry.CacheCharge = 0;
+    }
+
+    private static bool SameValues(string[]? current, string[]? previous) =>
+        current == null ? previous == null : previous != null && current.AsSpan().SequenceEqual(previous);
+
+    private byte[] Serialized(Entry entry)
+    {
+        if (entry.Utf8 is { } data && SameValues(entry.Push.Classes, entry.Classes)
+            && SameValues(entry.Push.RawAiTypes, entry.RawAiTypes)) return data;
+        Uncache(entry);
+        Serialization serialized = Capture(entry.Push);
+        Cache(entry, serialized);
+        return serialized.Data;
+    }
+
     private bool Trim(DateTimeOffset now)
     {
         bool changed = false;
         while (_entries.TryPeek(out var first) && (_bytes > _maxBytes - 1024 || first.Push.At < now - _retention))
-        { _entries.Dequeue(); _bytes -= first.Bytes; changed = true; }
+        { _entries.Dequeue(); _bytes -= first.Bytes; Uncache(first); changed = true; }
         return changed;
     }
 
@@ -170,12 +249,12 @@ internal sealed class ProtectReplayJournal : IDisposable
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
         _header = _header with { Sequence = push.Sequence, Epoch = push.ConnectionEpoch };
-        byte[] data = JsonSerializer.SerializeToUtf8Bytes(push);
-        _entries.Enqueue((push, data.Length + 1)); _bytes += data.Length + 1;
+        Serialization serialized = Capture(push);
+        _entries.Enqueue(CreateEntry(push, serialized.Data.Length + 1, serialized)); _bytes += serialized.Data.Length + 1;
         try
         {
             if (Trim(now) || _stream == null) Compact();
-            else { WriteLine(_stream, data); _stream.Flush(flushToDisk: true); }
+            else { WriteLine(_stream, serialized.Data); _stream.Flush(flushToDisk: true); }
             State = "ready";
         }
         catch (Exception error) when (error is IOException or UnauthorizedAccessException)
