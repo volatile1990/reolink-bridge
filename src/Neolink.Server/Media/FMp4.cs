@@ -284,7 +284,12 @@ public static class FMp4
 
     /// <summary>The access units of an Annex-B buffer without copying any sample
     /// data; the source must outlive the result.</summary>
-    public static AccessUnits SplitAccessUnitsRaw(VideoCodec codec, byte[] annexB)
+    public static AccessUnits SplitAccessUnitsRaw(VideoCodec codec, byte[] annexB) =>
+        SplitAccessUnitsRaw(codec, H26x.SplitNals(annexB));
+
+    /// <summary>Reuse immutable publisher-owned NAL boundaries without scanning
+    /// the elementary-stream payload again.</summary>
+    internal static AccessUnits SplitAccessUnitsRaw(VideoCodec codec, IReadOnlyList<ReadOnlyMemory<byte>> parsedNals)
     {
         var result = new AccessUnits();
         var nals = result.Nals;
@@ -299,7 +304,7 @@ public static class FMp4
             hasVcl = false; key = false; bytes = 0;
         }
 
-        foreach (var nal in H26x.SplitNals(annexB))
+        foreach (var nal in parsedNals)
         {
             var span = nal.Span;
             if (span.Length < 2) continue;

@@ -10,7 +10,10 @@ internal sealed record RtpAccessUnit(IReadOnlyList<ReadOnlyMemory<byte>> Nals, b
 /// These are boundary estimates, not a decoder or a complete H264 picture-header parser.</summary>
 internal static class RtpAccessUnitSplitter
 {
-    public static List<RtpAccessUnit> Split(VideoCodec codec, byte[] annexB)
+    public static List<RtpAccessUnit> Split(VideoCodec codec, byte[] annexB) =>
+        Split(codec, H26x.SplitNals(annexB));
+
+    internal static List<RtpAccessUnit> Split(VideoCodec codec, IReadOnlyList<ReadOnlyMemory<byte>> parsedNals)
     {
         var result = new List<RtpAccessUnit>();
         var group = new List<ReadOnlyMemory<byte>>();
@@ -21,7 +24,7 @@ internal static class RtpAccessUnitSplitter
             result.Add(new RtpAccessUnit(group, hasVcl, keyframe, hasSps));
             group = new(); hasVcl = keyframe = hasSps = false;
         }
-        foreach (var nal in H26x.SplitNals(annexB))
+        foreach (var nal in parsedNals)
         {
             var span = nal.Span;
             if (span.Length == 0) continue;

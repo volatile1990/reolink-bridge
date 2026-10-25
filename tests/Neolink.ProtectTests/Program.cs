@@ -13,6 +13,19 @@ using Neolink.Media;
 using Neolink.Onvif;
 using Neolink.Streaming;
 
+if (args.SequenceEqual(new[] { "--cpu-optimization-only" }))
+{
+    try
+    {
+        await CpuOptimizationTests.SubMillisecondWaitYields();
+        await CpuOptimizationTests.SharedNalOwnershipAndPacketParity();
+        await CpuOptimizationTests.IncrementalLargeNalParity();
+        await CpuOptimizationTests.WriteGuardFastPathAndBudgets();
+        Console.WriteLine("4 CPU optimization contracts passed; synthetic media and controlled clocks only."); return 0;
+    }
+    catch (Exception error) { Console.Error.WriteLine("FAIL CPU optimization: " + error); return 1; }
+}
+
 if (args.SequenceEqual(new[] { "--video-progress-production-deadline" }))
 {
     try
@@ -459,6 +472,10 @@ internal static class ContractTests
             await Test("camera timestamp diagnostics distinguish wrap zero reversal and reconnect", VideoBufferDiagnosticsTests.TimestampDeltas);
             await Test("protected HTTP metrics expose buffer diagnostics without encoded data or secrets", VideoBufferDiagnosticsTests.HttpMetrics);
             await Test("GOP playout corrects camera wall drift and retains variable cadence", GopVideoPlayoutTests.DriftAndPacing);
+            await Test("sub-millisecond GOP waits yield through one usable timer tick", CpuOptimizationTests.SubMillisecondWaitYields);
+            await Test("shared NAL metadata preserves payload ownership diagnostic boundaries and RTP bytes", CpuOptimizationTests.SharedNalOwnershipAndPacketParity);
+            await Test("incremental HEVC scan preserves large NALs at arbitrary pipe boundaries", CpuOptimizationTests.IncrementalLargeNalParity);
+            await Test("immediate RTSP writes avoid timer allocations while blocked writes share one deadline", CpuOptimizationTests.WriteGuardFastPathAndBudgets);
             await Test("GOP playout wraps continuously and cancels its reserve promptly", GopVideoPlayoutTests.WrapAndCancel);
             await Test("GOP playout bounds memory frames time and recovers only at complete keyframes", GopVideoPlayoutTests.BoundsAndRecovery);
             await Test("GOP playout splits pictures while preserving parameter slices and SEI", GopVideoPlayoutTests.MultiAuAndMetadata);

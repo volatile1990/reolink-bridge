@@ -15,6 +15,15 @@ public abstract record HubPacket(long Index);
 public sealed record HubVideo(long Index, byte[] AnnexB, bool Keyframe, uint RtpTs, bool HasSps = false)
     : HubPacket(Index)
 {
+    /// <summary>Publisher-owned immutable slices over AnnexB, shared by all
+    /// consumers and the GOP cache. Never pooled or modified after publication.</summary>
+    private readonly byte[]? _parsedNalSource;
+    private readonly IReadOnlyList<ReadOnlyMemory<byte>>? _parsedNals;
+    internal IReadOnlyList<ReadOnlyMemory<byte>>? ParsedNals
+    {
+        get => ReferenceEquals(_parsedNalSource, AnnexB) ? _parsedNals : null;
+        init { _parsedNalSource = AnnexB; _parsedNals = value; }
+    }
     /// <summary>Publisher generation for optional delayed consumers; not an RTP timestamp.</summary>
     public long SourceEpoch { get; init; }
     /// <summary>Original publisher arrival on a monotonic clock, including after GOP replay.</summary>
@@ -221,10 +230,10 @@ public sealed class StreamHub : IStreamHub, IMediaSink
         while (Interlocked.CompareExchange(ref target, value, old) != old);
     }
 
-    private void RecordVideoBuffer(VideoFrame frame)
+    private void RecordVideoBuffer(VideoFrame frame, IReadOnlyList<ReadOnlyMemory<byte>> parsedNals)
     {
         // Inspect only: the original bytes, frame boundary, flags and RTP clock stay unchanged.
-        var split = FMp4.SplitAccessUnitsRaw(frame.Codec, frame.Data);
+        var split = FMp4.SplitAccessUnitsRaw(frame.Codec, parsedNals);
         int pictures = 0;
         foreach (var unit in split.Units)
         {
@@ -321,7 +330,8 @@ public sealed class StreamHub : IStreamHub, IMediaSink
         {
             long arrivalTimestamp = _diagnosticClock.GetTimestamp();
             RecordVideoArrival(frame.Data.Length);
-            RecordVideoBuffer(frame);
+            var parsedNals = H26x.SplitNals(frame.Data);
+            RecordVideoBuffer(frame, parsedNals);
             // Advance the RTP timestamp using the camera's microsecond counter when sane,
             // otherwise fall back to wall clock.
             uint deltaUs;
@@ -356,7 +366,7 @@ public sealed class StreamHub : IStreamHub, IMediaSink
             bool needParams = frame.Keyframe || Sps == null || Pps == null
                 || (frame.Codec == VideoCodec.H265 && Vps == null);
             if (needParams)
-            foreach (var nal in H26x.SplitNals(frame.Data))
+            foreach (var nal in parsedNals)
             {
                 var span = nal.Span;
                 if (span.Length == 0) continue;
@@ -408,7 +418,8 @@ public sealed class StreamHub : IStreamHub, IMediaSink
                  { SourceEpoch = SourceEpoch, ArrivalTimestamp = arrivalTimestamp,
                    ArrivalTimestampFrequency = _diagnosticClock.TimestampFrequency, CameraMicroseconds = frame.Microseconds,
                    SourceArrivalTimestamp = sourceArrivalTimestamp,
-                   SourceArrivalTimestampFrequency = sourceArrivalTimestamp == null ? 0 : sourceArrivalFrequency },
+                   SourceArrivalTimestampFrequency = sourceArrivalTimestamp == null ? 0 : sourceArrivalFrequency,
+                   ParsedNals = parsedNals },
                  frame.Keyframe, frame.Data.Length);
         }
     }

@@ -407,7 +407,9 @@ internal sealed class HevcAccessUnitReader
 {
     private const int MaxBytes = 2 * 1024 * 1024;
     private byte[] _pending = new byte[16 * 1024];
-    private int _length;
+    private int _length, _searchFrom;
+    private static ReadOnlySpan<byte> StartCodeCore => [0, 0, 1];
+    private static ReadOnlySpan<byte> StartCode => [0, 0, 0, 1];
     private readonly MemoryStream _unit = new();
     private bool _hasVcl, _keyframe;
 
@@ -428,19 +430,25 @@ internal sealed class HevcAccessUnitReader
         int keep = first;
         while (true)
         {
-            int next = FindStartCode(_pending.AsSpan(0, _length), nal, out int nextLength);
+            int next = FindStartCode(_pending.AsSpan(0, _length), Math.Max(nal, _searchFrom), out int nextLength);
             if (next < 0)
             {
                 if (endOfStream) { AddNal(_pending.AsSpan(nal, _length - nal), result); keep = _length; }
+                // Only the final three bytes can participate in a start code
+                // spanning the next pipe read. Never scan the unfinished NAL's
+                // already searched payload again.
+                _searchFrom = Math.Max(nal, _length - 3);
                 break;
             }
             AddNal(_pending.AsSpan(nal, next - nal), result);
             keep = next; nal = next + nextLength;
+            _searchFrom = nal;
         }
         if (keep > 0)
         {
             _pending.AsSpan(keep, _length - keep).CopyTo(_pending);
             _length -= keep;
+            _searchFrom = Math.Max(0, _searchFrom - keep);
         }
         if (endOfStream) Close(result);
         return result;
@@ -455,7 +463,7 @@ internal sealed class HevcAccessUnitReader
         bool prefix = type is 32 or 33 or 34 or 35 or 39;
         if (_hasVcl && (firstSlice || prefix)) Close(frames);
         if (_unit.Length + 4 + nal.Length > MaxBytes) throw new InvalidDataException("HEVC access unit exceeds low-quality buffer bound");
-        _unit.Write(new byte[] { 0, 0, 0, 1 }); _unit.Write(nal);
+        _unit.Write(StartCode); _unit.Write(nal);
         _hasVcl |= vcl;
         _keyframe |= vcl && type is >= 16 and <= 23;
     }
@@ -468,11 +476,15 @@ internal sealed class HevcAccessUnitReader
 
     private static int FindStartCode(ReadOnlySpan<byte> bytes, int from, out int length)
     {
-        for (int i = from; i + 2 < bytes.Length; i++)
+        if (from <= bytes.Length - 3)
         {
-            if (bytes[i] != 0 || bytes[i + 1] != 0) continue;
-            if (bytes[i + 2] == 1) { length = 3; return i; }
-            if (i + 3 < bytes.Length && bytes[i + 2] == 0 && bytes[i + 3] == 1) { length = 4; return i; }
+            int relative = bytes[from..].IndexOf(StartCodeCore);
+            if (relative >= 0)
+            {
+                int start = from + relative;
+                if (start > from && bytes[start - 1] == 0) { length = 4; return start - 1; }
+                length = 3; return start;
+            }
         }
         length = 0; return -1;
     }

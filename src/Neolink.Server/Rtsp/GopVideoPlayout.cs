@@ -71,7 +71,9 @@ internal sealed class GopVideoPlayout
     {
         if (video.ArrivalTimestamp == null || video.ArrivalTimestampFrequency <= 0 || video.AnnexB.Length > MaxBytes)
         { Reset(); return null; }
-        var units = RtpAccessUnitSplitter.Split(_codec, video.AnnexB);
+        var units = video.ParsedNals is { } nals
+            ? RtpAccessUnitSplitter.Split(_codec, nals)
+            : RtpAccessUnitSplitter.Split(_codec, video.AnnexB);
         var incoming = new SourceBuffer(video, units, units.Count(unit => unit.HasVcl));
         if (incoming.Pictures > MaxFrames) { Reset(); return null; }
         if (_buffers.Count == 0)

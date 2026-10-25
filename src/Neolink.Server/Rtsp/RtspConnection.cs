@@ -19,6 +19,7 @@ public sealed class RtspConnection
     private readonly NetworkStream _stream;
     private readonly RtspServer _server;
     private readonly SemaphoreSlim _writeLock = new(1, 1);
+    private readonly Action _abortWrite;
     private readonly ConcurrentDictionary<string, RtspSession> _sessions = new();
     private readonly byte[] _readBuf = new byte[8192];
     private readonly EndPoint? _remote;
@@ -52,6 +53,7 @@ public sealed class RtspConnection
         _stream = client.GetStream();
         _server = server;
         _remote = client.Client.RemoteEndPoint;
+        _abortWrite = Close;
         _lastActivity = server.ResourceTimeProvider.GetTimestamp();
     }
 
@@ -665,22 +667,14 @@ public sealed class RtspConnection
 
     private async Task WriteGuardedAsync(ReadOnlyMemory<byte> data, CancellationToken ct)
     {
-        // Responses and media both use this guard, including the shared lock wait.
-        using var cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
-        cts.CancelAfter(TimeSpan.FromSeconds(10)); // slow-client guard
+        // Responses and media both retain one 10-second guard, including lock
+        // admission. Immediate socket writes no longer allocate a CTS/timer.
         try
         {
-            await _writeLock.WaitAsync(cts.Token).ConfigureAwait(false);
-            try
-            {
-                await _stream.WriteAsync(data, cts.Token).ConfigureAwait(false);
-            }
-            finally
-            {
-                _writeLock.Release();
-            }
+            await RtspWriteGuard.WriteAsync(_stream, _writeLock, data,
+                TimeSpan.FromSeconds(10), _abortWrite, ct).ConfigureAwait(false);
         }
-        catch (OperationCanceledException) when (!ct.IsCancellationRequested)
+        catch (TimeoutException)
         {
             // The client stopped reading. A half-dead connection is worse than a dead
             // one (the client sits blind until its own watchdog fires), so close it
@@ -1046,7 +1040,7 @@ internal sealed class RtspSession
                             if (aacTimeline != null) _conn.Server.ObserveGopAac(Id, aacTimeline.Diagnostics);
                             continue;
                         }
-                        await SendVideoAsync(hub, v.AnnexB, v.Keyframe, v.HasSps, v.RtpTs, batch, ct).ConfigureAwait(false);
+                        await SendVideoCachedAsync(hub, v.AnnexB, v.Keyframe, v.HasSps, v.RtpTs, batch, ct, v.ParsedNals).ConfigureAwait(false);
                         if (lowSenderClock != null)
                         {
                             lowSenderClock.ObserveRawVideoSent(v);
@@ -1122,8 +1116,8 @@ internal sealed class RtspSession
             switch (packet)
             {
                 case HubVideo video when Video != null:
-                    await SendVideoAsync(hub, video.AnnexB, video.Keyframe, video.HasSps,
-                        video.RtpTs, batch, ct).ConfigureAwait(false);
+                    await SendVideoCachedAsync(hub, video.AnnexB, video.Keyframe, video.HasSps,
+                        video.RtpTs, batch, ct, video.ParsedNals).ConfigureAwait(false);
                     break;
                 case HubAudioAac audio when Audio != null:
                     if (!RtspConnection.SameAudio(_description.Audio, hub.Audio))
@@ -1155,15 +1149,23 @@ internal sealed class RtspSession
         _conn.Server.ObserveLowSenderReports(Id, clock.Diagnostics());
     }
 
-    private async Task SendVideoAsync(IStreamHub hub, byte[] annexB, bool keyframe, bool hasSps,
-        uint timestamp, RtpBatch batch, CancellationToken ct)
+    private Task SendVideoAsync(IStreamHub hub, byte[] annexB, bool keyframe, bool hasSps,
+        uint timestamp, RtpBatch batch, CancellationToken ct) =>
+        SendVideoCachedAsync(hub, annexB, keyframe, hasSps, timestamp, batch, ct, null);
+
+    private async Task SendVideoCachedAsync(IStreamHub hub, byte[] annexB, bool keyframe, bool hasSps,
+        uint timestamp, RtpBatch batch, CancellationToken ct,
+        IReadOnlyList<ReadOnlyMemory<byte>>? parsedNals)
     {
         var video = Video ?? throw new InvalidOperationException("Video transport missing");
         var codec = _description.Codec ?? VideoCodec.H264;
         if (hub.Codec != codec) throw new IOException("RTSP source codec changed; reconnect for current SDP");
         var au = keyframe ? EnsureParameterSets(_description, codec, annexB, hasSps) : annexB;
         // Packetization follows the cancellable wait, into this pump's private batch.
-        video.Packetizer.PacketizeVideoInto(batch, codec, au, timestamp, video.RtpChannel);
+        if (parsedNals != null && ReferenceEquals(au, annexB))
+            video.Packetizer.PacketizeVideoNalsInto(batch, codec, parsedNals, timestamp, video.RtpChannel);
+        else
+            video.Packetizer.PacketizeVideoInto(batch, codec, au, timestamp, video.RtpChannel);
         await SendVideoBatchAsync(video, batch, ct).ConfigureAwait(false);
     }
 
