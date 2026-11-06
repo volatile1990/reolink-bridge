@@ -79,8 +79,9 @@ internal static class LowQualityCadenceTests
         if (Ffmpeg.ExePath is not { } ffmpeg) { Console.WriteLine("SKIP real night cadence: ffmpeg absent"); return; }
         using var deadline = new CancellationTokenSource(TimeSpan.FromSeconds(25));
         var ct = deadline.Token;
+        int width = hardware ? 320 : 160, height = hardware ? 180 : 90;
         var (encoded, errors) = await Ffmpeg.RunAsync(ffmpeg,
-            ["-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i", "testsrc2=size=160x90:rate=20", "-frames:v", "80",
+            ["-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i", $"testsrc2=size={width}x{height}:rate=20", "-frames:v", "80",
              "-an", "-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency", "-threads", "1",
              "-x264-params", "keyint=20:min-keyint=20:scenecut=0:repeat-headers=1:aud=1", "-f", "h264", "pipe:1"],
             [], TimeSpan.FromSeconds(10), ct);
@@ -88,10 +89,11 @@ internal static class LowQualityCadenceTests
         var pictures = RtpAccessUnitSplitter.Split(VideoCodec.H264, encoded).Where(unit => unit.HasVcl).ToArray();
         Check(pictures.Length == 80, "night source has wrong picture count");
         var source = new StreamHub("synthetic-night-sub");
+        if (hardware) source.PublishInfo(new((uint)width, (uint)height, 20));
         var low = new StreamHub("synthetic-night-low");
         var sink = new ProtectBridgeHost.LowQualitySourceSink(source, low);
         using var stop = CancellationTokenSource.CreateLinkedTokenSource(ct);
-        var converter = new LowQualityVideoTranscoder("synthetic-night", source, low, ct, 20, 256, 20, 160, 90,
+        var converter = new LowQualityVideoTranscoder("synthetic-night", source, low, ct, 20, 256, 20, width, height,
             hardware ? "vaapi" : "software", "/dev/dri/renderD128", hardware ? "vaapi" : "software");
         var running = converter.RunAsync(stop.Token);
         var (id, reader) = low.Subscribe();
@@ -186,8 +188,9 @@ internal static class LowQualityCadenceTests
     {
         if (Ffmpeg.ExePath is not { } ffmpeg) throw new InvalidOperationException("ffmpeg required for TCP burst regression");
         using var deadline = new CancellationTokenSource(TimeSpan.FromSeconds(25)); var ct = deadline.Token;
+        int width = hardware ? 320 : 160, height = hardware ? 180 : 90;
         var (encoded, errors) = await Ffmpeg.RunAsync(ffmpeg,
-            ["-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i", "testsrc2=size=160x90:rate=20", "-frames:v", "80",
+            ["-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i", $"testsrc2=size={width}x{height}:rate=20", "-frames:v", "80",
              "-an", "-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency", "-threads", "1",
              "-x264-params", "keyint=20:min-keyint=20:scenecut=0:repeat-headers=1:aud=1", "-f", "h264", "pipe:1"],
             [], TimeSpan.FromSeconds(10), ct);
@@ -196,11 +199,11 @@ internal static class LowQualityCadenceTests
         Check(pictures.Length == 80, "TCP burst source picture count changed");
         var clock = new GopAacContractTests.Clock();
         var source = new StreamHub("synthetic-tcp-source", clock); var low = new StreamHub("synthetic-tcp-low");
-        source.PublishInfo(new(160, 90, 20));
+        source.PublishInfo(new((uint)width, (uint)height, 20));
         var sink = new ProtectBridgeHost.LowQualitySourceSink(source, low);
         sink.PublishVideo(new(VideoCodec.H264, true, 0, null, RtpAccessUnitSplitter.AnnexB(pictures[0].Nals)));
         using var stop = CancellationTokenSource.CreateLinkedTokenSource(ct);
-        var converter = new LowQualityVideoTranscoder("synthetic-tcp-burst", source, low, ct, 20, 256, 20, 160, 90,
+        var converter = new LowQualityVideoTranscoder("synthetic-tcp-burst", source, low, ct, 20, 256, 20, width, height,
             hardware ? "vaapi" : "software", "/dev/dri/renderD128", hardware ? "vaapi" : "software");
         Task running = converter.RunAsync(stop.Token); var (id, reader) = low.Subscribe();
         var listener = new TcpListener(IPAddress.Loopback, 0); listener.Start();

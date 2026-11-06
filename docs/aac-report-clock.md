@@ -9,6 +9,16 @@ Source/build tests alone are not a production acceptance result. Deployment
 starts with Hintertuer only and still needs actual RTP/RTCP, native fMP4 audio,
 fresh recording, archive, preservation and natural-monitor checks.
 
+The first isolated Linux audit exposed a hardware-fixture mismatch: FFmpeg
+6.1.1 with Intel iHD 24.1.0 reports a minimum encoder height of 128 pixels,
+so the synthetic 160x90 hardware output is unsupported. Independent diagnostic
+640x360-to-320x180 and same-size 320x180 runs each decoded 40 pictures; six
+larger GPU variants also passed. Hardware-only reconnect, night and TCP-burst
+fixtures now use those supported dimensions. Software fixtures retain 160x90.
+All frame-count, timing, AAC-payload, decoding, reconnect and shutdown assertions
+and deadlines remain unchanged. No production encoder setting or 4 ms native
+media criterion is relaxed; the original failed audit remains a separate result.
+
 Sender Reports associate RTP and NTP timestamps with the same instant, using
 the maintained RTP-counter/realtime relationship
 ([RFC 3550, section 6.4.1](https://www.rfc-editor.org/rfc/rfc3550.html#section-6.4.1)).

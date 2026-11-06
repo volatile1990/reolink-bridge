@@ -208,8 +208,9 @@ internal static class LowQualityVideoTranscoderTests
         }
         using var deadline = new CancellationTokenSource(TimeSpan.FromSeconds(25));
         var ct = deadline.Token;
+        int sourceWidth = hardware ? 640 : 320, sourceHeight = hardware ? 360 : 180;
         var (h264, error) = await Ffmpeg.RunAsync(ffmpeg,
-            ["-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i", "testsrc2=size=320x180:rate=20",
+            ["-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i", $"testsrc2=size={sourceWidth}x{sourceHeight}:rate=20",
                 "-frames:v", "80", "-an", "-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency",
                 "-threads", "1", "-x264-params", "keyint=20:min-keyint=20:scenecut=0:repeat-headers=1:aud=1",
                 "-f", "h264", "pipe:1"], [], TimeSpan.FromSeconds(10), ct);
@@ -222,7 +223,7 @@ internal static class LowQualityVideoTranscoderTests
         var mainBefore = main.GetVideoBufferDiagnostics();
         var source = new StreamHub("synthetic-sub-source");
         var low = new StreamHub("synthetic-low-output");
-        int expectedWidth = scaled ? 160 : 320, expectedHeight = scaled ? 90 : 180;
+        int expectedWidth = scaled ? sourceWidth / 2 : sourceWidth, expectedHeight = scaled ? sourceHeight / 2 : sourceHeight;
         var transcoder = new LowQualityVideoTranscoder("synthetic-low", source, low, ct, 10, 256, 20,
             scaled ? expectedWidth : 0, scaled ? expectedHeight : 0, hardware ? "vaapi" : "software",
             "/dev/dri/renderD128", hardware ? "vaapi" : "software");
