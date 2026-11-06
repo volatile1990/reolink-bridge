@@ -66,6 +66,21 @@ if (args.SequenceEqual(new[] { "--video-progress-only" }))
     catch (Exception error) { Console.Error.WriteLine("FAIL parsed-video freshness: " + error); return 1; }
 }
 
+if (args.SequenceEqual(new[] { "--video-rtp-clock-only" }) || args.SequenceEqual(new[] { "--video-rtp-cadence-only" }))
+{
+    try
+    {
+        await VideoRtpClockTests.SubMillisecondCadenceAndSenderReports();
+        if (args[0] == "--video-rtp-clock-only")
+        {
+            await VideoRtpClockTests.LongRunAndWraps();
+            await VideoRtpClockTests.EpochIsolationAndFallbackRules();
+        }
+        Console.WriteLine("Video RTP fractional-clock contracts passed; actual synthetic publishers/subscribers and controlled clocks only."); return 0;
+    }
+    catch (Exception error) { Console.Error.WriteLine("FAIL video RTP clock: " + error); return 1; }
+}
+
 if (args.SequenceEqual(new[] { "--lq-rtcp-only" }))
 {
     try
@@ -378,6 +393,9 @@ internal static class ContractTests
             await Test("actual ffmpeg low conversion decodes reconnects and preserves the main stream", LowQualityVideoTranscoderTests.RealFfmpegReconnectAndShutdown);
             await Test("actual scaled low conversion matches HEVC dimensions and preserves main/reconnect", LowQualityVideoTranscoderTests.RealFfmpegScaledReconnectAndShutdown);
             await Test("one-to-one low quality retains night cadence and rejects camera clock jumps", LowQualityCadenceTests.SourceCadenceAndBurstClock);
+            await Test("video RTP retains sub-tick durations in actual publisher and sender reports", VideoRtpClockTests.SubMillisecondCadenceAndSenderReports);
+            await Test("video RTP cumulative conversion remains exact over eight hours and four days", VideoRtpClockTests.LongRunAndWraps);
+            await Test("video RTP isolates epochs and retains bounded fallback rules", VideoRtpClockTests.EpochIsolationAndFallbackRules);
             await Test("real night encoder preserves source duration, HEVC pictures and original AAC", LowQualityCadenceTests.RealNightEncoderAndAacPreservation);
             await Test("real TCP burst encoder retains positive native millisecond durations and original AAC", LowQualityCadenceTests.RealTcpBurstEncoderAndNativeMilliseconds);
             await Test("optional LQ delay shares HQ aliases and preserves direct authentication/source", LowQualityAlignmentTests.ConfigurationAndMountIsolation);

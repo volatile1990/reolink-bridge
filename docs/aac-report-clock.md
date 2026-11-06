@@ -149,3 +149,46 @@ unsent-anchor and forward-recovery contracts. Extra focused entry points are
 This corrects noisy RTP/report associations. It is not a promise that a native
 muxer will produce zero fMP4 discontinuities: any real remaining sample-rate
 difference or muxer quantization still requires its own strict media proof.
+
+## Video fractional conversion and the first canary
+
+The first Hintertuer-only candidate passed its Linux audit and greatly reduced
+actual adjacent audio SR residuals, from about -4.14..+4.45 ms to
+-0.046..+0.058 ms. Its native 180-second fMP4 probe nevertheless retained one
+-5 ms audio boundary and repeated -4 ms corrections. A later probe after the
+AAC long fit matured still had a -5 ms boundary. This candidate was not accepted;
+the guarded rollback restored the original target image without native service
+restarts. Short startup passes do not supersede those complete negative probes.
+
+The remaining source audit found an independent arithmetic bias in
+`StreamHub.PublishVideo`: it floored every microsecond delta separately while
+converting to the 90 kHz RTP clock. Alternating 50,001/49,999 us source durations
+have exactly 20 fps average but lost one tick per pair: -111.111 ppm. The actual
+LQ timeline uses an absolute host-arrival estimate for elapsed time, so it also
+passed through this lossy conversion. Its observed video SR slope near -108 ppm
+and the native correction cadence are consistent with that defect; the separate
+diagnostic session does not prove a physical capture clock relationship.
+
+The follow-up retains the integer remainder of `(deltaUs * 90 + remainder) / 1000`
+under the existing hub lock. For every source epoch, relative RTP ticks now equal
+`floor(sum(chosenDeltaUs) * 90 / 1000)`: quantization stays below one tick instead
+of accumulating once per picture. The first frame still advances zero, uint RTP
+and camera wrap remain modular, and `SourceStopped` clears the fraction with the
+old camera anchor. Duplicate/backward/>5-second camera counters still use the
+same existing bounded wall fallback; valid/fallback transitions retain the
+fraction of their chosen elapsed deltas. Exact integral 50,000-us durations stay
+4,500 ticks. Encoded bytes, AAC RTP, scheduling and CPU/journal paths are unchanged;
+video RTP values intentionally differ when formerly discarded fractions add up.
+
+The new tests inspect actual StreamHub subscriber packets, not a second copy of
+the conversion. They cover 6,000 variable-duration pictures and 300 actual SR
+adapter mappings, 576,000 pictures over eight simulated hours, four simulated
+days with many camera/RTP wraps, isolated hubs, nonzero-remainder epoch reset,
+index/payload/provenance preservation and the original fallback boundaries.
+Compiling the identical tests with only the complete frozen production8473
+`StreamHub.cs` restored reproduces -3,000 ticks over five minutes (-33.333 ms,
+-111.111 ppm); the carry version has zero cumulative tick error. The relevant
+other LQ conversions use an absolute origin/index, not this per-delta floor.
+Focused selectors are `--video-rtp-clock-only` and `--video-rtp-cadence-only`;
+the three new groups also run by default. Native criteria remain unchanged,
+and a new exact Linux build plus actual canary acceptance is still required.

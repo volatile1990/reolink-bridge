@@ -139,6 +139,7 @@ public sealed class StreamHub : IStreamHub, IMediaSink
 
     // Video RTP timestamp tracking (90 kHz)
     private uint _videoRtpTs = (uint)Random.Shared.Next();
+    private uint _videoRtpRemainder;
     private uint _lastVideoUs;
     private bool _haveVideoTs;
     private readonly Stopwatch _wallClock = Stopwatch.StartNew();
@@ -349,7 +350,11 @@ public sealed class StreamHub : IStreamHub, IMediaSink
             }
             _lastVideoUs = frame.Microseconds;
             _lastWall = wallNow;
-            _videoRtpTs = unchecked(_videoRtpTs + (uint)((ulong)deltaUs * 90 / 1000));
+            // Carry sub-tick fractions across frames. Flooring each delta alone
+            // loses up to one 90-kHz tick per picture and creates a rate bias.
+            ulong videoTicks = (ulong)deltaUs * 90 + _videoRtpRemainder;
+            _videoRtpTs = unchecked(_videoRtpTs + (uint)(videoTicks / 1000));
+            _videoRtpRemainder = (uint)(videoTicks % 1000);
 
             // Learn codec parameters from the stream. Parameter sets ride keyframes,
             // so once they are known, P-frames skip the full-buffer NAL scan — that's
@@ -581,6 +586,7 @@ public sealed class StreamHub : IStreamHub, IMediaSink
             Audio = null; AudioBitrateKbps = null; AudioMetadataSourceEpoch = -1;
             _aacPayloadBytes = _aacSampleCount = 0;
             _haveVideoTs = false;
+            _videoRtpRemainder = 0;
             _transcoder?.Dispose(); _transcoder = null;
         }
     }
