@@ -927,11 +927,14 @@ internal sealed class RtspSession
         int aacRate = _mount.GopAudio && _description.Audio is { IsAac: true } describedAudio ? describedAudio.SampleRate : 0;
         byte[]? aacAsc = aacRate > 0 ? _description.Audio!.AudioSpecificConfig?.ToArray() : null;
         var aacTimeline = playout != null && Audio != null && aacRate > 0 ? new GopAacTimeline(aacRate, hub.SourceEpoch) : null;
+        var gopAacReportClock = aacTimeline != null ? new AacReportClock(aacRate, _conn.Server.PlayoutTimeProvider) : null;
         var matchedLow = _mount.MatchHqTiming is { } timing
             ? new MatchedLowQualityPlayout(hub, timing, _conn.Server.PlayoutTimeProvider, _conn.Server.PlayoutWaiter) : null;
         var lowSenderClock = _mount.LowQualitySenderReports && !_mount.GopPlayout && !_opus
             ? new LowQualityRtpSenderClock(hub, _conn.Server.PlayoutTimeProvider, _mount.LowQualityRequiresSourceArrival) : null;
         long? lastRtcpAt = null;
+        var rtcpClock = _conn.Server.PlayoutTimeProvider;
+        var rtcpOrigin = (At: rtcpClock.GetTimestamp(), Utc: rtcpClock.GetUtcNow());
         string cname = "reolink-gop-" + Id.ToLowerInvariant();
         long sourceEpoch = hub.SourceEpoch;
         bool? uniformCadence = null;
@@ -964,6 +967,7 @@ internal sealed class RtspSession
                     waitKeyframe = true;
                     playout?.Reset();
                     aacTimeline?.Reset(hub.SourceEpoch);
+                    gopAacReportClock?.Reset();
                 }
                 if (playout != null && sourceEpoch != hub.SourceEpoch)
                 {
@@ -971,6 +975,7 @@ internal sealed class RtspSession
                     waitKeyframe = true;
                     playout.Reset();
                     aacTimeline?.Reset(sourceEpoch);
+                    gopAacReportClock?.Reset();
                 }
 
                 switch (packet)
@@ -993,7 +998,9 @@ internal sealed class RtspSession
                             uniformCadence = complete.UniformCadence;
                             complete = playout.BeginGop(complete);
                             _mount.PublishHqTiming?.Observe(Id, complete, playout.PresentationTimestamp(TimeSpan.Zero));
+                            long aacResetVersion = aacTimeline?.ResetVersion ?? 0;
                             var aacPlans = aacTimeline?.Plan(complete) ?? [];
+                            if (aacTimeline != null && aacTimeline.ResetVersion != aacResetVersion) gopAacReportClock?.Reset();
                             var presentation = complete.Pictures.Select(picture => (Offset: picture.Offset, Video: (GopPlayoutPicture?)picture, Audio: (GopAacPlan?)null))
                                 .Concat(aacPlans.Select(aac => (Offset: aac.Offset, Video: (GopPlayoutPicture?)null, Audio: (GopAacPlan?)aac)))
                                 .OrderBy(item => item.Offset).ThenBy(item => item.Video == null ? 1 : 0);
@@ -1006,6 +1013,7 @@ internal sealed class RtspSession
                                     waitKeyframe = true;
                                     playout.Reset();
                                     aacTimeline?.Reset(hub.SourceEpoch);
+                                    gopAacReportClock?.Reset();
                                     break;
                                 }
                                 if (item.Video is { } picture)
@@ -1020,8 +1028,10 @@ internal sealed class RtspSession
                                         throw new IOException("GOP AAC source format changed; reconnect for current SDP");
                                     await SendAsync(Audio, Audio.Packetizer.PacketizeAac(aac.Packet.Au, aac.Packet.RtpTs), ct).ConfigureAwait(false);
                                     aacTimeline!.MarkSent();
+                                    gopAacReportClock!.ObserveSent(aac.Packet.RtpTs, playout.PresentationTimestamp(aac.Offset),
+                                        aac.Packet.BlockIndex == aac.Packet.BlockUnits - 1, aacTimeline.ReportRecoveryOffsetSamples);
                                 }
-                                if (aacTimeline is { HaveAnchor: true } && Audio != null)
+                                if (gopAacReportClock is { HaveAnchor: true } && Audio != null)
                                 {
                                     var clock = _conn.Server.PlayoutTimeProvider;
                                     long now = clock.GetTimestamp();
@@ -1029,15 +1039,17 @@ internal sealed class RtspSession
                                     {
                                         double elapsed = clock.GetElapsedTime(playout.PresentationTimestamp(TimeSpan.Zero), now).TotalSeconds;
                                         uint videoTs = unchecked(complete.Pictures[0].RtpTimestamp + (uint)(long)Math.Round(elapsed * 90000));
-                                        uint audioTs = aacTimeline.RtpAtSourceTime(complete.SourceArrivalTimestamp / (double)complete.SourceArrivalFrequency + elapsed);
-                                        DateTimeOffset utc = clock.GetUtcNow();
+                                        uint audioTs = gopAacReportClock.RtpAt(now);
+                                        DateTimeOffset utc = rtcpOrigin.Utc + clock.GetElapsedTime(rtcpOrigin.At, now);
                                         await SendRtcpAsync(Video!, RtcpSenderReport.Build(Video!.Packetizer, videoTs, utc, cname), ct).ConfigureAwait(false);
                                         await SendRtcpAsync(Audio, RtcpSenderReport.Build(Audio.Packetizer, audioTs, utc, cname), ct).ConfigureAwait(false);
+                                        gopAacReportClock.MarkReportSent(now);
                                         lastRtcpAt = now;
                                     }
                                 }
                             }
-                            if (aacTimeline != null) _conn.Server.ObserveGopAac(Id, aacTimeline.Diagnostics);
+                            if (aacTimeline != null) _conn.Server.ObserveGopAac(Id,
+                                aacTimeline.Diagnostics with { ReportClock = gopAacReportClock?.Diagnostics() });
                             continue;
                         }
                         await SendVideoCachedAsync(hub, v.AnnexB, v.Keyframe, v.HasSps, v.RtpTs, batch, ct, v.ParsedNals).ConfigureAwait(false);
@@ -1063,7 +1075,10 @@ internal sealed class RtspSession
                             if (hub.Audio is not { IsAac: true } actual || actual.SampleRate != aacRate
                                 || aacAsc == null || actual.AudioSpecificConfig?.SequenceEqual(aacAsc) != true)
                                 throw new IOException("GOP AAC source format changed; reconnect for current SDP");
-                            aacTimeline.Push(a); break;
+                            long aacResetVersion = aacTimeline.ResetVersion;
+                            aacTimeline.Push(a);
+                            if (aacTimeline.ResetVersion != aacResetVersion) gopAacReportClock?.Reset();
+                            break;
                         }
                         await SendAsync(Audio, Audio.Packetizer.PacketizeAac(a.Au, a.RtpTs), ct).ConfigureAwait(false);
                         if (lowSenderClock != null)
@@ -1095,7 +1110,7 @@ internal sealed class RtspSession
             if (lowSenderClock != null) _conn.Server.ObserveLowSenderReports(Id, lowSenderClock.Diagnostics(), completed: true);
             if (aacTimeline != null)
             {
-                var diagnostic = aacTimeline.Diagnostics;
+                var diagnostic = aacTimeline.Diagnostics with { ReportClock = gopAacReportClock?.Diagnostics() };
                 _conn.Server.ObserveGopAac(Id, diagnostic, completed: true);
                 Log.Info($"{hub.Name}: GOP AAC summary: sent={diagnostic.SentPackets}, dropped={diagnostic.DroppedPackets}, resets={diagnostic.Resets}, " +
                     $"initialEstimatedOffsetMs={diagnostic.InitialAudioOffsetMs:F1}, maxArrivalEstimateDeviationMs={diagnostic.MaxArrivalEstimateDeviationMs:F1}; capture PTS unavailable");

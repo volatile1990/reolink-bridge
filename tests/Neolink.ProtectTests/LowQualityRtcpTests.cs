@@ -34,18 +34,95 @@ internal static class LowQualityRtcpTests
     private static void At(ManualTimeProvider clock, long at)
     { Check(at >= clock.GetTimestamp(), "synthetic publication time moved backwards"); clock.AdvanceTimestampTicks(at - clock.GetTimestamp()); }
     private static double MappedInstant(LowQualityRtpReport report, uint reportRtp, uint packetRtp, int rate) =>
-        (report.UtcTimestamp - DateTimeOffset.UnixEpoch).TotalSeconds - unchecked(reportRtp - packetRtp) / (double)rate;
+        (report.UtcTimestamp - DateTimeOffset.UnixEpoch).TotalSeconds - unchecked((int)(reportRtp - packetRtp)) / (double)rate;
 
     public static async Task RunAll()
     {
         LongRawDualClock();
+        await AacReportClockTests.RunAll();
+        await PublishedAudioPhaseIgnoresArrivalJitter();
         RawBundlesDiscontinuitiesAndEpochs();
         RawVideoClockGuards();
         NativeAndEncodedProvenanceModes();
         PacketizationDoesNotConfirmSend();
         await MatchedReportsUseConfirmedPlan();
         await LoopbackReportsAndSessionLifecycle();
+        await LoopbackPublishedPhaseIgnoresJitter();
         await MatchedPauseDoesNotConfirmUnsentMedia();
+    }
+
+    public static Task PublishedAudioPhaseIgnoresArrivalJitter()
+    {
+        foreach (bool matched in new[] { false, true })
+        {
+            var clock = new ManualTimeProvider(); var hub = Hub("aac-phase-adapter", clock);
+            var sender = new LowQualityRtpSenderClock(hub, clock);
+            const uint start = uint.MaxValue - 2047; int next = 0, comparisons = 0;
+            bool published = false;
+            for (double reportAt = 1.05; reportAt < 180; reportAt += 1)
+            {
+                while (true)
+                {
+                    int group = next / 16, end = matched ? next : group * 16 + 15;
+                    double noise = group % 2 == 0 ? .008 : -.008;
+                    long arrival = (long)Math.Round((end * .064 + .05 + noise) * 1_000_000);
+                    if (arrival > reportAt * 1_000_000) break;
+                    At(clock, arrival); hub.PublishVideo(Key((uint)arrival));
+                    for (; next <= end; next++)
+                    {
+                        LowQualityRtpReport before = default;
+                        if (published) Check(sender.TryGetReport(false, true, out before), "confirmed prior AAC report unavailable");
+                        var packet = Aac(hub, next, unchecked(start + (uint)(next * 1024L)), arrival)
+                            with { BlockUnits = matched ? 1 : 16, BlockIndex = matched ? 0 : next % 16 };
+                        bool observed = matched
+                            ? sender.ObserveMatchedSent(packet, new(hub.SourceEpoch, arrival, 1_000_000))
+                            : sender.ObserveRawAacSent(packet, hub.Audio);
+                        Check(observed, $"fresh jittered AAC adapter rejected original AU: matched={matched}, AU={next}, arrival={arrival}, epoch={hub.SourceEpoch}, audio={hub.Audio}");
+                        if (published)
+                        {
+                            Check(sender.TryGetReport(false, true, out var after)
+                                && before.AudioRtpTimestamp == after.AudioRtpTimestamp,
+                                $"{(matched ? "matched" : "raw")} AAC arrival reanchored already published report phase");
+                            comparisons++;
+                        }
+                        Check(packet.Au.SequenceEqual(new byte[] { 1, 2, 3, (byte)next }), "report adapter changed original AAC bytes");
+                    }
+                }
+                At(clock, (long)Math.Round(reportAt * 1_000_000)); hub.PublishVideo(Key((uint)clock.GetTimestamp()));
+                Check(sender.TryGetReport(false, true, out _), "jittered AAC lost its live report");
+                sender.MarkReportSent(); published = true;
+            }
+            Check(comparisons > 2000, "actual sender adapter jitter fixture did not exercise enough confirmed AUs");
+        }
+        RawBatchesWithRetrogradeDeburstEstimates();
+        return Task.CompletedTask;
+    }
+
+    private static void RawBatchesWithRetrogradeDeburstEstimates()
+    {
+        var clock = new ManualTimeProvider(); var hub = Hub("aac-retrograde-deburst", clock);
+        var sender = new LowQualityRtpSenderClock(hub, clock);
+        const uint start = uint.MaxValue - 2047;
+        At(clock, 1_000_000); hub.PublishVideo(Key(1_000_000));
+        for (int i = 0; i < 16; i++)
+            Check(sender.ObserveRawAacSent(Aac(hub, i, unchecked(start + (uint)(i * 1024)), 1_000_000)
+                with { BlockUnits = 16, BlockIndex = i }, hub.Audio), "first original16-AU batch rejected");
+        Check(sender.TryGetReport(false, true, out _), "first actual batch did not create a report"); sender.MarkReportSent();
+        At(clock, 1_100_000); hub.PublishVideo(Key(1_100_000));
+        Check(sender.TryGetReport(false, true, out var before), "report unavailable before burst");
+        for (int i = 16; i < 32; i++)
+        {
+            // Batch2 first estimate0.14s is older than batch1 last estimate1s.
+            // Successful send time1.1s and RTP sample count remain increasing.
+            Check(sender.ObserveRawAacSent(Aac(hub, i, unchecked(start + (uint)(i * 1024)), 1_100_000)
+                with { BlockUnits = 16, BlockIndex = i % 16 }, hub.Audio), "legitimate retrograde de-burst estimate reset the raw clock");
+            Check(sender.TryGetReport(false, true, out var after) && after.AudioRtpTimestamp == before.AudioRtpTimestamp,
+                "two16-AU TCP batches within100ms reanchored published audio phase");
+        }
+        using var diagnostic = System.Text.Json.JsonDocument.Parse(System.Text.Json.JsonSerializer.Serialize(sender.Diagnostics()));
+        var audio = diagnostic.RootElement.GetProperty("audioReportClock");
+        Check(audio.GetProperty("resets").GetInt64() == 0 && audio.GetProperty("independentObservations").GetInt64() == 2,
+            "raw fit counted correlated AUs or reset its model on delivery estimates");
     }
 
     private static void LongRawDualClock()
@@ -60,7 +137,8 @@ internal static class LowQualityRtcpTests
         const uint videoBase = uint.MaxValue - 9000, audioBase = uint.MaxValue - 2047;
         int v = 0, a = 0, reports = 0; long index = 0;
         HubVideo? lastVideo = null; HubAudioAac? lastAudio = null;
-        double audioSource = 0, maximumVideoError = 0, maximumAudioError = 0;
+        double audioSource = 0, maximumVideoError = 0, maximumAudioError = 0, maximumAcquisitionError = 0;
+        int steadyReports = 0;
         while (true)
         {
             long videoAt = (long)Math.Round((v * .05 + .2) * 1_000_000);
@@ -88,14 +166,24 @@ internal static class LowQualityRtcpTests
                 "wall clock jump or independent track capture changed common monotonic report UTC");
             maximumVideoError = Math.Max(maximumVideoError, Math.Abs(MappedInstant(report, report.VideoRtpTimestamp!.Value,
                 lastVideo!.RtpTs, 90000) - lastVideo.SourceArrivalTimestamp!.Value / 1_000_000d));
-            maximumAudioError = Math.Max(maximumAudioError, Math.Abs(MappedInstant(report, report.AudioRtpTimestamp!.Value,
-                lastAudio!.RtpTs, 16000) - audioSource));
+            double audioError = Math.Abs(MappedInstant(report, report.AudioRtpTimestamp!.Value,
+                // The fixture's known sample clock is 16064 Hz. RFC 3550 SRs
+                // relate samples to real time; nominal16000 inverse would add
+                // up to255us solely from the last AU's age. Keep100us strict.
+                lastAudio!.RtpTs, 16064) - audioSource);
+            // An unknown-rate AU and an indistinguishable TCP ramp cannot
+            // promise100us from SR1. Acquisition has an explicit250ms bound;
+            // steady100us plus all45min/wrap/wallclock coverage stays strict.
+            maximumAcquisitionError = Math.Max(maximumAcquisitionError, audioError);
+            if (now >= 1500_000_000) { maximumAudioError = Math.Max(maximumAudioError, audioError); steadyReports++; }
             sender.MarkReportSent(); reports++;
             Check(!sender.ReportDue, "report cadence advanced before one second elapsed");
         }
         Check(v > 53_000 && a > 42_000 && reports > 2600, "long-run fixture did not traverse 45min, both RTP wraps and report cadence");
         Check(maximumVideoError < .00002 && maximumAudioError < .0001,
             $"RTP/NTP mapping accumulated drift or retained encoder delay: video={maximumVideoError}s, AAC={maximumAudioError}s");
+        Check(maximumAcquisitionError < .250 && steadyReports > 1100,
+            $"AAC acquisition exceeded presentation bound or never converged: max={maximumAcquisitionError}s, steady={steadyReports}");
     }
 
     private static void RawBundlesDiscontinuitiesAndEpochs()
@@ -318,6 +406,47 @@ internal static class LowQualityRtcpTests
         await wire.Command("TEARDOWN");
     }
 
+    public static async Task LoopbackPublishedPhaseIgnoresJitter()
+    {
+        var clock = new ManualTimeProvider(); var hub = Hub("aac-phase-wire", clock);
+        var server = Server(hub, clock);
+        await using var wire = await Wire.Start(server);
+        async Task Marked(int count)
+        {
+            for (int i = 0; i < 2000; i++)
+            {
+                var diagnostic = System.Text.Json.JsonSerializer.SerializeToNode(server.LowQualityTimingDiagnostics())!;
+                var sessions = diagnostic["senderReports"]!["sessions"]!.AsArray();
+                if (sessions.Any(s => s!["reportsSent"]!.GetValue<long>() >= count)) return;
+                await Task.Delay(1);
+            }
+            throw new TimeoutException("wire report was received but not committed by its sender");
+        }
+        await wire.Setup(0); await wire.Setup(1); await wire.Command("PLAY");
+        await wire.UntilReports(2); await Marked(1);
+        for (int group = 0; group < 60; group++)
+        {
+            double jitter = group % 2 == 0 ? .008 : -.008;
+            long at = (long)Math.Round(((group + 1) * 1.024 + .05 + jitter) * 1_000_000);
+            At(clock, at); hub.PublishVideo(Key((uint)at));
+            hub.PublishAac(new AacFrame(Enumerable.Range(0,16).SelectMany(_ => Adts).ToArray()));
+            await wire.UntilReports((group + 2) * 2);
+            await wire.UntilAudioPackets((uint)(1 + (group + 1) * 16));
+            await wire.Command("GET_PARAMETER"); await Marked(group + 2);
+            if (group == 30) clock.WallClock = DateTimeOffset.UnixEpoch.AddDays(1);
+        }
+        var audio = wire.Reports.Where(r => r.Channel == 3).ToArray();
+        Check(audio.Length >= 61, "actual jitter wire path did not emit enough paired reports");
+        for (int i = 1; i < audio.Length; i++)
+        {
+            double seconds = (audio[i].Ntp - audio[i - 1].Ntp) / 4294967296d;
+            double samples = unchecked((int)(audio[i].Rtp - audio[i - 1].Rtp));
+            Check(Math.Abs(samples / 16000d - seconds) < .00007,
+                $"actual RtspConnection AAC report phase followed delivery jitter: report={i}, residualMs={(samples / 16000d - seconds) * 1000}, diag={System.Text.Json.JsonSerializer.Serialize(server.LowQualityTimingDiagnostics())}");
+        }
+        await wire.Command("TEARDOWN");
+    }
+
     private sealed record Reply(int Status);
     private sealed record Frame(byte Channel, byte[] Data);
     private sealed record Report(byte Channel, uint Ssrc, ulong Ntp, uint Rtp, uint Packets, uint Octets, string Cname);
@@ -368,6 +497,8 @@ internal static class LowQualityRtcpTests
         { if (_frames.TryDequeue(out var frame)) return frame; Check((await Read(1))[0] == '$', "expected interleaved sender-report media"); return await ReadFrame(); }
         public async Task UntilReports(int count) { while (Reports.Count < count) await Next(); }
         public async Task UntilAudio() { while (!_rtp.ContainsKey(2)) await Next(); }
+        public async Task UntilAudioPackets(uint count)
+        { while (!_rtp.TryGetValue(2, out var audio) || audio.Packets < count) await Next(); }
         private void Record(Frame frame)
         {
             var data = frame.Data;

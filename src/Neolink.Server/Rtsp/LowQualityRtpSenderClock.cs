@@ -18,9 +18,10 @@ internal sealed class LowQualityRtpSenderClock(IStreamHub hub, TimeProvider? clo
     private TrackAnchor? _video, _audio;
     private TrackAnchor? _rawVideoObservation;
     private uint? _rawAudioPreviousRtp;
-    private long _rawAudioSamples;
-    private double _rawAudioOrigin, _rawAudioPhase;
     private AudioTrackInfo? _rawAudioFormat;
+    private AacReportClock? _aacReportClock;
+    private long? _pendingReportAt;
+    private bool _pendingAudio;
     private long _reports, _rejected;
     private long? _lastReportAt;
     private sealed record TrackAnchor(uint RtpTimestamp, double PresentationTimestamp, int Rate, long ConfirmedAt);
@@ -78,28 +79,17 @@ internal sealed class LowQualityRtpSenderClock(IStreamHub hub, TimeProvider? clo
 
         if (_rawAudioPreviousRtp is { } previous && (unchecked(packet.RtpTs - previous) != 1024
             || !SameAudio(format, _rawAudioFormat))) ResetRawAudio();
-        if (_rawAudioPreviousRtp != null)
-        {
-            _rawAudioSamples += 1024;
-            double predicted = _rawAudioOrigin + _rawAudioSamples / (double)format.SampleRate;
-            double deviation = observed - predicted - _rawAudioPhase;
-            if (Math.Abs(deviation) > 5) ResetRawAudio();
-            else
-            {
-                // The same bounded sample/arrival phase estimate as matched LQ.
-                // Only the report's inverse mapping slews; RTP stays exactly 1024/AU.
-                double step = 1024d / format.SampleRate * 0.01;
-                _rawAudioPhase += Math.Clamp(deviation, -step, step);
-            }
-        }
-        if (_rawAudioPreviousRtp == null)
-        { _rawAudioOrigin = observed; _rawAudioSamples = 0; _rawAudioFormat = format; }
+        _rawAudioFormat = format;
         _rawAudioPreviousRtp = packet.RtpTs;
-        double presentation = Math.Round((_rawAudioOrigin + _rawAudioSamples / (double)format.SampleRate + _rawAudioPhase)
-            * packet.ArrivalTimestampFrequency);
+        // Raw AAC is not paced here. Confirm freshness at its already validated
+        // debursted observation; the independent report clock owns rate/phase.
+        double presentation = Math.Round(observed * packet.ArrivalTimestampFrequency);
         if (!ValidInstant(packet.SourceEpoch, presentation, packet.ArrivalTimestampFrequency))
         { _audio = null; _rejected++; return false; }
         _audio = new(packet.RtpTs, presentation, format.SampleRate, _clock.GetTimestamp());
+        _aacReportClock ??= new(format.SampleRate, _clock);
+        _aacReportClock.ObserveSent(packet.RtpTs, presentation,
+            packet.BlockIndex == packet.BlockUnits - 1, observationTimestamp: packet.ArrivalTimestamp.Value);
         return true;
     }
 
@@ -119,6 +109,9 @@ internal sealed class LowQualityRtpSenderClock(IStreamHub hub, TimeProvider? clo
             case HubAudioAac audio when audio.SourceEpoch == timing.SourceEpoch
                 && hub.Audio is { IsAac: true, SampleRate: >= 8000 and <= 96000 } format:
                 _audio = new(audio.RtpTs, timing.PresentationTimestamp, format.SampleRate, _clock.GetTimestamp());
+                _aacReportClock ??= new(format.SampleRate, _clock);
+                _aacReportClock.ObserveSent(audio.RtpTs, timing.PresentationTimestamp,
+                    audio.BlockIndex == audio.BlockUnits - 1);
                 return true;
             default:
                 _video = _audio = null; _rejected++; return false;
@@ -136,16 +129,21 @@ internal sealed class LowQualityRtpSenderClock(IStreamHub hub, TimeProvider? clo
         // One instant and UTC snapshot for both SSRCs. Never stamp two differently
         // aged last-packet timestamps with 'now' and pretend they are simultaneous.
         uint? video = videoEnabled ? At(_video!, now) : null;
-        uint? audio = audioEnabled ? At(_audio!, now) : null;
+        uint? audio = audioEnabled ? _aacReportClock!.RtpAt(now) : null;
         if (_epoch != hub.SourceEpoch) { ResetChangedEpoch(); return false; }
         report = new(video, audio, _utcOrigin.Utc + _clock.GetElapsedTime(_utcOrigin.At, now));
+        _pendingReportAt = now; _pendingAudio = audioEnabled;
         return true;
     }
 
     public bool ReportDue => _lastReportAt == null
         || _clock.GetElapsedTime(_lastReportAt.Value).TotalSeconds >= 1;
 
-    public void MarkReportSent() { _reports++; _lastReportAt = _clock.GetTimestamp(); }
+    public void MarkReportSent()
+    {
+        if (_pendingAudio && _pendingReportAt is { } at) _aacReportClock?.MarkReportSent(at);
+        _reports++; _lastReportAt = _clock.GetTimestamp(); _pendingReportAt = null; _pendingAudio = false;
+    }
 
     private static (long At, DateTimeOffset Utc) CaptureClock(TimeProvider clock)
         => (clock.GetTimestamp(), clock.GetUtcNow());
@@ -170,8 +168,8 @@ internal sealed class LowQualityRtpSenderClock(IStreamHub hub, TimeProvider? clo
 
     private void ResetRawAudio()
     {
-        _audio = null; _rawAudioPreviousRtp = null; _rawAudioSamples = 0;
-        _rawAudioOrigin = _rawAudioPhase = 0; _rawAudioFormat = null;
+        _audio = null; _rawAudioPreviousRtp = null; _rawAudioFormat = null;
+        _aacReportClock = null;
     }
 
     private static bool SameAudio(AudioTrackInfo? expected, AudioTrackInfo? actual) => expected != null
@@ -184,6 +182,7 @@ internal sealed class LowQualityRtpSenderClock(IStreamHub hub, TimeProvider? clo
         sourceEpoch = _epoch, videoAnchored = _video != null, audioAnchored = _audio != null,
         reportsSent = _reports, rejectedAnchors = _rejected,
         rawVideoRequiresSourceArrival = requireSourceArrival,
+        audioReportClock = _aacReportClock?.Diagnostics(),
         timeBasis = "confirmed-source-or-scheduled-presentation", captureSynchronizationVerified = false
     };
 }

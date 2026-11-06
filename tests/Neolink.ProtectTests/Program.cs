@@ -76,6 +76,30 @@ if (args.SequenceEqual(new[] { "--lq-rtcp-only" }))
     catch (Exception error) { Console.Error.WriteLine("FAIL LQ sender clock/RTCP: " + error); return 1; }
 }
 
+if (args.SequenceEqual(new[] { "--aac-long-drift-only" }))
+{
+    try { await AacLongDriftTests.RunAll(); return 0; }
+    catch (Exception error) { Console.Error.WriteLine("FAIL AAC long drift: " + error); return 1; }
+}
+
+if (args.SequenceEqual(new[] { "--aac-report-clock-only" }))
+{
+    try { await AacReportClockTests.RunAll(); return 0; }
+    catch (Exception error) { Console.Error.WriteLine("FAIL AAC report clock: " + error); return 1; }
+}
+
+if (args.SequenceEqual(new[] { "--aac-adapter-jitter-only" }))
+{
+    try { await LowQualityRtcpTests.PublishedAudioPhaseIgnoresArrivalJitter(); return 0; }
+    catch (Exception error) { Console.Error.WriteLine("FAIL AAC adapter phase: " + error); return 1; }
+}
+
+if (args.SequenceEqual(new[] { "--aac-wire-jitter-only" }))
+{
+    try { await LowQualityRtcpTests.LoopbackPublishedPhaseIgnoresJitter(); return 0; }
+    catch (Exception error) { Console.Error.WriteLine("FAIL AAC wire phase: " + error); return 1; }
+}
+
 if (args.SequenceEqual(new[] { "--lq-alignment-only" }))
 {
     try

@@ -11,7 +11,10 @@ internal sealed record GopAacDiagnostics(int BufferedPackets, int BufferedBytes,
     long FreshArrivalLateSamplePackets = 0, long InvalidPackets = 0,
     double MinSignedArrivalEstimateDeviationMs = 0, double MaxSignedArrivalEstimateDeviationMs = 0,
     double PhaseCorrectionMs = 0, double MaxPhaseCorrectionPerGopMs = 0, long ReconciledFreshPackets = 0,
-    long PhaseRecoveries = 0, long RecoveryRtpOffsetSamples = 0);
+    long PhaseRecoveries = 0, long RecoveryRtpOffsetSamples = 0)
+{
+    public object? ReportClock { get; init; }
+}
 
 /// <summary>A single media pump owns this bounded queue. AAC is paced by its real
 /// 1024-sample clock and positioned relative to the unchanged video GOP's source-arrival window.
@@ -38,6 +41,8 @@ internal sealed class GopAacTimeline(int sampleRate, long sourceEpoch)
     private uint _outputRtpOffset;
     private double? _initialOffset;
     public bool HaveAnchor => _firstRtp != null;
+    public long ResetVersion => _resets;
+    public long ReportRecoveryOffsetSamples => _recoverySamples;
     public GopAacDiagnostics Diagnostics => new(_pending.Count, _bytes, _planned, _sent, _drops, _resets, _initialOffset, _maxDeviation,
         LateSamplePackets: _lateSamples, FreshArrivalLateSamplePackets: _freshLateSamples, InvalidPackets: _invalid,
         MinSignedArrivalEstimateDeviationMs: _minSignedDeviation, MaxSignedArrivalEstimateDeviationMs: _maxSignedDeviation,

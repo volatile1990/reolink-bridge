@@ -51,7 +51,47 @@ internal static class GopAacContractTests
         Check(BinaryPrimitives.ReadUInt32BigEndian(asr.AsSpan(20)) == 1 && BinaryPrimitives.ReadUInt32BigEndian(asr.AsSpan(24)) == 6, "RTCP packet/octet counts include framing or unsent packets");
         Check(Encoding.UTF8.GetString(vsr).Contains("synthetic-common-clock") && Encoding.UTF8.GetString(asr).Contains("synthetic-common-clock"), "Audio/video CNAME differs");
         Check(audio.Diagnostics is { CaptureSynchronizationVerified: false, InitialAudioOffsetMs: 0 }, "Arrival estimate was presented as camera capture synchronization");
+        ReportsIgnoreOrdinaryArrivalPhase();
         return Task.CompletedTask;
+    }
+
+    private static void ReportsIgnoreOrdinaryArrivalPhase()
+    {
+        var clock = new ManualTimeProvider(); var timeline = new GopAacTimeline(16000, 0);
+        var reports = new AacReportClock(16000, clock);
+        const uint first = uint.MaxValue - 2047; int sample = 0, sent = 0;
+        uint? previous = null, oldPrevious = null; double maximumNew = 0, maximumLegacy = 0;
+        for (int group = 0; group < 120; group++)
+        {
+            double phase = group % 2 == 0 ? -.008 : .008;
+            while (sample * .064 < group + 1)
+            {
+                timeline.Push(Aac(sample, unchecked(first + (uint)(sample * 1024L)),
+                    (long)Math.Round((sample * .064 + phase) * 1_000_000))); sample++;
+            }
+            var gop = new CompletedVideoGop([], TimeSpan.FromSeconds(1), 0)
+                { SourceArrivalTimestamp = group * 1_000_000L, SourceArrivalFrequency = 1_000_000 };
+            foreach (var plan in timeline.Plan(gop))
+            {
+                long at = (long)Math.Round((group + 2.5 + plan.Offset.TotalSeconds) * 1_000_000);
+                clock.AdvanceTimestampTicks(at - clock.GetTimestamp());
+                uint? before = reports.Published ? reports.RtpAt(at) : null;
+                reports.ObserveSent(plan.Packet.RtpTs, at, true, timeline.ReportRecoveryOffsetSamples);
+                if (before != null) Check(reports.RtpAt(at) == before, "ordinary GOP phase reanchored a published sender report");
+                Check(plan.Packet.Au.SequenceEqual(new byte[] { (byte)plan.Packet.Index, 0x21, 0x43 }), "report clock changed GOP AAC payload"); sent++;
+            }
+            long reportAt = (long)Math.Round((group + 3.5) * 1_000_000);
+            clock.AdvanceTimestampTicks(reportAt - clock.GetTimestamp());
+            uint current = reports.RtpAt(reportAt), legacy = timeline.RtpAtSourceTime(group + 1);
+            if (previous != null)
+            {
+                maximumNew = Math.Max(maximumNew, Math.Abs(unchecked((int)(current - previous.Value)) / 16000d - 1));
+                maximumLegacy = Math.Max(maximumLegacy, Math.Abs(unchecked((int)(legacy - oldPrevious!.Value)) / 16000d - 1));
+            }
+            reports.MarkReportSent(reportAt); previous = current; oldPrevious = legacy;
+        }
+        Check(sent > 1800 && maximumLegacy > .005 && maximumNew < .001 && timeline.Diagnostics.Resets == 0,
+            $"GOP SR jitter repro did not separate old phase from continuous reports: old={maximumLegacy}s, new={maximumNew}s");
     }
 
     public static Task LossEpochAndBounds()
@@ -264,8 +304,10 @@ internal static class GopAacContractTests
         Check(audio.Select((f, i) => BinaryPrimitives.ReadUInt32BigEndian(f.Payload.AsSpan(4)) == unchecked(sourceFirst + expectedOffset + (uint)(i * 1024))).All(x => x),
             "Actual SendAsync ignored the forward-pause RTP offset or changed segment cadence");
         var reports = frames.Where(f => f.Channel == 3).ToArray();
-        Check(reports.Length >= 2 && BinaryPrimitives.ReadUInt32BigEndian(reports[0].Payload.AsSpan(16)) == sourceFirst,
-            "Actual phase-compensated RTCP map jumped at recovery");
+        Check(reports.Length >= 2 && BinaryPrimitives.ReadUInt32BigEndian(reports[0].Payload.AsSpan(16))
+                == BinaryPrimitives.ReadUInt32BigEndian(audio[0].Payload.AsSpan(4))
+            && frames.IndexOf(reports[0]) > frames.IndexOf(audio[0]),
+            "First recovery report did not describe its successfully sent AAC sample");
         for (int i = 1; i < reports.Length; i++)
         {
             uint delta = unchecked(BinaryPrimitives.ReadUInt32BigEndian(reports[i].Payload.AsSpan(16)) - BinaryPrimitives.ReadUInt32BigEndian(reports[i - 1].Payload.AsSpan(16)));
